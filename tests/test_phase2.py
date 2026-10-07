@@ -303,6 +303,39 @@ for _ in range(10):
 check("ten reads still leave the edge for the manager",
       flags.changed("evict_order"))
 
+# *** AND THE REFUSAL MUST STILL REACH THE LOG THROUGH THE READER PATH. ***
+# Making snapshot() use peek() left NOTHING calling knob() on a disk flag, so
+# disk_enabled=1 was refused SILENTLY on the live engine -- the flag was set,
+# correctly ignored, and no line said why. The refusal belongs to the shared
+# validator, not to knob().
+flags.reset_for_tests()
+harness.clear_log()
+F.write(kvmgr_enabled=1, disk_enabled=1)
+snap = stats.snapshot()
+eq("a reader still reports the blocked knob as OFF",
+   snap["policy"]["disk_enabled"], False)
+txt = harness.log_text()
+check("and the REFUSAL is logged through the reader path", "REFUSED" in txt)
+check("carrying the reason and the upstream blocker",
+      "NO KV BYTES" in txt and "vllm#45663" in txt, txt[:160])
+
+# ...once, not on every poll: a reader is on a timer.
+harness.clear_log()
+for _ in range(20):
+    stats.snapshot()
+eq("twenty more polls add no further refusal lines",
+   harness.log_text().count("REFUSED"), 0)
+
+# a DIFFERENT value announces again, because it is a different claim
+harness.clear_log()
+F.write(kvmgr_enabled=1, disk_budget_gb=64.0)
+stats.snapshot()
+flags.peek("disk_budget_gb")
+check("a different blocked knob announces on its own",
+      "disk_budget_gb" in harness.log_text() and "REFUSED" in harness.log_text(),
+      harness.log_text()[:160])
+F.write(kvmgr_enabled=1, disk_enabled=0, disk_budget_gb=0.0)
+
 # peek must validate exactly as knob does, minus the recording
 flags.reset_for_tests()
 F.write(protect_alloc="nonsense")

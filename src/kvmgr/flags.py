@@ -134,6 +134,53 @@ _IMPLEMENTED: dict[str, tuple] = {}
 
 _last_seen: dict[str, Any] = {}
 
+# (name, repr(value)) pairs already announced, so a REFUSAL is reported once and
+# not on every poll. Needed because the refusal is about the VALUE, not the edge:
+# `peek()` is called by readers on a timer, and `knob()` by the manager.
+_announced: set[tuple[str, str]] = set()
+
+
+def _announce(key: tuple[str, str], emit) -> None:
+    if key in _announced:
+        return
+    _announced.add(key)
+    emit()
+
+
+def _validate(name: str, value: Any) -> Any:
+    """The refusals, shared by knob() and peek().
+
+    *** THIS LIVES HERE AND NOT IN knob() BECAUSE OF A BUG I INTRODUCED. ***
+    The BLOCKED warning was in knob(), and `snapshot()` was its only production
+    caller. Making snapshot() use peek() -- correct, so a reader cannot consume
+    the change edge -- left NOTHING calling knob() on a disk flag, so
+    `disk_enabled=1` was refused SILENTLY. Verified on the live engine
+    2026-10-07: the flag was set, correctly ignored, and no line said why.
+    A refusal nobody can see is the defect it exists to prevent.
+    """
+    allowed = _VALID.get(name)
+    if allowed is not None and value not in allowed:
+        _announce((name, repr(value)), lambda: logger.warning(
+            "kvmgr: %s=%r is not one of %s; falling back to %r",
+            name, value, allowed, DEFAULTS[name]))
+        return DEFAULTS[name]
+
+    built = _IMPLEMENTED.get(name)
+    if built is not None and value not in built:
+        _announce((name, repr(value)), lambda: logger.warning(
+            "kvmgr: %s=%r is recognised but NOT YET IMPLEMENTED (built: %s); "
+            "using %r. This is a refusal, not a silent downgrade.",
+            name, value, built, DEFAULTS[name]))
+        return DEFAULTS[name]
+
+    reason = BLOCKED.get(name)
+    if reason is not None and value != DEFAULTS[name]:
+        _announce((name, repr(value)), lambda: logger.warning(
+            "kvmgr: %s=%r REFUSED -- %s. Using %r.",
+            name, value, reason, DEFAULTS[name]))
+        return DEFAULTS[name]
+    return value
+
 
 def raw(name: str) -> Any:
     """The value, with no logging and no validation. Hot-path safe."""
@@ -159,32 +206,7 @@ def knob(name: str, *, quiet: bool = False) -> Any:
     blocks AND tokens per group, which is the figure that actually matters);
     the change is still recorded so `changed()` stays accurate.
     """
-    value = raw(name)
-
-    allowed = _VALID.get(name)
-    if allowed is not None and value not in allowed:
-        logger.warning(
-            "kvmgr: %s=%r is not one of %s; falling back to %r",
-            name, value, allowed, DEFAULTS[name],
-        )
-        value = DEFAULTS[name]
-
-    built = _IMPLEMENTED.get(name)
-    if built is not None and value not in built:
-        logger.warning(
-            "kvmgr: %s=%r is recognised but NOT YET IMPLEMENTED (built: %s); "
-            "using %r. This is a refusal, not a silent downgrade.",
-            name, value, built, DEFAULTS[name],
-        )
-        value = DEFAULTS[name]
-
-    reason = BLOCKED.get(name)
-    if reason is not None and value != DEFAULTS[name]:
-        logger.warning(
-            "kvmgr: %s=%r REFUSED -- %s. Using %r.",
-            name, value, reason, DEFAULTS[name],
-        )
-        value = DEFAULTS[name]
+    value = _validate(name, raw(name))
 
     previous = _last_seen.get(name, _MISSING)
     if previous is _MISSING:
@@ -220,16 +242,7 @@ def peek(name: str):
     had prevented it being applied. Observability must not alter behaviour, and a
     dashboard polling every 30s would have made flag changes intermittent.
     """
-    value = raw(name)
-    allowed = _VALID.get(name)
-    if allowed is not None and value not in allowed:
-        return DEFAULTS[name]
-    built = _IMPLEMENTED.get(name)
-    if built is not None and value not in built:
-        return DEFAULTS[name]
-    if BLOCKED.get(name) is not None and value != DEFAULTS[name]:
-        return DEFAULTS[name]
-    return value
+    return _validate(name, raw(name))
 
 
 def changed(name: str) -> bool:
@@ -238,13 +251,7 @@ def changed(name: str) -> bool:
     The edge, so a caller can reconcile promptly instead of waiting for the next
     natural call on that path.  Consumes the edge: a second call is False.
     """
-    value = raw(name)
-    allowed = _VALID.get(name)
-    if allowed is not None and value not in allowed:
-        value = DEFAULTS[name]
-    built = _IMPLEMENTED.get(name)
-    if built is not None and value not in built:
-        value = DEFAULTS[name]
+    value = _validate(name, raw(name))
     previous = _last_seen.get(name, _MISSING)
     if previous is _MISSING or previous != value:
         _last_seen[name] = value
@@ -282,3 +289,4 @@ def log_env_audit() -> None:
 
 def reset_for_tests() -> None:
     _last_seen.clear()
+    _announced.clear()
