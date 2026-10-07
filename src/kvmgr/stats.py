@@ -222,8 +222,12 @@ def snapshot() -> dict[str, Any]:
             "protected_fraction": float(flags.raw("protected_fraction")),
             "protect_alloc": flags.knob("protect_alloc", quiet=True),
             "evict_order": flags.knob("evict_order", quiet=True),
-            "disk_enabled": bool(flags.raw("disk_enabled")),
-            "disk_restore": bool(flags.raw("disk_restore")),
+            # knob() rather than raw(), so a BLOCKED knob reports what is in
+            # force (False) rather than what somebody asked for -- a reader
+            # must not see disk_enabled true against a tier that cannot exist.
+            "disk_enabled": bool(flags.knob("disk_enabled", quiet=True)),
+            "disk_restore": bool(flags.knob("disk_restore", quiet=True)),
+            "blocked": {k: True for k in flags.BLOCKED},
         },
         "env_pinned": flags.audit_env(),
         "groups": [g.as_dict() for _, g in sorted(_groups.items())],

@@ -89,6 +89,27 @@ _VALID = {
     "evict_order": ("fifo", "lru", "lru_tail_first"),
 }
 
+# *** KNOBS THAT CANNOT BE BUILT AT THIS LAYER, with the reason. ***
+#
+# Setting one of these does nothing useful, so it must say why rather than fail
+# silently.  The reason is carried here, next to the knob, because the next
+# person to try will reach for the flag before the write-up.
+BLOCKED: dict[str, str] = {
+    "disk_enabled": (
+        "a KV cache manager holds NO KV BYTES. KVCacheBlock is metadata only "
+        "(block_id, ref_cnt, hash) and across the whole manager/coordinator "
+        "layer there is not one reference to a tensor or a device -- the "
+        "tensors live in the WORKER processes, indexed by block_id. Writing "
+        "them needs worker-side code, i.e. a KVConnector, which is what "
+        "vllm/v1/kv_offload already is. That path is parked on vllm#45663: the "
+        "sparse indexer materialises every KV block at once and OOMs past "
+        "~120K tokens against a 570K working set. See "
+        "docs/local/KVMGR-PHASE45-20261007.md"
+    ),
+    "disk_restore": "same layer problem as disk_enabled; see its reason",
+    "disk_budget_gb": "nothing writes to disk, so a byte budget bounds nothing",
+}
+
 # Values implemented SO FAR.  A knob set to a recognised-but-unbuilt value falls
 # back to the safe default and SAYS SO -- shipping a half-built policy as though
 # it were live is worse than refusing it.
@@ -139,6 +160,14 @@ def knob(name: str, *, quiet: bool = False) -> Any:
             "kvmgr: %s=%r is recognised but NOT YET IMPLEMENTED (built: %s); "
             "using %r. This is a refusal, not a silent downgrade.",
             name, value, built, DEFAULTS[name],
+        )
+        value = DEFAULTS[name]
+
+    reason = BLOCKED.get(name)
+    if reason is not None and value != DEFAULTS[name]:
+        logger.warning(
+            "kvmgr: %s=%r REFUSED -- %s. Using %r.",
+            name, value, reason, DEFAULTS[name],
         )
         value = DEFAULTS[name]
 

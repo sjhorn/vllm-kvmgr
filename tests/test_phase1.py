@@ -317,6 +317,36 @@ finally:
     flags._VALID["evict_order"] = ("fifo", "lru", "lru_tail_first")
     flags._IMPLEMENTED.pop("evict_order", None)
 
+# ---------------------------------------------------------------------------
+# 5b. A KNOB THAT CANNOT WORK AT THIS LAYER REFUSES, WITH THE REASON
+# ---------------------------------------------------------------------------
+for name in ("disk_enabled", "disk_restore", "disk_budget_gb"):
+    flags.reset_for_tests()
+    harness.clear_log()
+    F.write(**{name: (1 if isinstance(flags.DEFAULTS[name], bool) else 64.0)})
+    eq(f"{name} is REFUSED, not silently ignored",
+       flags.knob(name), flags.DEFAULTS[name])
+    txt = harness.log_text()
+    check(f"{name}'s refusal says REFUSED", "REFUSED" in txt)
+    check(f"{name}'s refusal carries the REASON, so the next person to reach "
+          f"for the flag learns it from the log",
+          "NO KV BYTES" in txt or "same layer problem" in txt
+          or "nothing writes to disk" in txt, txt[:200])
+
+check("the reason names the upstream blocker, not just our layer",
+      "vllm#45663" in flags.BLOCKED["disk_enabled"],
+      "the sparse indexer OOMs past ~120K tokens against a 570K working set")
+check("and points at the write-up",
+      "KVMGR-PHASE45" in flags.BLOCKED["disk_enabled"])
+
+# raw() still reports what was ASKED FOR -- the refusal is knob()'s job, so a
+# reader can tell "nobody set it" from "it was set and refused".
+F.write(disk_enabled=1)
+check("raw() still shows what was requested, so the two are distinguishable",
+      bool(flags.raw("disk_enabled")) is True
+      and bool(flags.knob("disk_enabled", quiet=True)) is False)
+F.write(disk_enabled=0)
+
 try:
     flags.raw("knob_that_does_not_exist")
     check("an unknown knob raises", False)

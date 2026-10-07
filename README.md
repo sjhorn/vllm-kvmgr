@@ -57,7 +57,7 @@ so an empty file behaves exactly as today.**
 | `protected_fraction` | 0.30 | the cap, moved off `os.environ` | yes |
 | `protect_alloc` | `equal` | `equal` \| `by_need` | yes |
 | `evict_order` | `fifo` | `fifo` \| `lru` \| `lru_tail_first` | yes |
-| `disk_enabled` / `disk_budget_gb` / `disk_restore` | off | the disk tier | Phase 4/5 |
+| `disk_enabled` / `disk_budget_gb` / `disk_restore` | off | the disk tier | **cannot** — see below |
 | `kvmgr_log_level` | 0 | per-decision eviction logging | Phase 2 |
 
 A value that is **recognised but not yet built** falls back to the default and
@@ -66,6 +66,31 @@ worse than refusing it.
 
 	bash local-ops/kv-flags.sh                       # read both nodes
 	bash local-ops/kv-flags.sh kvmgr_enabled 1
+
+## The disk tier is not buildable here, and the knobs say so
+
+Phases 4–5 of the plan are **not delivered**, for a structural reason:
+**a KV cache manager holds no KV bytes.** `KVCacheBlock` is metadata only, and
+across the 3,691 lines of this layer — `patch6`, `patch7`, the coordinator and
+`kv_cache_manager.py` — a search for `torch`, `tensor`, `cuda`, `device` or
+`kv_caches` returns **one** hit, which is the word "safetensors" in a comment
+this work added. The tensors live in the **worker** processes, indexed by
+`block_id`. Writing them needs a `KVConnector`, which `vllm/v1/kv_offload`
+already is — and that path is parked on **vllm#45663**, where the sparse indexer
+materialises every KV block at once and OOMs past ~120K tokens against a 570K
+working set. Nothing we build moves that; a hand-rolled writer arrives at the
+same wall from a different direction.
+
+So the three knobs stay in the table and **refuse loudly**, carrying the reason,
+rather than being removed or silently doing nothing:
+
+	kvmgr: disk_enabled=True REFUSED -- a KV cache manager holds NO KV BYTES …
+
+`raw()` still reports what was *asked for*, so "nobody set it" stays
+distinguishable from "it was set and refused".
+
+Full evidence, the Phase 6 assessment and the re-check trigger:
+`docs/local/KVMGR-PHASE45-20261007.md`.
 
 ## Registration is belt-and-braces, on purpose
 
