@@ -307,6 +307,40 @@ for sym, why in [
     check(f"connector has {sym} ({why})", sym in conn)
 
 print()
+print("== (0l) *** UPSTREAM DOES NOT SUPPORT TRANSFER FAILURE *** ==")
+
+# THIS IS THE FACT THAT SHAPES THE WHOLE READ PATH, and it is upstream's own
+# words: "we currently do not support job failures", followed by
+# `assert transfer_result.success`. So a handler reporting failure KILLS THE
+# ENGINE CORE. That is the safe direction -- a dead engine beats wrong tokens --
+# but it means a load has only two honest answers on a bad file: kill the
+# engine, or return KV that is silently wrong. There is no third option, so the
+# entire safety burden falls on lookup() being RIGHT.
+#
+# Pinned because an upstream bump that adds real failure handling would change
+# the design space, and because somebody reading our handler might otherwise
+# "soften" a refusal without realising what it costs.
+wkr = open(os.path.join(REPO, "patches", "pristine", "vllm",
+                        "kv_connector_offloading", "worker.py")).read()
+check("the worker ASSERTS on a failed transfer",
+      "assert transfer_result.success" in wkr)
+check("...and says so in its own comment",
+      "we currently do not support job failures" in wkr)
+check("...and marks the job completed REGARDLESS of our stats fields",
+      "mark_completed(job_id)" in wkr)
+
+sch = open(os.path.join(REPO, "patches", "pristine", "vllm",
+                        "kv_connector_offloading", "scheduler.py")).read()
+_flat = "".join(sch.split())
+check("and the scheduler has NO success/failure branch at all -- it only "
+      "counts down pending_count and then calls complete_load",
+      "job_status.pending_count-=count" in _flat
+      and "self.manager.complete_load(" in sch)
+check("...so a load that 'completed' is BELIEVED, which is why a missing file "
+      "must be caught before the load is ever scheduled",
+      "is_store" in sch)
+
+print()
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
     for f in FAIL:

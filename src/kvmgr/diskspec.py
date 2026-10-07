@@ -124,12 +124,97 @@ class DiskPresenceManager(OffloadingManager):
     warm cache nobody can find. Persisting it is Phase 2.
     """
 
-    def __init__(self, file_mapper: FileMapper, num_workers: int):
+    # Flush cadence. A write per completed store would be one fsync-ish rename
+    # per block; batching costs at most this many keys of a crash's worth of
+    # forgotten (not wrong) presence, which only ever means a needless recompute.
+    MANIFEST_FLUSH_KEYS = 512
+
+    def __init__(self, file_mapper: FileMapper, num_workers: int,
+                 manifest_path: str | None = None):
         self._mapper = file_mapper
         self._num_workers = num_workers
         self._present: set[bytes] = set()
         self._events: list[OffloadingEvent] = []
-        self._stats = {"lookup": 0, "hit": 0, "stored": 0, "skipped_present": 0}
+        self._stats = {"lookup": 0, "hit": 0, "stored": 0, "skipped_present": 0,
+                       "manifest_loaded": 0, "manifest_pruned": 0,
+                       "manifest_writes": 0}
+        self._manifest = manifest_path
+        self._unflushed = 0
+        if manifest_path:
+            self._load_manifest()
+
+    # -- the manifest -----------------------------------------------------
+    def _load_manifest(self) -> None:
+        """Restore presence from disk, PRUNED against the local filesystem.
+
+        *** WHY A MANIFEST AND NOT JUST os.path.exists(). *** exists() would
+        survive a restart too, and it is what the fs tier uses -- but it is
+        RACY in exactly the way that matters here. Rank 0's file lands before
+        the all-ranks completion, so a lookup in the gap would claim a block
+        that rank 1 is still writing or has failed to write. The manifest is
+        written only from complete_store, which the framework calls if and only
+        if every rank reported the job done, so a key in it was written
+        EVERYWHERE.
+
+        *** AND IT IS PRUNED, because the manifest is a claim about two
+        filesystems and can only be checked against one. *** An entry whose own
+        `_r0` file has gone -- somebody cleared the directory, a budget evicted
+        it -- is dropped at startup. What that CANNOT catch is rank 1's files
+        being deleted while the head's survive: upstream asserts on a failed
+        transfer, so such a load would kill the engine core rather than return
+        wrong KV. That is the right way round, and the recovery is to delete
+        this file; the log line below says so.
+        """
+        import json
+        import os as _os
+
+        if not self._manifest or not _os.path.exists(self._manifest):
+            return
+        try:
+            with open(self._manifest) as f:
+                keys = [bytes.fromhex(h) for h in json.load(f).get("keys", [])]
+        except Exception:
+            logger.exception(
+                "kvmgr: manifest %s is unreadable -- starting with an EMPTY "
+                "index, which costs recompute and never correctness",
+                self._manifest)
+            return
+        kept = []
+        for k in keys:
+            try:
+                if _os.path.exists(self._mapper.get_file_name(k)):
+                    kept.append(k)
+            except Exception:
+                pass
+        self._present = set(kept)
+        self._stats["manifest_loaded"] = len(kept)
+        self._stats["manifest_pruned"] = len(keys) - len(kept)
+        logger.info(
+            "kvmgr: manifest %s -- %d keys restored, %d pruned (their own file "
+            "is gone). If a load ever asserts on a missing file, DELETE THIS "
+            "FILE: it is a claim about both nodes and can only be checked "
+            "against this one.",
+            self._manifest, len(kept), len(keys) - len(kept))
+
+    def flush_manifest(self, force: bool = False) -> None:
+        import json
+        import os as _os
+
+        if not self._manifest:
+            return
+        if not force and self._unflushed < self.MANIFEST_FLUSH_KEYS:
+            return
+        try:
+            _os.makedirs(_os.path.dirname(self._manifest), exist_ok=True)
+            tmp = self._manifest + ".part"
+            with open(tmp, "w") as f:
+                json.dump({"keys": sorted(k.hex() for k in self._present)}, f)
+            _os.replace(tmp, self._manifest)
+            self._unflushed = 0
+            self._stats["manifest_writes"] += 1
+        except Exception:
+            logger.exception("kvmgr: manifest flush failed (presence kept in "
+                             "memory; a restart will simply forget it)")
 
     # -- reads ------------------------------------------------------------
     def lookup(self, key: "OffloadKey", req_context: "ReqContext") -> bool | None:
@@ -187,6 +272,10 @@ class DiskPresenceManager(OffloadingManager):
             self._events.append(
                 OffloadingEvent(keys=list(new), medium=DISK_MEDIUM, removed=False)
             )
+            # complete_store is the ALL-RANKS edge, so this is the only place a
+            # key may be claimed present -- see _load_manifest.
+            self._unflushed += len(new)
+            self.flush_manifest()
 
     def complete_load(
         self, keys: "Collection[OffloadKey]", req_context: "ReqContext"
@@ -202,6 +291,7 @@ class DiskPresenceManager(OffloadingManager):
 
     def reset_cache(self) -> None:
         self._present.clear()
+        self.flush_manifest(force=True)
 
     # -- ours, for the /kv endpoint ---------------------------------------
     def snapshot(self) -> dict[str, Any]:
@@ -284,7 +374,11 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
             self._manager = DiskPresenceManager(
-                self.file_mapper(), num_workers=self.world_size
+                self.file_mapper(), num_workers=self.world_size,
+                # Beside the KV it describes, so clearing the directory clears
+                # the claim too -- and under the format root, so a format change
+                # cannot inherit a stale index.
+                manifest_path=os.path.join(self.root_dir, "presence.json"),
             )
         return self._manager
 
@@ -302,7 +396,7 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
         """
         from vllm.v1.kv_offload.base import GPULoadStoreSpec
 
-        from .diskio import DiskStoreHandler
+        from .diskio import DiskLoadHandler, DiskStoreHandler
 
         handler = DiskStoreHandler(
             spec=self,
@@ -312,3 +406,27 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
         )
         self._store_handler = handler
         yield (GPULoadStoreSpec, DiskLoadStoreSpec, handler)
+
+        # *** THE LOAD DIRECTION IS REGISTERED ONLY IF disk_restore IS SET, and
+        # that is a SECOND lock on the same door. *** lookup() already refuses
+        # while the flag is off, so the scheduler never asks for a load; this
+        # means that even if a later edit made lookup() optimistic,
+        # OffloadingWorker would have no handler to route the transfer to.
+        #
+        # It is read ONCE here rather than per transfer, unlike every other knob
+        # in this plugin, and that is deliberate: handlers are registered at boot
+        # and cannot appear later, so a hot read would promise something the
+        # framework cannot deliver. This is the one knob that needs a restart,
+        # and saying so is better than a flag that silently does nothing.
+        if flags.raw("disk_restore"):
+            self._load_handler = DiskLoadHandler(
+                spec=self, kv_caches=kv_caches,
+                staging_blocks=self.staging_blocks,
+                read_threads=self.write_threads, store=handler,
+            )
+            yield (DiskLoadStoreSpec, GPULoadStoreSpec, self._load_handler)
+        else:
+            logger.info(
+                "kvmgr: restore is OFF, so no (DISK -> GPU) handler is "
+                "registered at all. Set disk_restore AND restart to enable it; "
+                "a hot flip cannot work, because handlers are registered once.")

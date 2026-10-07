@@ -40,7 +40,9 @@ def eq(name, got, want):
 
 
 base = harness.load_kv_offload()
-from kvmgr import diskio, diskspec  # noqa: E402
+from kvmgr import diskio, diskspec, flags  # noqa: E402
+
+F = harness.Flags(os.path.join(tempfile.mkdtemp(prefix="kv1b-"), "flags.json"))
 
 
 class Ref:
@@ -498,6 +500,121 @@ eq("...and is valid JSON holding the answer",
 check("*** a snapshot failure returns None rather than raising -- it must "
       "never be able to break a boot ***",
       diskio.write_geometry(object(), fake_spec, sd) is None)
+
+print()
+print("== (b11) read_chunks: the size check BEFORE any byte is read ==")
+
+# Why this ordering is the safety property: upstream does `assert
+# transfer_result.success` under "we currently do not support job failures", so
+# a load has two honest outcomes on a bad file -- kill the engine, or hand back
+# silently wrong KV. Checking length FIRST means a wrong file never reaches a
+# GPU tensor and the caller can refuse loudly.
+rdir = tempfile.mkdtemp(prefix="kvread-")
+src = {(0, 0): b"A" * 4096, (1, 0): b"B" * 4096}
+good = os.path.join(rdir, "good.bin")
+diskio.write_chunks(good, diskio.file_plan(REFS, 0, 0),
+                    lambda t, s_, n: src[(t, 0)][:n])
+
+back = {}
+n = diskio.read_chunks(good, diskio.file_plan(REFS, 0, 0),
+                       lambda t, sl, b: back.__setitem__((t, sl), bytes(b)))
+eq("a good file reads back its full length", n, 8192)
+eq("...into the right staging rows, in ref order",
+   sorted(back), [(0, 0), (1, 0)])
+eq("*** and the bytes ROUND TRIP exactly ***",
+   (hashlib.sha256(back[(0, 0)]).hexdigest()[:12],
+    hashlib.sha256(back[(1, 0)]).hexdigest()[:12]),
+   (hashlib.sha256(b"A" * 4096).hexdigest()[:12],
+    hashlib.sha256(b"B" * 4096).hexdigest()[:12]))
+
+# a SHORT file is refused, and nothing is written to staging
+short = os.path.join(rdir, "short.bin")
+open(short, "wb").write(b"A" * 4095)
+touched = []
+refused = False
+try:
+    diskio.read_chunks(short, diskio.file_plan(REFS, 0, 0),
+                       lambda t, sl, b: touched.append(t))
+except ValueError as e:
+    refused = "REFUSING" in str(e)
+check("*** a SHORT file is refused ***", refused)
+eq("...and NOTHING reached staging, because the check precedes the read",
+   touched, [])
+
+# a file of the WRONG GROUP's size is refused too -- same mechanism, and this
+# is the case a per-group byte plan makes detectable at all.
+wrong = os.path.join(rdir, "wrong.bin")
+open(wrong, "wb").write(b"C" * diskio.plan_nbytes(diskio.file_plan(REFS, 1, 0)))
+wrefused = False
+try:
+    diskio.read_chunks(wrong, diskio.file_plan(REFS, 0, 0), lambda *a: None)
+except ValueError:
+    wrefused = True
+check("a file sized for ANOTHER group is refused", wrefused)
+
+# a missing file names the recovery, because the manifest is the only thing
+# that could have claimed it.
+missing = False
+try:
+    diskio.read_chunks(os.path.join(rdir, "nope.bin"),
+                       diskio.file_plan(REFS, 0, 0), lambda *a: None)
+except FileNotFoundError as e:
+    missing = "presence.json" in str(e)
+check("a missing file raises and NAMES the recovery (delete presence.json)",
+      missing)
+
+print()
+print("== (b12) the presence manifest survives a restart, and is PRUNED ==")
+
+mdir = tempfile.mkdtemp(prefix="kvman-")
+mpath = os.path.join(mdir, "presence.json")
+k_a = K(b"\xa1" * 32, 0)
+k_b = K(b"\xb2" * 32, 0)
+
+
+class FakeMapper:
+    """Maps a key to a path under mdir, so presence can be made true or false."""
+
+    @staticmethod
+    def get_file_name(k):
+        return os.path.join(mdir, base.get_offload_block_hash(k).hex()[:8] + ".bin")
+
+
+ctx2 = base.ReqContext(req_id="r")
+m = diskspec.DiskPresenceManager(FakeMapper, num_workers=2, manifest_path=mpath)
+# make both files real, then record them
+for k in (k_a, k_b):
+    open(FakeMapper.get_file_name(k), "wb").write(b"x")
+m.complete_store([k_a, k_b], ctx2)
+m.flush_manifest(force=True)
+check("the manifest file is written", os.path.exists(mpath))
+check("...and left no .part", not os.path.exists(mpath + ".part"))
+
+# A FRESH manager -- i.e. a restarted engine -- recovers the claim.
+F.write(disk_restore=1)
+flags.reset_for_tests()
+m2 = diskspec.DiskPresenceManager(FakeMapper, num_workers=2, manifest_path=mpath)
+eq("*** a restarted engine RECOVERS presence from disk -- the whole prize ***",
+   m2._stats["manifest_loaded"], 2)
+eq("...and lookup now hits for a key stored before the restart",
+   m2.lookup(k_a, ctx2), True)
+
+# ...and an entry whose own file has gone is PRUNED, not trusted.
+os.unlink(FakeMapper.get_file_name(k_b))
+m3 = diskspec.DiskPresenceManager(FakeMapper, num_workers=2, manifest_path=mpath)
+eq("*** an entry whose file is gone is PRUNED ***", m3._stats["manifest_pruned"], 1)
+eq("...the survivor is kept", m3._stats["manifest_loaded"], 1)
+eq("...and lookup refuses the pruned key", m3.lookup(k_b, ctx2), False)
+eq("...while still hitting the live one", m3.lookup(k_a, ctx2), True)
+
+# a corrupt manifest must cost recompute, never correctness
+open(mpath, "w").write("{not json")
+m4 = diskspec.DiskPresenceManager(FakeMapper, num_workers=2, manifest_path=mpath)
+eq("*** an unreadable manifest yields an EMPTY index, not a wrong one ***",
+   len(m4._present), 0)
+eq("...so lookup simply misses", m4.lookup(k_a, ctx2), False)
+F.write(disk_restore=0)
+flags.reset_for_tests()
 
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")

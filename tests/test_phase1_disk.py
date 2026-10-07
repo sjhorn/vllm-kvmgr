@@ -243,12 +243,43 @@ eq("...dst is our disk medium", dst_cls.medium(), "DSPARK_DISK")
 # makes, done a second time on purpose: with no (DISK -> GPU) handler
 # registered, OffloadingWorker has nothing to route a load to, so a restore
 # cannot happen even if a later edit made lookup() optimistic.
-check("*** no (DISK -> GPU) handler is registered, so a restore is not even "
-      "routable ***",
+check("*** with disk_restore OFF, no (DISK -> GPU) handler exists at all, so "
+      "a restore is not even routable ***",
       not any(s.medium() == "DSPARK_DISK" and d.medium() == "GPU"
               for s, d, _ in triples))
+
 eq("the handler is built with our staging size", _built.get("staging_blocks"), 32)
 check("...and gets the spec, so it can reach file_mapper()", _built.get("spec") is sp)
+
+# ...and with the flag ON, BOTH directions appear. This is the one knob that
+# needs a restart -- handlers are registered once at boot -- so it is read once
+# here rather than per transfer, and the code says so rather than offering a
+# hot flip that could not work.
+F.write(disk_restore=1)
+flags.reset_for_tests()
+
+
+class _FakeLoad:
+    def __init__(self, **kw):
+        pass
+
+
+_rl = diskio.DiskLoadHandler
+diskio.DiskLoadHandler = _FakeLoad
+diskio.DiskStoreHandler = _FakeHandler
+try:
+    both = list(mkspec().get_handlers(kv_caches=object()))
+finally:
+    diskio.DiskLoadHandler = _rl
+    diskio.DiskStoreHandler = _real
+    F.write(disk_restore=0)
+    flags.reset_for_tests()
+
+eq("with disk_restore ON there are two handlers", len(both), 2)
+eq("...the store direction", (both[0][0].medium(), both[0][1].medium()),
+   ("GPU", "DSPARK_DISK"))
+eq("...and the load direction", (both[1][0].medium(), both[1][1].medium()),
+   ("DSPARK_DISK", "GPU"))
 
 print()
 print("== (1j) the file path: per-rank, per-group, under our root ==")

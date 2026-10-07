@@ -335,6 +335,56 @@ def write_geometry(kv_caches: Any, spec: Any, out_dir: str) -> str | None:
         return None
 
 
+def read_chunks(path: str, plan: "Sequence[Chunk]", write_row: Any) -> int:
+    """Read one file back into staging, refusing anything that is not exact.
+
+    *** THE SIZE CHECK HAPPENS BEFORE ANY BYTE IS READ, and that ordering is the
+    whole safety property. *** Upstream does not support transfer failure -- its
+    worker does `assert transfer_result.success` under the comment "we currently
+    do not support job failures" -- so a load has exactly two honest outcomes on
+    a bad file: kill the engine core, or hand back KV that is silently wrong.
+    There is no third. Checking the length first means a wrong file is caught
+    before anything reaches a GPU tensor, and the caller can refuse loudly.
+
+    The atomic rename in write_chunks is what makes a length check sufficient
+    for completeness: a path that exists was renamed into place whole, so it is
+    never a partial write. What length cannot catch is bit rot or a file from an
+    incompatible engine -- the first is accepted, the second is covered by
+    FileMapper's config fingerprint plus our own format root.
+    """
+    want = plan_nbytes(plan)
+    try:
+        have = os.path.getsize(path)
+    except OSError as e:
+        raise FileNotFoundError(
+            f"kvmgr: {path} is gone, but the presence index claimed it. "
+            f"Delete the manifest (presence.json) beside the KV to recover: it "
+            f"is a claim about every rank and can only be checked against one."
+        ) from e
+    if have != want:
+        raise ValueError(
+            f"kvmgr: {path} is {have} B, expected {want} B. REFUSING to load "
+            f"it -- a short or foreign file would decode as plausible KV and "
+            f"nothing downstream would notice."
+        )
+    got = 0
+    with open(path, "rb") as f:
+        for c in plan:
+            buf = f.read(c.nbytes)
+            # UNREACHABLE while the length check above precedes this loop, and
+            # labelled rather than pretended-tested: break-verification could
+            # not make it fire, because a file of the right TOTAL size cannot
+            # end early at a chunk boundary of the same plan. Kept as defence in
+            # depth for the day someone reorders the two.
+            if len(buf) != c.nbytes:
+                raise ValueError(
+                    f"kvmgr: {path} ended early at chunk {c.tensor_idx} "
+                    f"({len(buf)} of {c.nbytes} B)")
+            write_row(c.tensor_idx, c.slot, buf)
+            got += len(buf)
+    return got
+
+
 class DiskStoreHandler:
     """GPU -> pinned staging -> file, as one OffloadingHandler.
 
@@ -375,6 +425,7 @@ class DiskStoreHandler:
                 (staging_blocks, t.page_size_bytes * spec.block_size_factor),
                 dtype=torch.int8, device="cpu", pin_memory=pin))
 
+        self._gpu_tensors = gpu_tensors   # the load handler reuses these
         self._inner = SingleDirectionOffloadingHandler(
             gpu_tensors=gpu_tensors, cpu_tensors=self._staging,
             block_size_factor=spec.block_size_factor,
@@ -610,3 +661,200 @@ class DiskStoreHandler:
         return dict(self.stats, staging=self._pool.snapshot(),
                     group_file_sizes=self._sizes,
                     jobs_open=len(self._jobs), writes_open=len(self._writing))
+
+
+class DiskLoadHandler:
+    """file -> pinned staging -> GPU. The stages are the store's, reversed.
+
+    *** THE DESIGN IS SHAPED BY ONE UPSTREAM FACT: THERE IS NO SUCH THING AS A
+    FAILED LOAD. *** The connector worker does `assert transfer_result.success`
+    under the comment "we currently do not support job failures", and the
+    scheduler has no success branch at all -- it counts down pending_count and
+    calls complete_load. So a load that reports done is BELIEVED.
+
+    That leaves exactly two honest answers when a file is wrong: report failure
+    and kill the engine core, or report success and hand back KV that is
+    silently wrong. There is no third. We choose the first, loudly, every time --
+    a dead engine beats wrong tokens, and the log names the one file to delete.
+
+    Which is why `read_chunks` checks the length BEFORE reading a byte, and why
+    `lookup` carries the real safety burden: it is the only place that can keep
+    us out of that choice altogether.
+    """
+
+    def __init__(self, spec, kv_caches, staging_blocks: int, read_threads: int,
+                 store: "DiskStoreHandler"):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from vllm.v1.kv_offload.cpu.gpu_worker import (
+            SingleDirectionOffloadingHandler,
+        )
+
+        self._spec = spec
+        self._mapper = spec.file_mapper()
+        self._refs = store._refs
+        # SHARE the store handler's staging and pool. Two pools would double the
+        # pinned memory for no reason, and a load and a store never need the same
+        # slot at once -- the pool is what serialises them.
+        self._staging = store._staging
+        self._pool = store._pool
+        self._inner = SingleDirectionOffloadingHandler(
+            gpu_tensors=store._inner.gpu_tensors
+            if hasattr(store._inner, "gpu_tensors") else store._gpu_tensors,
+            cpu_tensors=self._staging,
+            block_size_factor=spec.block_size_factor,
+            kv_cache_groups_data_refs=self._refs,
+            gpu_to_cpu=False,
+        )
+        self._readers = ThreadPoolExecutor(max_workers=read_threads,
+                                          thread_name_prefix="kvmgr_diskrd")
+        self._jobs: dict[int, dict] = {}
+        self._reading: list[tuple[int, Any, list[int], list, int]] = []
+        self._inner_to_job: dict[int, tuple] = {}
+        self._next_inner = 1_000_000          # disjoint from the store's ids
+        self.stats = {"submitted": 0, "refused_pairing": 0, "files": 0,
+                      "bytes": 0, "errors": 0}
+        logger.info("kvmgr: disk LOAD handler installed (restore is live)")
+
+    def _write_row(self, tensor_idx: int, slot: int, buf) -> None:
+        self._staging[tensor_idx][slot][:len(buf)].numpy().data[:] = buf
+
+    def _read_batch(self, keys, slots, group_idx) -> int:
+        total = 0
+        for key, slot in zip(keys, slots):
+            path = self._mapper.get_file_name(key)
+            total += read_chunks(path, file_plan(self._refs, group_idx, slot),
+                                 self._write_row)
+            self.stats["files"] += 1
+        return total
+
+    def transfer_async(self, job_id: int, spec) -> bool:
+        from vllm.v1.kv_offload.base import get_offload_group_idx
+
+        disk_spec, gpu_spec = spec
+        keys = list(disk_spec.keys)
+        block_ids = list(gpu_spec.block_ids)
+        group_sizes = list(gpu_spec.group_sizes)
+        why = check_pairing(keys, block_ids, group_sizes, get_offload_group_idx)
+        if why is not None:
+            self.stats["refused_pairing"] += 1
+            logger.error("kvmgr: REFUSING load job %d -- %s", job_id, why)
+            return False
+        batches, off = [], 0
+        for g, n in enumerate(group_sizes):
+            if n:
+                batches.append([g, keys[off:off + n], block_ids[off:off + n]])
+            off += n
+        self._jobs[job_id] = {"batches": batches, "pending": 0, "bytes": 0,
+                              "failed": False}
+        self.stats["submitted"] += 1
+        self._pump()
+        return True
+
+    def _pump(self) -> None:
+        for job_id, st in self._jobs.items():
+            while st["batches"] and not st["failed"]:
+                g, bkeys, bids = st["batches"][0]
+                slots = self._pool.take_upto(len(bids))
+                if not slots:
+                    return
+                n = len(slots)
+                # Stage 1 for a LOAD is the FILE READ, on the thread pool.
+                fut = self._readers.submit(self._read_batch, bkeys[:n], slots, g)
+                self._reading.append((job_id, fut, slots, bids[:n], g))
+                st["pending"] += 1
+                if n == len(bids):
+                    st["batches"].pop(0)
+                else:
+                    st["batches"][0] = [g, bkeys[n:], bids[n:]]
+
+    def get_finished(self) -> list:
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+        from vllm.v1.kv_offload.worker.worker import TransferResult
+
+        ngroups = len(self._refs)
+        still = []
+        for job_id, fut, slots, bids, g in self._reading:
+            if not fut.done():
+                still.append((job_id, fut, slots, bids, g))
+                continue
+            st = self._jobs.get(job_id)
+            try:
+                nbytes = fut.result()
+            except Exception:
+                # A dead engine beats wrong tokens. The message read_chunks
+                # raises names the single file and the recovery.
+                self.stats["errors"] += 1
+                logger.critical(
+                    "kvmgr: *** DISK RESTORE FAILED for job %d -- refusing to "
+                    "hand back KV we cannot verify. The engine core will stop. "
+                    "Delete presence.json beside the KV and restart. ***",
+                    job_id, exc_info=True)
+                self._pool.give(slots)
+                if st is not None:
+                    st["failed"] = True
+                    st["pending"] -= 1
+                continue
+            if st is not None:
+                st["bytes"] += nbytes
+            self.stats["bytes"] += nbytes
+            # Stage 2: staging -> GPU.
+            gs = [0] * ngroups
+            gs[g] = len(bids)
+            inner = self._next_inner
+            self._next_inner += 1
+            ok = self._inner.transfer_async(
+                inner, (CPULoadStoreSpec(slots),
+                        GPULoadStoreSpec(bids, group_sizes=gs,
+                                         block_indices=[0] * ngroups)))
+            if not ok:
+                self._pool.give(slots)
+                if st is not None:
+                    st["failed"] = True
+                    st["pending"] -= 1
+                continue
+            self._inner_to_job[inner] = (job_id, slots)
+        self._reading = still
+
+        for res in self._inner.get_finished():
+            ent = self._inner_to_job.pop(res.job_id, None)
+            if ent is None:
+                continue
+            job_id, slots = ent
+            self._pool.give(slots)
+            st = self._jobs.get(job_id)
+            if st is None:
+                continue
+            if not res.success:
+                st["failed"] = True
+            st["pending"] -= 1
+
+        self._pump()
+
+        out = []
+        for job_id in [j for j, st in self._jobs.items()
+                       if st["pending"] == 0 and (not st["batches"] or st["failed"])]:
+            st = self._jobs.pop(job_id)
+            out.append(TransferResult(
+                job_id=job_id, success=not st["failed"],
+                transfer_size=st["bytes"] if not st["failed"] else None,
+                transfer_type=(self._spec.disk_medium, "GPU")))
+        return out
+
+    def wait(self, job_ids: set) -> None:
+        import time
+        deadline = time.monotonic() + 600.0
+        rem = set(job_ids)
+        while rem and time.monotonic() < deadline:
+            for r in self.get_finished():
+                rem.discard(r.job_id)
+            if rem:
+                time.sleep(0.0005)
+
+    def shutdown(self) -> None:
+        self._readers.shutdown(wait=True)
+
+    def snapshot(self) -> dict:
+        return dict(self.stats, jobs_open=len(self._jobs),
+                    reads_open=len(self._reading))
