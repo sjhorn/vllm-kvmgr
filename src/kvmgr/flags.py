@@ -84,6 +84,10 @@ DEFAULTS: dict[str, Any] = {
     # hybrid KV layout can reach the disk tier. See kvmgr/offload.py for why
     # that is defensible and -- more importantly -- what it does NOT prove.
     "offload_allow_hybrid": False,
+    # The fs tier opens every block with O_DIRECT, which needs 512-aligned
+    # lengths; our 2,103,552-byte blocks are not (mod 512 = 256), so every
+    # write failed with EINVAL. False drops the flag. See kvmgr/offload.py.
+    "offload_odirect": False,
     # pre-existing, preserved unchanged -- listed so this table is the whole
     # surface and nothing is hot-by-accident or cold-by-omission.
     "swa_recycle": True,

@@ -68,6 +68,98 @@ from . import flags
 logger = init_logger("vllm." + __name__)
 
 
+_real_odirect: int | None = None
+
+
+def install_io() -> bool:
+    """Drop `O_DIRECT` from the fs tier's block writes.
+
+    WHY NOTHING REACHED DISK, measured 2026-10-07: `tiering/fs/io.py` opens
+    every block with O_DIRECT, which requires the length and offset to be
+    multiples of the device logical block size. Ours are not --
+
+        per-block CPU page : 2,103,552 bytes
+        mod  512 : 256      (nvme0n1 LOG-SEC is 512)
+        mod 4096 : 2,304
+
+    -- so every write was rejected before a byte landed:
+
+        ERROR [thread_pool.py:150] FileSystemTierManagerPython:
+              job 208 block I/O failed: [Errno 22] Invalid argument
+
+    13,519 of them in one boot, against 1 file on disk. The 17,222 directories
+    exist because `mkdir` succeeds; only the writes fail.
+
+    *** WHY DROP IT RATHER THAN PAD THE WRITES. *** Padding to a 512 boundary
+    keeps O_DIRECT's benefits, and it means the writer must record the TRUE
+    length and the reader must honour it. Get that wrong and the reader returns
+    padding as KV -- it CORRUPTS rather than failing. Dropping the flag cannot:
+    the write either succeeds whole or raises. And it is not an invention --
+    `io.py` itself resolves O_DIRECT to 0 wherever the platform lacks it
+    (`getattr(os, "O_DIRECT", 0)`, for macOS), so the no-O_DIRECT path is a
+    configuration upstream already supports.
+
+    *** THE COST, WHICH IS REAL ON THIS BOX. *** Without O_DIRECT the writes go
+    through the page cache, and host RAM is the scarce resource here
+    (MemAvailable ~1.7 GB with the 1.07 GB /dev/shm tier live). Page cache is
+    reclaimable, so the kernel gives it back under pressure rather than OOMing
+    -- but it can drive swap, and swap is earlyoom's real gate on these nodes.
+    WATCH MemAvailable AND SwapFree while this is on. The proper fix if it bites
+    is posix_fadvise(POSIX_FADV_DONTNEED) after each write, which is a change to
+    io.py's own logic rather than one integer, and is deliberately not done here.
+
+    Hot: the flag is re-read per block I/O, so it can be flipped on a running
+    engine like every other knob.
+    """
+    global _real_odirect
+    try:
+        from vllm.v1.kv_offload.tiering.fs import io as fsio
+    except Exception:
+        return False
+
+    if getattr(fsio, "_kvmgr_odirect_wrapped", False):
+        return True
+
+    if _real_odirect is None:
+        _real_odirect = int(getattr(fsio, "O_DIRECT", 0) or 0)
+
+    def _sync() -> None:
+        # O_DIRECT is a module-level int that io.py ORs into every os.open, so
+        # setting it here is exactly "use O_DIRECT or do not". Both I/O threads
+        # would write the same value, so the race is benign.
+        want = _real_odirect if flags.raw("offload_odirect") else 0
+        if getattr(fsio, "O_DIRECT", None) != want:
+            fsio.O_DIRECT = want
+
+    def _wrap(fn):
+        def inner(*args, **kwargs):
+            try:
+                _sync()
+            except Exception:
+                pass  # never fail a block transfer over a flag read
+            return fn(*args, **kwargs)
+
+        inner.__name__ = getattr(fn, "__name__", "wrapped")
+        return inner
+
+    for name in ("store_block", "load_block"):
+        fn = getattr(fsio, name, None)
+        if fn is not None:
+            setattr(fsio, name, _wrap(fn))
+
+    fsio._kvmgr_odirect_wrapped = True  # type: ignore[attr-defined]
+    _sync()
+    logger.info(
+        "kvmgr: fs-tier O_DIRECT shim installed (platform O_DIRECT=%s; "
+        "offload_odirect=%s -> effective O_DIRECT=%s). Dropping it is what lets "
+        "a %d-byte block write at all; watch MemAvailable and SwapFree, because "
+        "the writes then go through the page cache.",
+        _real_odirect, flags.raw("offload_odirect"),
+        getattr(fsio, "O_DIRECT", "?"), 2103552,
+    )
+    return True
+
+
 def install() -> bool:
     """Wrap `TieringOffloadingSpec.get_manager`. Idempotent and total.
 
@@ -151,4 +243,7 @@ def install() -> bool:
         "kvmgr: hybrid-offload shim installed (opt-in, off unless "
         "offload_allow_hybrid is set)"
     )
+    # The fs tier's O_DIRECT is a separate defect with a separate knob, so the
+    # two can be A/B'd independently.
+    install_io()
     return True

@@ -241,6 +241,102 @@ eq("and defaults to False", flags.DEFAULTS["offload_allow_hybrid"], False)
 check("it is NOT in BLOCKED (it is buildable, unlike the disk_* knobs)",
       "offload_allow_hybrid" not in flags.BLOCKED)
 
+# ---------------------------------------------------------------------------
+# 9. THE O_DIRECT SHIM -- what actually stopped anything reaching disk
+# ---------------------------------------------------------------------------
+# Measured: our per-block CPU page is 2,103,552 bytes; mod 512 = 256, and the
+# device logical sector is 512. O_DIRECT needs an aligned length, so every write
+# failed with EINVAL -- 13,519 times in one boot, against 1 file on disk.
+eq("the real block size is NOT 512-aligned (the whole cause)",
+   2103552 % 512, 256)
+eq("nor 4096-aligned", 2103552 % 4096, 2304)
+
+# Section 7 removed the kv_offload chain from sys.modules, so rebuild it --
+# otherwise this section fails for the wrong reason.
+for _n in ("vllm.v1.kv_offload", "vllm.v1.kv_offload.tiering",
+           "vllm.v1.kv_offload.tiering.fs", "vllm.v1.kv_offload.tiering.fs.io"):
+    if _n not in sys.modules:
+        _m = types.ModuleType(_n)
+        sys.modules[_n] = _m
+        _par, _, _leaf = _n.rpartition(".")
+        setattr(sys.modules[_par], _leaf, _m)
+_fsio = sys.modules["vllm.v1.kv_offload.tiering.fs.io"]
+
+PLATFORM_ODIRECT = 0x4000          # what Linux os.O_DIRECT actually is
+_fsio.O_DIRECT = PLATFORM_ODIRECT
+_opens: list = []
+
+
+def _store_block(*a, **kw):
+    _opens.append(("store", _fsio.O_DIRECT))
+    return "stored"
+
+
+def _load_block(*a, **kw):
+    _opens.append(("load", _fsio.O_DIRECT))
+    return "loaded"
+
+
+_fsio.store_block = _store_block
+_fsio.load_block = _load_block
+
+offload._real_odirect = None
+check("install_io() reports success", offload.install_io() is True)
+check("install_io() is idempotent", offload.install_io() is True)
+
+flags.reset_for_tests()
+F.write(offload_odirect=0)
+_opens.clear()
+eq("a store still returns normally", _fsio.store_block("x"), "stored")
+eq("*** and O_DIRECT was 0 for that write -- which is what makes a "
+   "2,103,552-byte block writable at all ***", _opens[-1], ("store", 0))
+eq("the load path too", _fsio.load_block("x"), "loaded")
+eq("also with O_DIRECT 0", _opens[-1], ("load", 0))
+
+# HOT: flip it back on without a restart
+F.write(offload_odirect=1)
+_opens.clear()
+_fsio.store_block("x")
+eq("*** offload_odirect is HOT -- O_DIRECT comes back with no restart ***",
+   _opens[-1], ("store", PLATFORM_ODIRECT))
+F.write(offload_odirect=0)
+_fsio.store_block("x")
+eq("and goes away again", _opens[-1], ("store", 0))
+
+eq("the default is OFF, i.e. dropped -- the engine cannot write otherwise",
+   flags.DEFAULTS["offload_odirect"], False)
+
+# it must never fail a transfer over a flag read
+_bad = {"n": 0}
+_orig_raw = flags.raw
+
+
+def _boom(name):
+    if name == "offload_odirect":
+        _bad["n"] += 1
+        raise RuntimeError("flags exploded")
+    return _orig_raw(name)
+
+
+flags.raw = _boom  # type: ignore[assignment]
+try:
+    eq("a flag-read failure does NOT fail the block transfer",
+       _fsio.store_block("x"), "stored")
+    check("and it was actually exercised", _bad["n"] > 0)
+finally:
+    flags.raw = _orig_raw  # type: ignore[assignment]
+
+# absent fs io module -> quiet no-op
+for _n in ("vllm.v1.kv_offload.tiering.fs.io", "vllm.v1.kv_offload.tiering.fs"):
+    sys.modules.pop(_n, None)
+offload._real_odirect = None
+harness.clear_log()
+eq("install_io() returns False when the fs tier is absent",
+   offload.install_io(), False)
+
+check("offload_odirect is in DEFAULTS so the hot-config suite covers it",
+      "offload_odirect" in flags.DEFAULTS)
+
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()
