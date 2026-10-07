@@ -316,8 +316,9 @@ eq("a reader still reports the blocked knob as OFF",
    snap["policy"]["disk_enabled"], False)
 txt = harness.log_text()
 check("and the REFUSAL is logged through the reader path", "REFUSED" in txt)
-check("carrying the reason and the upstream blocker",
-      "NO KV BYTES" in txt and "vllm#45663" in txt, txt[:160])
+check("carrying the reason and a pointer (re-aimed: the old assertion pinned "
+      "vllm#45663, which was never the real blocker)",
+      "superseded" in txt and "diskspec.py" in txt, txt[:160])
 
 # ...once, not on every poll: a reader is on a timer.
 harness.clear_log()

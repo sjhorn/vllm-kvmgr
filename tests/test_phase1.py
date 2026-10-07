@@ -436,14 +436,22 @@ for name in ("disk_enabled", "disk_restore", "disk_budget_gb"):
     check(f"{name}'s refusal says REFUSED", "REFUSED" in txt)
     check(f"{name}'s refusal carries the REASON, so the next person to reach "
           f"for the flag learns it from the log",
-          "NO KV BYTES" in txt or "same layer problem" in txt
-          or "nothing writes to disk" in txt, txt[:200])
+          "superseded" in txt or "CORRECTNESS HAZARD" in txt
+          or "bounds nothing" in txt, txt[:200])
 
-check("the reason names the upstream blocker, not just our layer",
-      "vllm#45663" in flags.BLOCKED["disk_enabled"],
-      "the sparse indexer OOMs past ~120K tokens against a 570K working set")
-check("and points at the write-up",
-      "KVMGR-PHASE45" in flags.BLOCKED["disk_enabled"])
+# *** THESE TWO ASSERTED THE OLD, WRONG CAUSE and were re-aimed 2026-10-07
+# rather than deleted: the property is right (a refusal must name a cause and
+# point somewhere) and only the cause moved. The old reason blamed vllm#45663
+# and "NO KV BYTES"; what actually gates restore is measured -- every file the
+# tiering tier wrote has rank>0's half EXACTLY ZERO.
+check("disk_restore's reason names the MEASURED hazard, not a layer argument",
+      "SECOND HALF EXACTLY ZERO" in flags.BLOCKED["disk_restore"],
+      "a half-zero page restores as half the KV silently wrong")
+check("...and says why that is worse than no cache (the F8_E8M0 class)",
+      "F8_E8M0" in flags.BLOCKED["disk_restore"])
+for _k in ("disk_enabled", "disk_restore"):
+    check(f"{_k}'s refusal still POINTS somewhere",
+          "diskspec.py" in flags.BLOCKED[_k])
 
 # raw() still reports what was ASKED FOR -- the refusal is knob()'s job, so a
 # reader can tell "nobody set it" from "it was set and refused".

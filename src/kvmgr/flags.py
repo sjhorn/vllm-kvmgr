@@ -122,19 +122,40 @@ _VALID = {
 # silently.  The reason is carried here, next to the knob, because the next
 # person to try will reach for the flag before the write-up.
 BLOCKED: dict[str, str] = {
+    # *** THESE REASONS WERE REWRITTEN 2026-10-07 AND THE OLD ONES WERE WRONG,
+    # which is worth keeping because they were wrong in an instructive way. ***
+    # They said a disk tier was unbuildable at the manager layer -- true, a
+    # KVCacheBlock holds no bytes -- and then concluded the whole path was
+    # parked on vllm#45663. It is not. vllm/v1/kv_offload RAN, wrote 27 GB, and
+    # the real obstacles turned out to be two things that reason never mentioned:
+    # a random per-boot Merkle root (fixed: PYTHONHASHSEED), and upstream's
+    # offload consolidating every rank's shard into ONE SHARED HOST region,
+    # which is single-host TP by construction while ours is one rank per node.
     "disk_enabled": (
-        "a KV cache manager holds NO KV BYTES. KVCacheBlock is metadata only "
-        "(block_id, ref_cnt, hash) and across the whole manager/coordinator "
-        "layer there is not one reference to a tensor or a device -- the "
-        "tensors live in the WORKER processes, indexed by block_id. Writing "
-        "them needs worker-side code, i.e. a KVConnector, which is what "
-        "vllm/v1/kv_offload already is. That path is parked on vllm#45663: the "
-        "sparse indexer materialises every KV block at once and OOMs past "
-        "~120K tokens against a 570K working set. See "
-        "docs/local/KVMGR-PHASE45-20261007.md"
+        "superseded. The write path works and is being replaced rather than "
+        "unblocked: kvmgr/diskspec.py puts the disk transfer WORKER-SIDE so "
+        "each rank persists its own slice. Until that spec is the live one, "
+        "this knob toggles nothing, because what writes today is upstream's "
+        "tiering tier via KV_TRANSFER_CONFIG and not a flag. "
+        "See kvmgr/diskspec.py and docs/local/KVMGR-PHASE45-20261007.md"
     ),
-    "disk_restore": "same layer problem as disk_enabled; see its reason",
-    "disk_budget_gb": "nothing writes to disk, so a byte budget bounds nothing",
+    "disk_restore": (
+        "*** BLOCKED ON A MEASURED CORRECTNESS HAZARD, not on missing code. *** "
+        "Every .bin the tiering tier wrote is page*world_size bytes with the "
+        "SECOND HALF EXACTLY ZERO -- rank 1's slice, never written, because the "
+        "secondary tiers are scheduler-side and /dev/shm does not cross "
+        "machines. Restoring one loads half-zero pages: half the KV silently "
+        "wrong, nothing crashing, which is the F8_E8M0 failure class. "
+        "prepare_load never having fired is the ONLY reason this has not "
+        "already produced garbage. Unblocks when Phase 3 proves a restored "
+        "block equals what was stored -- and 6,141 of those half-empty files "
+        "are still on disk, which is why diskspec.py writes under its own root."
+    ),
+    "disk_budget_gb": (
+        "Phase 5. Nothing we control writes to disk yet, so a byte budget "
+        "bounds nothing -- and bounding the TIERING tier's writes is not ours "
+        "to do from here."
+    ),
 }
 
 # Values implemented SO FAR.  A knob set to a recognised-but-unbuilt value falls
