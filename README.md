@@ -30,7 +30,18 @@ image rebuild** — Tier-4 rebuilds trigger only on `recipe/overlay/` moving ahe
 of the image.
 
 	git push head local/main && git push worker local/main
-	# then restart; a push is not a restart.
+	./stop-deepseek-v4-flash-dspark.sh && ./start-deepseek-v4-flash-dspark.sh
+
+**A PUSH IS NOT A RESTART, AND `start-…sh` ALONE IS NOT A RECREATE.** Measured
+2026-10-07: running the start script against an already-running engine printed
+`Container … Running` and exited 0 — because the container *spec* had not
+changed, so compose had nothing to do. A bind-mounted `.py` edit is invisible to
+compose, and the live processes keep the modules they imported at boot. The
+second deploy of the day looked successful and ran the previous code.
+
+So an engine-side Python change needs `stop` then `start` (or
+`up -d --force-recreate`). The tell is the **container id**: if it is the same
+id as before, nothing was reloaded.
 
 ## The kill switch is read PER CALL, and that is not a detail
 
