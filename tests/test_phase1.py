@@ -154,6 +154,38 @@ eq("and the per-group windows, which by_need needs",
    DSparkMLAAttentionManager.group_sliding_windows, (None, 128, 128, 128, 128))
 
 # ---------------------------------------------------------------------------
+# 1b. EVERY LOGGER MUST SIT UNDER THE `vllm.` NAMESPACE
+# ---------------------------------------------------------------------------
+# vLLM hands a handler to the `vllm` logger only, propagate=false, with no root
+# handler -- so a logger named `kvmgr.flags` has NO handler and an effective
+# level of 30 (WARNING), and every info() is dropped. Measured in the running
+# container 2026-10-07, which is how the first deploy came up with the
+# registration line, the cap line, the flag-change line and the env audit all
+# INVISIBLE -- indistinguishable from the plugin never having loaded.
+import glob  # noqa: E402
+
+_plugin_dir = os.path.join(REPO_ROOT := os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))), "patches", "kvmgr_plugin", "kvmgr")
+_mods = sorted(glob.glob(os.path.join(_plugin_dir, "*.py")))
+check("found the plugin modules", len(_mods) >= 6, f"{len(_mods)}")
+for _m in _mods:
+    _src = open(_m).read()
+    _name = os.path.basename(_m)
+    if "init_logger(" not in _src:
+        continue
+    bare = "init_logger(__name__)" in _src
+    namespaced = 'init_logger("vllm." + __name__)' in _src
+    check(f"{_name}: logger is under the vllm namespace, not bare __name__",
+          namespaced and not bare,
+          "a bare __name__ logger has effective level 30 and drops every info()")
+
+# And the live objects agree, which is the half a source grep cannot see.
+for _lg in (flags.logger, _mgr_mod_logger := __import__(
+        "kvmgr.manager", fromlist=["logger"]).logger):
+    check(f"{_lg.name}: name starts with 'vllm.'", _lg.name.startswith("vllm."),
+          _lg.name)
+
+# ---------------------------------------------------------------------------
 # 2. PARITY -- the cap agrees with patch6, block for block
 # ---------------------------------------------------------------------------
 for frac in (0.30, 0.50, 0.75, 1.00, 0.0):

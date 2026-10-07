@@ -42,7 +42,22 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 
 from . import flags, policy, serve, stats
 
-logger = init_logger(__name__)
+# *** THE LOGGER NAME IS LOAD-BEARING, and `__name__` is the wrong one. ***
+#
+# vLLM's logging config gives a handler to the `vllm` logger ONLY, with
+# propagate=false, and configures no root handler. So a logger named
+# `kvmgr.flags` has NO handler and an EFFECTIVE LEVEL OF 30 (WARNING) --
+# every logger.info() it makes is silently dropped. Measured in the running
+# container 2026-10-07:
+#
+#   init_logger("kvmgr.register")       handlers [] effective 30  -> dropped
+#   init_logger("vllm.kvmgr.register")  handlers [] effective 20  -> printed
+#
+# That cost us the whole "did it take?" story on the first deploy: the
+# registration line, the cap-on-change line, the flag-change line and the env
+# audit were all invisible, which is indistinguishable from the plugin never
+# having loaded. Naming the logger under `vllm.` makes it inherit that handler.
+logger = init_logger("vllm." + __name__)
 
 
 class DSparkMLAAttentionManager(MLAAttentionManager):
