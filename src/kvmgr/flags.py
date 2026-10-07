@@ -92,6 +92,17 @@ DEFAULTS: dict[str, Any] = {
     # store I/O. Exists because this engine's OUTPUT is not deterministic, so an
     # output-equivalence gate proves nothing -- see kvmgr/offload.install_verify.
     "offload_verify": False,
+    # *** DROP THE GPU PREFIX CACHE WITHOUT A REBOOT, by bumping this integer.
+    # *** The point is the DISK TIER SURVIVES: block_pool.reset_prefix_cache()
+    # is the POOL's method, not the connector's, so it never reaches our
+    # presence index. That asymmetry is what turns "test the restore path" from
+    # a two-boot, twelve-minute ritual into an edit of this file -- and this
+    # build exposes no reset endpoint at all (POST /reset_prefix_cache is 404
+    # and no such route is registered), so there was no other lever.
+    #
+    # An INTEGER rather than a boolean because the useful operation is "do it
+    # again", and a bool can only be flipped once. The manager acts on the EDGE.
+    "gpu_cache_epoch": 0,
     # pre-existing, preserved unchanged -- listed so this table is the whole
     # surface and nothing is hot-by-accident or cold-by-omission.
     "swa_recycle": True,
@@ -121,6 +132,17 @@ _VALID = {
 # Setting one of these does nothing useful, so it must say why rather than fail
 # silently.  The reason is carried here, next to the knob, because the next
 # person to try will reach for the flag before the write-up.
+# *** disk_restore WAS IN HERE AND IT WAS LIVE ANYWAY, which is the defect this
+# removal fixes rather than hides. *** The restore gates read it with `raw()`,
+# which is documented as doing no validation -- so the flags file turned the
+# feature ON while BLOCKED said it was off and the /kv endpoint reported
+# `disk_restore: False`. A feature running while every reader denies it is the
+# "refusal nobody can see" failure pointed the other way round, and it is worse,
+# because the thing nobody can see is ENABLED.
+#
+# Two changes together: it is out of this table (it is built, and Phase 3 is
+# deliberately exercising it), and the gates now use a VALIDATED read so that an
+# entry here means blocked FOR REAL rather than blocked-unless-someone-used-raw.
 BLOCKED: dict[str, str] = {
     # *** THESE REASONS WERE REWRITTEN 2026-10-07 AND THE OLD ONES WERE WRONG,
     # which is worth keeping because they were wrong in an instructive way. ***
@@ -139,22 +161,10 @@ BLOCKED: dict[str, str] = {
         "tiering tier via KV_TRANSFER_CONFIG and not a flag. "
         "See kvmgr/diskspec.py and docs/local/KVMGR-PHASE45-20261007.md"
     ),
-    "disk_restore": (
-        "*** BLOCKED ON A MEASURED CORRECTNESS HAZARD, not on missing code. *** "
-        "Every .bin the tiering tier wrote is page*world_size bytes with the "
-        "SECOND HALF EXACTLY ZERO -- rank 1's slice, never written, because the "
-        "secondary tiers are scheduler-side and /dev/shm does not cross "
-        "machines. Restoring one loads half-zero pages: half the KV silently "
-        "wrong, nothing crashing, which is the F8_E8M0 failure class. "
-        "prepare_load never having fired is the ONLY reason this has not "
-        "already produced garbage. Unblocks when Phase 3 proves a restored "
-        "block equals what was stored -- and 6,141 of those half-empty files "
-        "are still on disk, which is why diskspec.py writes under its own root."
-    ),
     "disk_budget_gb": (
         "Phase 5. Nothing we control writes to disk yet, so a byte budget "
         "bounds nothing -- and bounding the TIERING tier's writes is not ours "
-        "to do from here."
+        "to do from here. See kvmgr/diskspec.py"
     ),
 }
 

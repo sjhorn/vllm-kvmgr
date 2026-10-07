@@ -504,6 +504,72 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
             # Recompute (which logs the new cap) and then act on it.
             self._max_protected_prompt_blocks()
             self.kvmgr_reconcile()
+        if flags.changed("gpu_cache_epoch"):
+            self.kvmgr_drop_gpu_cache()
+
+    def kvmgr_drop_gpu_cache(self) -> bool:
+        """Forget every cached prefix in the GPU pool, KEEPING the disk tier.
+
+        *** THIS IS THE LEVER THAT REMOVES THE REBOOT FROM A RESTORE TEST. ***
+        Proving the disk read path works needs a GPU cache that has forgotten a
+        prefix the disk still holds, and until now the only way to get there was
+        a full restart: ~4 minutes of boot plus a cold prefill, twice per
+        experiment. This build exposes no reset at all -- POST
+        /reset_prefix_cache is 404 and no such route is registered -- so there
+        was no other way in.
+
+        What makes it work is an asymmetry worth stating plainly:
+        `block_pool.reset_prefix_cache()` is the POOL's method, while the thing
+        that would throw away our disk index is the CONNECTOR's `reset_cache()`.
+        Going at the pool directly never touches the index, so the GPU forgets
+        and the disk remembers -- which is exactly the state a restore test
+        needs and is otherwise only reachable by rebooting.
+
+        *** AND IT HAS TO RELEASE OUR OWN PROTECTED BLOCKS FIRST. *** patch7
+        refuses the reset unless every block is free (`num_used_blocks != 1`
+        counting the null block), and MNT-6a's whole job is to hold references
+        so prompt blocks survive their request. So with protection in force the
+        reset could only ever return False, and the useful operation is the pair:
+        release, then reset.
+
+        Returns True only if the pool really did reset, and says so either way --
+        a drop that silently did nothing would send somebody hunting for a bug in
+        the read path that was never exercised.
+        """
+        pool = getattr(self, "block_pool", None)
+        if pool is None or not hasattr(pool, "reset_prefix_cache"):
+            logger.error("kvmgr: no block pool to drop (nothing was reset)")
+            return False
+        # Report FREE BLOCKS rather than a release count: our override returns
+        # None, and free blocks are the quantity patch7 actually gates on
+        # (`num_used_blocks != 1`), so this says whether the reset COULD work.
+        def _free():
+            try:
+                return pool.get_num_free_blocks()
+            except Exception:
+                return None
+
+        before = _free()
+        try:
+            self.release_protected_prompt_blocks()
+        except Exception:
+            logger.exception("kvmgr: releasing protected blocks failed")
+        after = _free()
+        try:
+            ok = bool(pool.reset_prefix_cache())
+        except Exception:
+            logger.exception("kvmgr: block_pool.reset_prefix_cache() raised")
+            ok = False
+        logger.info(
+            "kvmgr: GPU prefix cache drop -- pool free blocks %s -> %s, "
+            "reset %s. The DISK index is untouched by design (this is the "
+            "pool's reset, not the connector's), so the next identical prompt "
+            "must come back off disk or not at all.%s",
+            before, after, "OK" if ok else "REFUSED",
+            "" if ok else " Refused means blocks are still referenced -- let the"
+                          " engine go idle and bump gpu_cache_epoch again.",
+        )
+        return ok
 
 
 _AUDITED = False

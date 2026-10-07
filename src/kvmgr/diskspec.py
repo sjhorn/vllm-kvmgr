@@ -219,7 +219,7 @@ class DiskPresenceManager(OffloadingManager):
     # -- reads ------------------------------------------------------------
     def lookup(self, key: "OffloadKey", req_context: "ReqContext") -> bool | None:
         self._stats["lookup"] += 1
-        if not flags.raw("disk_restore"):
+        if not flags.peek("disk_restore"):
             # Write-only by construction: the scheduler only calls prepare_load
             # for keys lookup claimed, so returning False here means no file can
             # reach a GPU tensor at all. See this module's docstring.
@@ -232,7 +232,7 @@ class DiskPresenceManager(OffloadingManager):
     def prepare_load(
         self, keys: "Collection[OffloadKey]", req_context: "ReqContext"
     ) -> LoadStoreSpec:
-        if not flags.raw("disk_restore"):
+        if not flags.peek("disk_restore"):
             # Unreachable unless lookup lied. Loud rather than best-effort: a
             # silent half-load is the one outcome worse than no cache at all.
             raise RuntimeError(
@@ -297,7 +297,7 @@ class DiskPresenceManager(OffloadingManager):
     def snapshot(self) -> dict[str, Any]:
         return dict(self._stats, present=len(self._present),
                     num_workers=self._num_workers,
-                    restore_enabled=bool(flags.raw("disk_restore")))
+                    restore_enabled=bool(flags.peek("disk_restore")))
 
 
 class DSparkDiskOffloadingSpec(OffloadingSpec):
@@ -438,7 +438,7 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
         # and cannot appear later, so a hot read would promise something the
         # framework cannot deliver. This is the one knob that needs a restart,
         # and saying so is better than a flag that silently does nothing.
-        if flags.raw("disk_restore"):
+        if flags.peek("disk_restore"):
             self._load_handler = DiskLoadHandler(
                 spec=self, kv_caches=kv_caches,
                 staging_blocks=self.staging_blocks,

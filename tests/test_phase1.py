@@ -280,6 +280,7 @@ PROBE = {
     "offload_allow_hybrid": (0, 1),
     "offload_odirect": (0, 1),
     "offload_verify": (0, 1),
+    "gpu_cache_epoch": (0, 7),
     "swa_recycle": (1, 0),
     "swa_recycle_cached": (0, 1),
     "free_queue_prepend_uncached": (0, 1),
@@ -426,7 +427,7 @@ finally:
 # ---------------------------------------------------------------------------
 # 5b. A KNOB THAT CANNOT WORK AT THIS LAYER REFUSES, WITH THE REASON
 # ---------------------------------------------------------------------------
-for name in ("disk_enabled", "disk_restore", "disk_budget_gb"):
+for name in ("disk_enabled", "disk_budget_gb"):
     flags.reset_for_tests()
     harness.clear_log()
     F.write(**{name: (1 if isinstance(flags.DEFAULTS[name], bool) else 64.0)})
@@ -444,12 +445,22 @@ for name in ("disk_enabled", "disk_restore", "disk_budget_gb"):
 # point somewhere) and only the cause moved. The old reason blamed vllm#45663
 # and "NO KV BYTES"; what actually gates restore is measured -- every file the
 # tiering tier wrote has rank>0's half EXACTLY ZERO.
-check("disk_restore's reason names the MEASURED hazard, not a layer argument",
-      "SECOND HALF EXACTLY ZERO" in flags.BLOCKED["disk_restore"],
-      "a half-zero page restores as half the KV silently wrong")
-check("...and says why that is worse than no cache (the F8_E8M0 class)",
-      "F8_E8M0" in flags.BLOCKED["disk_restore"])
-for _k in ("disk_enabled", "disk_restore"):
+# *** disk_restore IS NO LONGER BLOCKED, and the removal fixed a real defect
+# rather than relaxing a guard. *** It was in BLOCKED while the restore gates
+# read it with raw() -- which does no validation -- so the feature ran while
+# BLOCKED said it was off and /kv reported disk_restore: False. A capability
+# live behind a reader that denies it is worse than a refusal nobody can see.
+# Now: it is out of the table (it is built), and the gates use a VALIDATED read
+# so an entry here means blocked for real.
+check("disk_restore is NOT in BLOCKED any more",
+      "disk_restore" not in flags.BLOCKED)
+check("*** and the restore gates use a VALIDATED read, so a future BLOCKED "
+      "entry would actually block ***",
+      'flags.raw("disk_restore")' not in open(os.path.join(
+          os.path.dirname(os.path.dirname(os.path.dirname(
+              os.path.abspath(__file__)))),
+          "patches", "kvmgr_plugin", "kvmgr", "diskspec.py")).read())
+for _k in ("disk_enabled", "disk_budget_gb"):
     check(f"{_k}'s refusal still POINTS somewhere",
           "diskspec.py" in flags.BLOCKED[_k])
 

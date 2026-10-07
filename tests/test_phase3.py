@@ -474,6 +474,122 @@ check("a lineage is keyed by a block HASH, so nothing here holds content",
       isinstance(key, (bytes, bytearray)), f"{type(key).__name__}")
 
 # ---------------------------------------------------------------------------
+
+
+print()
+print("== (3f) DROPPING THE GPU CACHE LIVE, which removes the reboot ==")
+
+# Why this exists: proving the disk read path needs a GPU cache that has
+# forgotten a prefix the disk still holds, and until now that state was only
+# reachable by restarting -- ~4 minutes plus a cold prefill, twice per
+# experiment. This build exposes NO reset (POST /reset_prefix_cache is 404 and
+# no such route is registered), so the lever had to be ours.
+#
+# The asymmetry that makes it work: block_pool.reset_prefix_cache() is the
+# POOL's method, while the thing that would discard our disk index is the
+# CONNECTOR's reset_cache(). Going at the pool never touches the index.
+
+
+class _Pool:
+    def __init__(self, free, resets_ok=True):
+        self._free = free
+        self.resets_ok = resets_ok
+        self.reset_calls = 0
+
+    def get_num_free_blocks(self):
+        return self._free
+
+    def reset_prefix_cache(self):
+        self.reset_calls += 1
+        return self.resets_ok
+
+
+def _mgr_with_pool(pool, release=None):
+    obj = DSparkMLAAttentionManager.__new__(DSparkMLAAttentionManager)
+    obj.block_pool = pool
+    obj.release_protected_prompt_blocks = release or (lambda *a, **k: None)
+    return obj
+
+
+flags.reset_for_tests()
+pool = _Pool(free=22000)
+released = []
+m = _mgr_with_pool(pool, release=lambda *a, **k: released.append(1))
+harness.clear_log()
+ok = m.kvmgr_drop_gpu_cache()
+check("*** the drop resets the POOL, not the connector, so the disk index "
+      "cannot be collateral ***", pool.reset_calls == 1)
+eq("...it releases our protected blocks FIRST, because patch7 refuses the "
+   "reset unless every block is free", len(released), 1)
+check("...and reports success", ok is True)
+txt = harness.log_text()
+check("...logging the free-block movement, which is what patch7 gates on",
+      "free blocks" in txt)
+check("...and stating that the disk index is untouched BY DESIGN",
+      "DISK index is untouched" in txt)
+
+# A refusal must say so and say what to do -- a drop that silently did nothing
+# would send somebody hunting a bug in a read path that never ran.
+pool2 = _Pool(free=10, resets_ok=False)
+m2 = _mgr_with_pool(pool2)
+harness.clear_log()
+eq("a refused reset returns False", m2.kvmgr_drop_gpu_cache(), False)
+txt2 = harness.log_text()
+check("*** and says REFUSED rather than looking like it worked ***",
+      "REFUSED" in txt2)
+check("...naming the cause and the remedy (go idle, bump it again)",
+      "still referenced" in txt2 and "gpu_cache_epoch" in txt2)
+
+# No pool at all must not raise -- this runs on a scheduler step.
+m3 = DSparkMLAAttentionManager.__new__(DSparkMLAAttentionManager)
+m3.block_pool = None
+harness.clear_log()
+eq("a missing pool is an error, not an exception", m3.kvmgr_drop_gpu_cache(), False)
+check("...and says nothing was reset", "nothing was reset" in harness.log_text())
+
+# And the knob is an INTEGER acted on at the EDGE, because the useful operation
+# is "do it again" and a bool can only be flipped once.
+# *** AND THE WIRING, which break-verification caught me not testing. ***
+# Everything above calls kvmgr_drop_gpu_cache() directly, so dropping the
+# `flags.changed("gpu_cache_epoch")` edge from new_step_starts left every
+# assertion green -- a perfect drop that nothing invokes, which is the
+# invisible-icon failure in another costume. This drives the REAL hook.
+flags.reset_for_tests()
+stats.reset_for_tests()
+harness.reset_manager_count()
+_pool = harness.make_pool(num_gpu_blocks=120, hash_block_size=16)
+F.write(kvmgr_enabled=1, gpu_cache_epoch=0)
+_m = MGR.get_manager_for_kv_cache_spec(
+    kv_cache_spec=iface.MLAAttentionSpec(block_size=16),
+    max_num_batched_tokens=8192, max_model_len=harness.LIVE_MAX_MODEL_LEN,
+    block_pool=_pool, enable_caching=True, kv_cache_group_id=0,
+    dcp_world_size=1, pcp_world_size=1)
+_hits = []
+_m.kvmgr_drop_gpu_cache = lambda: (_hits.append(1), True)[1]
+
+_m.new_step_starts()
+eq("a step with no epoch change does NOT drop the cache", len(_hits), 0)
+
+# NOTE: F.write() alone, NOT reset_for_tests(). The harness's write already
+# invalidates the 1s TTL, while reset_for_tests ALSO clears `_last_seen` -- and
+# changed() deliberately returns False on a first read (it establishes the
+# baseline). So resetting between bumps destroys the very edge under test.
+F.write(kvmgr_enabled=1, gpu_cache_epoch=1)
+_m.new_step_starts()
+eq("*** bumping gpu_cache_epoch DOES reach the drop, via the real hook ***",
+   len(_hits), 1)
+
+_m.new_step_starts()
+eq("...and it fires ONCE per bump, not every step after", len(_hits), 1)
+
+F.write(kvmgr_enabled=1, gpu_cache_epoch=2)
+_m.new_step_starts()
+eq("...and again on the next bump, which is why it is an int", len(_hits), 2)
+
+eq("the knob defaults to 0", flags.DEFAULTS["gpu_cache_epoch"], 0)
+check("...and is an int, so it can be bumped repeatedly",
+      isinstance(flags.DEFAULTS["gpu_cache_epoch"], int))
+
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()
