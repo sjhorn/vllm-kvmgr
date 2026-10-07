@@ -432,6 +432,73 @@ eq("...counted", h4.stats["refused_pairing"], 1)
 eq("...and nothing was submitted", len(h4._inner.subs), 0)
 eq("...nor any slot consumed", h4._pool.available, 8)
 
+
+
+print()
+print("== (b10) the geometry snapshot -- the thing that ends the restart tax ==")
+
+# The question it exists for: our per-group sizes summed to 4.29x the per-block
+# bytes the engine's own KV allocation implies, and arithmetic cannot say whether
+# that is shared tensors or differing row counts. These two fixtures are the two
+# answers, so the snapshot is asserted to DISTINGUISH them rather than merely to
+# serialise.
+class FakeT:
+    def __init__(self, rows, page):
+        self.tensor = type("X", (), {"shape": (rows, page)})()
+        self.page_size_bytes = page
+
+
+class FakeKV:
+    def __init__(self, tensors, refs):
+        self.tensors = tensors
+        self.group_data_refs = refs
+
+
+fake_spec = type("S", (), {"rank": 1, "world_size": 2, "block_size_factor": 1,
+                           "whole_page_bytes": 2103552,
+                           "page_size_per_worker": 1051776,
+                           "gpu_block_size": (256, 64, 64, 4, 8),
+                           "hash_block_size": 4})()
+
+# (a) groups SHARE tensor 2 -- the redundancy answer
+shared_kv = FakeKV([FakeT(100, 4096), FakeT(100, 4096), FakeT(100, 1024)], REFS)
+gs = diskio.geometry(shared_kv, fake_spec)
+eq("the snapshot carries the rank, so the two nodes are distinguishable",
+   gs["rank"], 1)
+eq("...and the derived page we write", gs["page_size_per_worker"], 1051776)
+eq("...and the live block sizes", gs["gpu_block_size"], [256, 64, 64, 4, 8])
+check("*** shared_tensors NAMES the groups that share -- the 4x answer ***",
+      gs["shared_tensors"] == {"2": [1, 2]}, repr(gs["shared_tensors"]))
+eq("...and per-group bytes are still reported per group",
+   [g["bytes_per_block"] for g in gs["groups"]], [8192, 1024, 1024, 64, 128])
+eq("...while the DISTINCT tensor pages sum to less than the group sum",
+   gs["sum_distinct_tensor_page_bytes"] < gs["sum_group_bytes_per_block"], True)
+eq("rows are reported, which is the OTHER candidate explanation",
+   [t["rows"] for t in gs["tensors"]], [100, 100, 100])
+
+# (b) groups DISJOINT -- then differing row counts must be the explanation
+disjoint = [[REFS[0][0]], [REFS[1][0]], [REFS[3][0]]]
+dj = FakeKV([FakeT(100, 4096), FakeT(50, 1024), FakeT(25, 64)], disjoint)
+gd = diskio.geometry(dj, fake_spec)
+eq("*** with disjoint groups, shared_tensors is EMPTY ***",
+   gd["shared_tensors"], {})
+eq("...and the differing row counts are visible instead",
+   [t["rows"] for t in gd["tensors"]], [100, 50, 25])
+
+# It is written atomically and never breaks a boot.
+sd = tempfile.mkdtemp(prefix="kvgeo-")
+pth = diskio.write_geometry(shared_kv, fake_spec, os.path.join(sd, "sub"))
+check("the snapshot is written, creating its directory", pth and os.path.exists(pth))
+check("...named by rank, so rank 0 and rank 1 cannot overwrite each other",
+      os.path.basename(pth) == "geometry-r1.json")
+check("...and left no .part", not os.path.exists(pth + ".part"))
+import json  # noqa: E402
+eq("...and is valid JSON holding the answer",
+   json.load(open(pth))["shared_tensors"], {"2": [1, 2]})
+check("*** a snapshot failure returns None rather than raising -- it must "
+      "never be able to break a boot ***",
+      diskio.write_geometry(object(), fake_spec, sd) is None)
+
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
