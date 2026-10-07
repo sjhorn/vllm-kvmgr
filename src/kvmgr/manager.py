@@ -85,6 +85,11 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
         # `fifo` remains literally patch6's code path and the two cannot drift.
         self._kv_lineages: OrderedDict[object, list[int]] = OrderedDict()
         self._kv_block_lineage: dict[int, object] = {}
+        # The FIRST block id ever seen for a lineage, kept even after that
+        # block is evicted. Without it a survivor list cannot answer the only
+        # question that matters -- "did the HEAD survive" -- because after an
+        # eviction ids[0] is just the lowest surviving index, not the head.
+        self._kv_lineage_head: dict[object, int] = {}
         if not _AUDITED:
             _audit_once()
         # From the CONSTRUCTOR, not register(): this has to run in whichever
@@ -189,6 +194,9 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
             len(after_ids),
         )
         self._kv_track(blocks, newly=after_ids - before)
+        stats.record_lineages(
+            self.kv_cache_group_id, self.kvmgr_lineage_report()
+        )
 
     def _kv_track(self, blocks, newly: set[int]) -> None:
         """Record this prefix's identity, order, and that it was just used.
@@ -215,6 +223,10 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
             if ids is None:
                 ids = []
                 self._kv_lineages[key] = ids
+            if key not in self._kv_lineage_head:
+                head = getattr(blocks[0], "block_id", None)
+                if head is not None:
+                    self._kv_lineage_head[key] = head
             for block in blocks:
                 bid = getattr(block, "block_id", None)
                 if bid is None or bid not in newly:
@@ -246,6 +258,7 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
             pass
         if not ids:
             self._kv_lineages.pop(key, None)
+            self._kv_lineage_head.pop(key, None)
 
     # -- the victim -----------------------------------------------------------
 
@@ -384,6 +397,52 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
             pass
         return blocks
 
+    def kvmgr_lineage_report(self, limit: int = 20) -> list[dict]:
+        """Per-prefix survivors, and whether the HEAD is still protected.
+
+        This is the only thing that distinguishes head-first from tail-first
+        eviction from OUTSIDE the engine. Counters cannot: both rules evict the
+        same NUMBER of blocks. And a re-send measures nothing either, because a
+        freed-but-still-cached block keeps serving a cache hit until something
+        actually reuses it -- so until real pressure has drained the free queue,
+        a head-first eviction and a tail-first one look identical from the API.
+
+        `head_intact` is what the prefix is WORTH: reuse is a contiguous match
+        from token 0, so a prefix that lost its head reuses NOTHING however many
+        of its blocks are still resident.
+
+        Bounded, and in the LRU order the eviction rule itself walks, so the
+        first entry is the next victim.
+        """
+        out: list[dict] = []
+        try:
+            protected = self._protected_prompt_block_ids
+            for key, ids in list(self._kv_lineages.items())[:limit]:
+                head = self._kv_lineage_head.get(key)
+                survivors = [b for b in ids if b in protected]
+                out.append({
+                    "blocks": len(survivors),
+                    "tokens": len(survivors) * self.block_size,
+                    "head_intact": head is not None and head in protected,
+                    "reusable_blocks": self._kv_reusable(ids, protected, head),
+                })
+        except Exception:
+            logger.exception("kvmgr: lineage report failed")
+        return out
+
+    def _kv_reusable(self, ids, protected, head) -> int:
+        """Blocks reusable from the head: the contiguous run from the head
+        onward. ZERO if the head itself is gone, however much else survived --
+        that is the whole asymmetry tail-first eviction exists to exploit."""
+        if head is None or head not in protected:
+            return 0
+        n = 0
+        for b in ids:
+            if b not in protected:
+                break
+            n += 1
+        return n
+
     # -- reconcile on the flag-change edge -----------------------------------
 
     def kvmgr_reconcile(self) -> int:
@@ -407,6 +466,9 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
         released = before - len(self._protected_prompt_block_ids)
         stats.record_protected_now(
             self.kv_cache_group_id, len(self._protected_prompt_block_ids)
+        )
+        stats.record_lineages(
+            self.kv_cache_group_id, self.kvmgr_lineage_report()
         )
         if released:
             logger.info(

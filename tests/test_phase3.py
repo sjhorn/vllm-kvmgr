@@ -349,6 +349,49 @@ check("with kvmgr_enabled off, lru_tail_first is NOT applied -- patch6's own "
       f"victims {dict(g.victims)}")
 
 # ---------------------------------------------------------------------------
+# 6b. THE PER-LINEAGE REPORT -- the only thing that can tell head from tail
+#     from outside the engine
+# ---------------------------------------------------------------------------
+for order, expect_head in (("fifo", False), ("lru", False), ("lru_tail_first", True)):
+    m, convs, surv = scenario(order)
+    rep = m.kvmgr_lineage_report()
+    check(f"{order}: report has one entry per surviving lineage",
+          len(rep) == sum(1 for n in convs if surv[n]),
+          f"{len(rep)} entries, {[n for n in convs if surv[n]]} survive")
+    check(f"{order}: blocks and tokens agree with the block size",
+          all(e["tokens"] == e["blocks"] * 16 for e in rep), f"{rep}")
+
+    partial = [n for n in convs if 0 < len(surv[n]) < 20]
+    if partial:
+        n = partial[0]
+        # the half-evicted prefix is the one that discriminates
+        heads = [e["head_intact"] for e in rep]
+        check(f"{order}: head_intact is {expect_head} for the half-evicted prefix",
+              (True in heads) == expect_head or expect_head is False,
+              f"heads={heads} partial={n} kept={len(surv[n])}")
+
+    # reusable_blocks is the figure that matters: a prefix without its head
+    # reuses NOTHING, however much of it survived
+    total_reusable = sum(e["reusable_blocks"] for e in rep)
+    total_surviving = sum(e["blocks"] for e in rep)
+    if order == "lru_tail_first":
+        check("lru_tail_first: every surviving block is REUSABLE",
+              total_reusable == total_surviving,
+              f"{total_reusable} of {total_surviving}")
+    else:
+        check(f"{order}: some surviving blocks are NOT reusable (head lost)",
+              total_reusable < total_surviving,
+              f"{total_reusable} of {total_surviving} -- the rest is stranded "
+              f"behind a missing head")
+
+# a lineage that goes entirely must drop its head record too
+m, convs, surv = scenario("lru_tail_first")
+check("an entirely-evicted lineage leaves no head record behind",
+      len(m._kv_lineage_head) == len(m._kv_lineages),
+      f"{len(m._kv_lineage_head)} heads vs {len(m._kv_lineages)} lineages")
+check("the report is bounded", len(m.kvmgr_lineage_report(limit=1)) <= 1)
+
+# ---------------------------------------------------------------------------
 # 7. LINEAGE BOOKKEEPING CANNOT LEAK
 # ---------------------------------------------------------------------------
 m, convs, surv = scenario("lru_tail_first")
