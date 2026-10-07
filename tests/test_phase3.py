@@ -142,8 +142,9 @@ needs = [policy.protected_cap(
     block_sizes=harness.LIVE_BLOCK_SIZES, group_index=i,
     sliding_windows=harness.LIVE_SLIDING_WINDOWS)
     for i, bs in enumerate(harness.LIVE_BLOCK_SIZES)]
-eq("windowed groups get their window and no more", needs[1:], [3, 3, 33, 17])
-check("costing 0.2% of the pool between them", sum(needs[1:]) == 56)
+eq("windowed groups get their window and no more", needs[1:], [3, 3, 3, 17])
+check("costing 0.1% of the pool between them", sum(needs[1:]) == 26,
+      "26 blocks, with group 3's window being 8 rather than 128")
 
 # ---------------------------------------------------------------------------
 # 3. THE MEASURED SCENARIO: three conversations, the oldest idle

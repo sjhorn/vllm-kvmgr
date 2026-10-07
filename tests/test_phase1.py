@@ -476,7 +476,7 @@ check("equal-token-extent by_need would be a 21x REGRESSION, not a fix",
 eq("window_need_blocks matches patch6's MNT-9 formula",
    [policy.window_need_blocks(w, bs)
     for w, bs in zip(harness.LIVE_SLIDING_WINDOWS, harness.LIVE_BLOCK_SIZES)],
-   [None, 3, 3, 33, 17])
+   [None, 3, 3, 3, 17])
 
 # ...and against patch6's own code, so the two definitions cannot drift.
 harness.reset_manager_count()
@@ -499,7 +499,7 @@ caps_by_need = [
     for i, bs in enumerate(harness.LIVE_BLOCK_SIZES)
 ]
 eq("the four windowed groups get exactly their window",
-   caps_by_need[1:], [3, 3, 33, 17])
+   caps_by_need[1:], [3, 3, 3, 17])
 eq("under by_need group 0 is clamped by the LEGACY cap, not the fraction",
    caps_by_need[0], 8192)
 g0_tokens = policy.cap_tokens(caps_by_need[0], 256)
@@ -509,8 +509,9 @@ check("which is 2.25x today, NOT the plan's 4.2x",
       f"{g0_tokens/932608:.2f}x -- Phase 0 finding 2, re-asserted here")
 check("and still 2x the 1M context ceiling, so the 740,315-token session fits",
       g0_tokens > 2 * 740315)
-check("and the windowed groups together cost 56 blocks, 0.2% of the pool",
-      sum(caps_by_need[1:]) == 56)
+check("and the windowed groups together cost 26 blocks, 0.1% of the pool",
+      sum(caps_by_need[1:]) == 26,
+      "measured on the live engine: windows (None,128,128,8,128)")
 
 # ---------------------------------------------------------------------------
 print()

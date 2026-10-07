@@ -168,9 +168,22 @@ the retention.
 Window-aware, at fraction 0.75 on the live pool:
 
 	24,288 blocks x 0.75        = 18,216 blocks to divide
-	groups 1-4, windowed        =  3 + 3 + 33 + 17 = 56 blocks  (0.2% of the pool)
-	group 0, full MLA           = 18,160 -> clamped by the LEGACY cap to 8,192
+	groups 1-4, windowed        =  3 + 3 + 3 + 17 = 26 blocks  (0.1% of the pool)
+	group 0, full MLA           = 18,190 -> clamped by the LEGACY cap to 8,192
 	                            = 2,097,152 tokens  (2.25x today, 2x the 1M ceiling)
+
+**CONFIRMED ON THE LIVE ENGINE 2026-10-07**, flipped with no restart:
+
+	kvmgr: protected cap for KV group 0 = 8192 blocks = 2097152 tokens
+	       (pool 24288, groups 5, fraction 0.75, alloc by_need, legacy 8192)
+	kvmgr: protected cap for KV group 0 = 3643 blocks =  932608 tokens
+	       (pool 24288, groups 5, fraction 0.75, alloc equal, legacy 8192) [was 8192 blocks]
+
+The engine's own geometry line reads `windows (None, 128, 128, 8, 128)` --
+**group 3's window is 8, not 128**, which the offline fixture had wrong until
+this deploy printed the truth. It does not move the headline, because group 0 is
+clamped by the legacy cap either way; it changes the windowed groups' cost from
+56 blocks to 26.
 
 ## The two policies (Phase 3)
 

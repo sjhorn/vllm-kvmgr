@@ -30,9 +30,17 @@ PATCHES = os.path.join(REPO, "patches")
 LIVE_BLOCK_SIZES = (256, 64, 64, 4, 8)
 
 # Group 0 is full MLA, so its need is unbounded (None). The other four are
-# windowed; `cache_config_info` reports sliding_window=128 across the five
-# KV managers, which is why a windowed group needs its window and no more.
-LIVE_SLIDING_WINDOWS = (None, 128, 128, 128, 128)
+# windowed, and a windowed group needs its window and no more however long the
+# prompt gets.
+#
+# READ OFF THE LIVE ENGINE 2026-10-07, not inferred: our own geometry line
+# prints `windows (None, 128, 128, 8, 128)`. Note GROUP 3's WINDOW IS 8, not
+# 128 -- this fixture said 128 for all four until the first deploy printed the
+# truth. It does not move the headline (group 0 is clamped by the legacy cap
+# either way) but it changes the windowed groups' cost from 56 blocks to 26,
+# and a fixture that disagrees with the box is how an offline suite goes quietly
+# wrong.
+LIVE_SLIDING_WINDOWS = (None, 128, 128, 8, 128)
 
 # The live pool, for cap arithmetic that must match the box.
 LIVE_NUM_GPU_BLOCKS = 24288
