@@ -375,3 +375,68 @@ def _install_kv_cache_interface() -> None:
         if name.startswith("_"):
             continue
         setattr(iface, name, obj)
+
+
+# ---------------------------------------------------------------------------
+# numpy and torch, stubbed rather than installed.
+#
+# WHY NOT JUST pip install: this harness's whole value is that it runs on a
+# laptop with NOTHING installed -- that is what makes it the thing you reach for
+# before a 4-minute boot. torch would have to be stubbed regardless (it is a
+# multi-GB dependency for one annotation), so stubbing numpy beside it keeps the
+# harness dependency-free rather than half-and-half.
+#
+# *** WHAT THESE DO AND DO NOT MODEL. *** kv_offload/base.py needs exactly two
+# things: np.array(ids, dtype=np.int64) in BlockIDsLoadStoreSpec.__init__, and
+# torch.Tensor as an evaluated dataclass annotation. Both are modelled. NOTHING
+# ELSE IS, so a test must not assert on numpy broadcasting, dtype coercion or
+# tensor behaviour -- it would be asserting on this file instead of on vLLM. The
+# contract tests are written to read .block_ids as a sequence and no more.
+# ---------------------------------------------------------------------------
+
+
+def _install_numpy_stub() -> None:
+    if "numpy" in sys.modules:
+        return
+    np = types.ModuleType("numpy")
+
+    class _NDArray(list):
+        """Enough of an ndarray for our one call site: a sequence with a dtype."""
+
+        def __init__(self, data, dtype=None):
+            super().__init__(data)
+            self.dtype = dtype
+
+        def tolist(self):
+            return list(self)
+
+        def __repr__(self):
+            return f"array({list(self)})"
+
+    np.ndarray = _NDArray
+    np.int64 = "int64"
+    np.int32 = "int32"
+    np.array = lambda data, dtype=None: _NDArray(data, dtype)
+    sys.modules["numpy"] = np
+
+
+def _install_torch_stub() -> None:
+    if "torch" in sys.modules:
+        return
+    torch = types.ModuleType("torch")
+
+    class _Tensor:
+        pass
+
+    torch.Tensor = _Tensor
+    # tiering/spec.py's create_handlers reads the worker's own rank from here,
+    # and OUR spec will have to do the same. Stubbed to 0 so a test can assert
+    # the per-rank path shape without a GPU.
+    accel = types.SimpleNamespace(current_device_index=lambda: 0)
+    torch.accelerator = accel
+    torch.int64 = "torch.int64"
+    sys.modules["torch"] = torch
+
+
+_install_numpy_stub()
+_install_torch_stub()

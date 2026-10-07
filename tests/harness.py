@@ -24,6 +24,7 @@ import vllm_stubs
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PATCHES = os.path.join(REPO, "patches")
+PRISTINE = os.path.join(PATCHES, "pristine")
 
 # The five live KV groups, in group order, as tokens per block.  Backed out of
 # the engine's own "legacy cap" lines; `--block-size 256` is group 0's only.
@@ -70,6 +71,45 @@ class Loaded:
 
 
 _loaded: Loaded | None = None
+
+
+def load_kv_offload() -> types.ModuleType:
+    """Load the REAL `vllm.v1.kv_offload.*` from patches/pristine/ and return it.
+
+    *** WHY PRISTINE AND NOT A COPY IN THIS DIRECTORY. *** Phase 1 implements an
+    `OffloadingSpec` against this contract, and the single most expensive way to
+    get that wrong is to write it against a contract I only skimmed, or against a
+    stale copy that has since moved. These are the image's own files, pulled by
+    the method `patches/pristine/MANIFEST.txt` prescribes, so the assertions in
+    test_phase0_disk.py are against the code that will actually run.
+
+    Safe to read from site-packages for THESE files specifically, which the
+    MANIFEST otherwise forbids: `docker inspect` confirms no mount touches
+    `kv_offload`, so there is no patched file to read by mistake. Verified
+    2026-10-07 against the 20 mounts the container actually has.
+
+    `load()` must run first: base.py imports `resolve_kv_cache_block_sizes` from
+    `vllm.v1.core.kv_cache_utils`, which is PATCH 8 -- so the block-size
+    resolution these tests see is our patched one, which is the point.
+    """
+    load()  # patch8 must be in sys.modules under its canonical name first
+
+    kvo = os.path.join(PRISTINE, "vllm", "v1", "kv_offload")
+    for name in ("vllm.v1.kv_offload", "vllm.v1.kv_offload.worker",
+                 "vllm.v1.kv_offload.tiering"):
+        if name not in sys.modules:
+            mod = types.ModuleType(name)
+            sys.modules[name] = mod
+            parent, _, leaf = name.rpartition(".")
+            setattr(sys.modules[parent], leaf, mod)
+
+    _load_file(os.path.join(kvo, "base.py"), "vllm.v1.kv_offload.base")
+    _load_file(os.path.join(kvo, "worker", "worker.py"),
+               "vllm.v1.kv_offload.worker.worker")
+    _load_file(os.path.join(kvo, "factory.py"), "vllm.v1.kv_offload.factory")
+    _load_file(os.path.join(kvo, "file_mapper.py"),
+               "vllm.v1.kv_offload.file_mapper")
+    return sys.modules["vllm.v1.kv_offload.base"]
 
 
 def load(force: bool = False) -> Loaded:
