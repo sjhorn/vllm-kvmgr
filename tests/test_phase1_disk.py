@@ -214,16 +214,41 @@ m3.complete_store([k1], ctx)
 eq("a re-store of a held key emits nothing", list(m3.take_events()), [])
 
 print()
-print("== (1i) Phase 1b refuses LOUDLY rather than booting half-built ==")
-# An empty iterator would boot cleanly and then assert deep inside
-# OffloadingWorker on the first transfer -- a mechanism present, correct-looking
-# and producing nothing, which is this repo's signature failure.
-raised = False
+print("== (1i) get_handlers registers the STORE direction ONLY ==")
+# The handler needs a GPU, but get_handlers imports it INSIDE the function, so
+# patching the module attribute gives a real test of the registration itself --
+# which is the part that decides whether a restore is even routable.
+from kvmgr import diskio  # noqa: E402
+
+_built = {}
+
+
+class _FakeHandler:
+    def __init__(self, **kw):
+        _built.update(kw)
+
+
+_real = diskio.DiskStoreHandler
+diskio.DiskStoreHandler = _FakeHandler
 try:
-    list(sp.get_handlers(kv_caches=None))
-except NotImplementedError as e:
-    raised = "Phase 1b" in str(e)
-check("get_handlers raises NotImplementedError naming the phase", raised)
+    triples = list(sp.get_handlers(kv_caches=object()))
+finally:
+    diskio.DiskStoreHandler = _real
+
+eq("exactly one handler is registered", len(triples), 1)
+src_cls, dst_cls, _h = triples[0]
+eq("...src is GPU", src_cls.medium(), "GPU")
+eq("...dst is our disk medium", dst_cls.medium(), "DSPARK_DISK")
+# *** THE LOAD DIRECTION MUST NOT EXIST. *** This is the same refusal lookup()
+# makes, done a second time on purpose: with no (DISK -> GPU) handler
+# registered, OffloadingWorker has nothing to route a load to, so a restore
+# cannot happen even if a later edit made lookup() optimistic.
+check("*** no (DISK -> GPU) handler is registered, so a restore is not even "
+      "routable ***",
+      not any(s.medium() == "DSPARK_DISK" and d.medium() == "GPU"
+              for s, d, _ in triples))
+eq("the handler is built with our staging size", _built.get("staging_blocks"), 32)
+check("...and gets the spec, so it can reach file_mapper()", _built.get("spec") is sp)
 
 print()
 print("== (1j) the file path: per-rank, per-group, under our root ==")

@@ -252,6 +252,15 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
         )
         self.root_dir: str = os.path.join(root, DISK_FORMAT_ROOT)
 
+        # Staging is SMALL by design -- that is the whole point of not having a
+        # CPU tier. 32 blocks of ~1 MB against the 510-block, 1.07 GB region we
+        # are replacing. Exhaustion is normal and survivable: the connector
+        # retries unsubmitted store jobs, so transfer_async returning False is
+        # an expected answer.
+        self.staging_blocks: int = int(self.extra_config.get("staging_blocks", 32))
+        self.write_threads: int = int(self.extra_config.get("write_threads", 4))
+        self.disk_medium: str = DISK_MEDIUM
+
         self._mapper: FileMapper | None = None
         self._manager: DiskPresenceManager | None = None
 
@@ -282,16 +291,24 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
     def get_handlers(
         self, kv_caches: "CanonicalKVCaches"
     ) -> "Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]":
-        # PHASE 1b. Deliberately a refusal and not a no-op: an empty iterator
-        # would boot cleanly and then assert deep inside OffloadingWorker on the
-        # first transfer ("handler is not None"), which is this repo's recurring
-        # failure -- a mechanism that is present, correct-looking and produces
-        # nothing. The handler composes SingleDirectionOffloadingHandler (which
-        # already owns the group arithmetic, block_indices and the CUDA streams)
-        # over a small PINNED STAGING buffer, then writes page_size_per_worker
-        # bytes per block to file_mapper().get_file_name(key).
-        raise NotImplementedError(
-            "kvmgr: the disk handler is Phase 1b and is not written yet. This "
-            "spec is scheduler-side only so far; do not set it as the live "
-            "offloading spec."
+        """Register the STORE direction only.
+
+        No (DISK -> GPU) handler exists yet, and that is the same safety property
+        `lookup()` enforces one layer up, done twice on purpose: with no load
+        handler registered, OffloadingWorker has nothing to route a load to, so a
+        restore cannot happen even if a future edit made lookup() optimistic.
+        Phase 3 adds the pair, and only once it can prove a restored block equals
+        what was stored.
+        """
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+
+        from .diskio import DiskStoreHandler
+
+        handler = DiskStoreHandler(
+            spec=self,
+            kv_caches=kv_caches,
+            staging_blocks=self.staging_blocks,
+            write_threads=self.write_threads,
         )
+        self._store_handler = handler
+        yield (GPULoadStoreSpec, DiskLoadStoreSpec, handler)
