@@ -225,18 +225,36 @@ DSparkMLAAttentionManager.group_block_sizes = harness.LIVE_BLOCK_SIZES
 DSparkMLAAttentionManager.group_sliding_windows = harness.LIVE_SLIDING_WINDOWS
 m = mgrs[0]
 
-# With our policy OFF, patch6 reads os.environ -- so the flags file is ignored,
-# which is the observable signature of being on the upstream path.
-eq("off: the cap is patch6's, from os.environ (default 0.30)",
-   m._max_protected_prompt_blocks(), int(24288 * 0.30 / 5))
-F.write(kvmgr_enabled=1, protected_fraction=0.75)
-eq("on: the cap is ours, from the flags file -- live, no restart",
+# *** THE SIGNATURE OF "WE ARE ON PATCH6'S PATH" CHANGED ON 2026-10-07. ***
+# It used to be "the flags file is ignored", because patch6 read the fraction
+# straight off os.environ. Now that the fraction is hot in patch6 too, BOTH
+# paths honour the file -- which is the point of that fix and means the old
+# discriminator is gone.
+#
+# `protect_alloc` is the discriminator now, and it is a better one because it is
+# the behavioural difference that actually matters: patch6 only ever does the
+# equal /num_managers split, so by_need is INERT with our policy off and moves
+# the cap 2.25x with it on.
+F.write(kvmgr_enabled=0, protected_fraction=0.75, protect_alloc="by_need")
+eq("off: by_need is INERT -- patch6 only knows the equal split",
    m._max_protected_prompt_blocks(), 3643)
-F.write(kvmgr_enabled=0, protected_fraction=0.75)
-eq("off again: back to patch6 in the same process",
-   m._max_protected_prompt_blocks(), int(24288 * 0.30 / 5))
-F.write(kvmgr_enabled=1, protected_fraction=0.75)
-eq("and on again", m._max_protected_prompt_blocks(), 3643)
+F.write(kvmgr_enabled=1, protected_fraction=0.75, protect_alloc="by_need")
+eq("on: by_need applies -- 8192 blocks, live, no restart",
+   m._max_protected_prompt_blocks(), 8192)
+F.write(kvmgr_enabled=0, protected_fraction=0.75, protect_alloc="by_need")
+eq("off again: back to patch6's equal split in the same process",
+   m._max_protected_prompt_blocks(), 3643)
+F.write(kvmgr_enabled=1, protected_fraction=0.75, protect_alloc="by_need")
+eq("and on again", m._max_protected_prompt_blocks(), 8192)
+
+# ...and the fraction is hot on BOTH sides of the switch, which is the new
+# property and the one the operator asked for.
+F.write(kvmgr_enabled=0, protected_fraction=0.50, protect_alloc="equal")
+eq("fraction is hot with our policy OFF (patch6's own path)",
+   m._max_protected_prompt_blocks(), int(24288 * 0.50 / 5))
+F.write(kvmgr_enabled=1, protected_fraction=0.50, protect_alloc="equal")
+eq("and hot with it ON", m._max_protected_prompt_blocks(), int(24288 * 0.50 / 5))
+F.write(kvmgr_enabled=1, protected_fraction=0.75, protect_alloc="equal")
 
 harness.clear_log()
 F.write(kvmgr_enabled=0, protected_fraction=0.75)
@@ -314,6 +332,40 @@ flags.log_env_audit()
 check("the audit warns for a knob that must not be env-pinned",
       "CANNOT move this knob" in harness.log_text())
 del os.environ[flags.LEGACY_FRACTION_ENV]
+
+# *** A BLANK ENV VALUE COUNTS AS UNSET, and that is what lets the compose stop
+# pinning this knob at all. *** docker-compose emits "" for
+# ${PROTECTED_FRACTION:-} when the variable is unset, and float("") raises --
+# which the old code caught and turned into 0.30, silently IGNORING the flags
+# file and dropping retention from 0.75 to 0.30 with nothing saying so.
+F.write(protected_fraction=0.10)
+for _blank in ("", "   ", "\t"):
+    os.environ[flags.LEGACY_FRACTION_ENV] = _blank
+    flags.reset_for_tests()
+    MGR._flags_checked_at = -1.0
+    eq(f"a blank env value {_blank!r} is UNSET, so the flags file still wins",
+       flags.raw("protected_fraction"), 0.10)
+del os.environ[flags.LEGACY_FRACTION_ENV]
+MGR._flags_checked_at = -1.0
+eq("with the env absent the file wins too", flags.raw("protected_fraction"), 0.10)
+os.environ[flags.LEGACY_FRACTION_ENV] = "0.55"
+MGR._flags_checked_at = -1.0
+eq("and a REAL env value still pins an arm for a boot",
+   flags.raw("protected_fraction"), 0.55)
+del os.environ[flags.LEGACY_FRACTION_ENV]
+MGR._flags_checked_at = -1.0
+check("garbage in the env falls back to 0.30 rather than raising",
+      (os.environ.__setitem__(flags.LEGACY_FRACTION_ENV, "not-a-number"),
+       MGR.__setattr__("_flags_checked_at", -1.0),
+       flags.raw("protected_fraction"))[2] == 0.30)
+del os.environ[flags.LEGACY_FRACTION_ENV]
+MGR._flags_checked_at = -1.0
+
+# the compose must not re-introduce a default, or the knob goes cold again
+_compose = open(os.path.join(REPO_ROOT, "docker-compose.dspark.yml")).read()
+check("the compose does NOT default VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION",
+      'VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION: "${PROTECTED_FRACTION:-}"' in _compose,
+      "a default there wins over the flags file and makes the knob restart-only")
 
 # ---------------------------------------------------------------------------
 # 5. AN UNBUILT POLICY VALUE IS REFUSED, NOT SILENTLY DOWNGRADED

@@ -190,12 +190,13 @@ def raw(name: str) -> Any:
             "not in the table is a knob no hot-config test covers."
         )
     if name == "protected_fraction":
-        legacy = os.environ.get(LEGACY_FRACTION_ENV)
-        if legacy is not None:
-            try:
-                return float(legacy)
-            except ValueError:
-                return DEFAULTS[name]
+        # ONE DEFINITION, patch6's. Re-implementing the precedence here is how
+        # two readers of one knob end up disagreeing -- and this knob has three
+        # sources (legacy env, flags file, default) plus the blank-is-unset rule
+        # that lets the compose stop pinning it.
+        from vllm.v1.core.single_type_kv_cache_manager import _protected_fraction
+
+        return _protected_fraction()
     return _patch6_flag(name, DEFAULTS[name])
 
 

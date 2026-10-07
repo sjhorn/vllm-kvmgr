@@ -145,12 +145,20 @@ with tempfile.TemporaryDirectory() as td:
         os.environ.pop("VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION", None)
         flags.write(protected_fraction=0.10)
         cap_via_file = mgrs[0]._max_protected_prompt_blocks()
-        eq("the flags file CANNOT move protected_fraction today "
-           "(it is read straight off os.environ)",
-           cap_via_file, int(24288 * 0.30 / 5))
-        check("so today's only route is the env var, i.e. a restart",
-              cap_via_file != int(24288 * 0.10 / 5),
-              "Trap 2 confirmed: _max_protected_prompt_blocks reads os.environ directly")
+        # TRAP 2 WAS REAL AND IS NOW CLOSED (2026-10-07). It read
+        #   float(os.environ.get(_PROTECTED_FRACTION_ENV, "0.30"))
+        # directly, so the single most valuable knob in the file was
+        # restart-only -- and a restart costs a measured 672-795s cold prefill.
+        # patch6 now has _protected_fraction(): legacy env (non-blank) wins,
+        # then the flags file, then 0.30. The assertion is inverted rather than
+        # deleted, so the history stays legible.
+        eq("the flags file MOVES protected_fraction now, in patch6's own path",
+           cap_via_file, int(24288 * 0.10 / 5))
+        check("so Trap 2 is closed: no restart to retune the fraction",
+              cap_via_file != int(24288 * 0.30 / 5),
+              "was os.environ-only until 2026-10-07")
+        check("and there is ONE definition of the precedence",
+              hasattr(MGR, "_protected_fraction"))
 
         # ... whereas a flag that DOES use the mechanism moves live.
         flags.write(head_pin_fraction=0.20)
