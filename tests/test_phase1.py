@@ -90,6 +90,38 @@ check("register() is idempotent", (register.register() or True))
 eq("still registered once", MGR.spec_manager_map[iface.MLAAttentionSpec],
    DSparkMLAAttentionManager)
 
+# MNT-11: patch6's own lazy hook, which is what guarantees registration in the
+# process that builds managers -- the entry point cannot be verified to load in
+# the engine core without the cluster.
+check("patch6 carries the MNT-11 lazy registration hook",
+      hasattr(MGR, "_maybe_register_kvmgr"),
+      "belt and braces: a silent no-op is the failure this stack keeps paying for")
+MGR.spec_manager_map[iface.MLAAttentionSpec] = MGR.MLAAttentionManager
+MGR._kvmgr_tried = False
+register._REGISTERED = False
+harness.reset_manager_count()
+_hook_pool = harness.make_pool(num_gpu_blocks=64, hash_block_size=16)
+_built = MGR.get_manager_for_kv_cache_spec(
+    kv_cache_spec=iface.MLAAttentionSpec(block_size=16),
+    max_num_batched_tokens=8192, max_model_len=harness.LIVE_MAX_MODEL_LEN,
+    block_pool=_hook_pool, enable_caching=True, kv_cache_group_id=0,
+    dcp_world_size=1, pcp_world_size=1)
+check("the hook registers kvmgr on the FIRST manager built, with no entry point",
+      isinstance(_built, DSparkMLAAttentionManager),
+      "so Phase 1 cannot silently do nothing if general plugins skip engine core")
+
+# And it is tried ONCE, not per manager: this is on the construction path.
+MGR.spec_manager_map[iface.MLAAttentionSpec] = MGR.MLAAttentionManager
+MGR.get_manager_for_kv_cache_spec(
+    kv_cache_spec=iface.MLAAttentionSpec(block_size=16),
+    max_num_batched_tokens=8192, max_model_len=harness.LIVE_MAX_MODEL_LEN,
+    block_pool=_hook_pool, enable_caching=True, kv_cache_group_id=0,
+    dcp_world_size=1, pcp_world_size=1)
+check("and only tries once -- a retry per manager would re-import on a hot path",
+      MGR.spec_manager_map[iface.MLAAttentionSpec] is MGR.MLAAttentionManager)
+register._REGISTERED = False
+register.register()
+
 check("the other four spec types are untouched (group 0 only)",
       MGR.spec_manager_map[iface.SlidingWindowMLASpec] is MGR.SlidingWindowMLAManager
       and MGR.spec_manager_map[iface.FullAttentionSpec] is MGR.FullAttentionManager,
@@ -194,6 +226,7 @@ PROBE = {
     "disk_budget_gb": (0.0, 64.0),
     "disk_restore": (0, 1),
     "kvmgr_log_level": (0, 2),
+    "kvmgr_stats_port": (0, 9107),
     "swa_recycle": (1, 0),
     "swa_recycle_cached": (0, 1),
     "free_queue_prepend_uncached": (0, 1),

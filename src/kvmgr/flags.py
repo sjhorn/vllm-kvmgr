@@ -62,6 +62,9 @@ DEFAULTS: dict[str, Any] = {
     "disk_budget_gb": 0.0,
     "disk_restore": False,
     "kvmgr_log_level": 0,
+    # 0 means BIND NOTHING, deliberately unlike a route that answers 404
+    # because a boolean said so. Same convention as METER_TAP_PORT.
+    "kvmgr_stats_port": 0,
     # pre-existing, preserved unchanged -- listed so this table is the whole
     # surface and nothing is hot-by-accident or cold-by-omission.
     "swa_recycle": True,

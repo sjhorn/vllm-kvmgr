@@ -67,6 +67,26 @@ worse than refusing it.
 	bash local-ops/kv-flags.sh                       # read both nodes
 	bash local-ops/kv-flags.sh kvmgr_enabled 1
 
+## Registration is belt-and-braces, on purpose
+
+The entry point is the right mechanism. What could not be verified without the
+cluster is whether `vllm.general_plugins` loads in the **engine core** process —
+the one that builds managers — or only in the workers. If only in the workers,
+the entry point registers where there is no scheduler and **Phase 1 silently
+does nothing**.
+
+So `patch6` also carries **MNT-11**: a four-line lazy hook in
+`get_manager_for_kv_cache_spec` that imports `kvmgr` and registers on the first
+manager built. That is in the module which *owns* `spec_manager_map`, so it is
+in the right process by construction. Lazy rather than at import, because
+`kvmgr` imports `_flag` and the manager classes back out of `patch6` — an
+import-time hook is a circular import against a half-executed module.
+`register()` is idempotent, so the two routes cannot conflict. A missing plugin
+is a silent `ImportError` (stock behaviour); any other failure is loud.
+
+**The box check that settles it**: `kvmgr: registered` must appear in the engine
+log. If it appears twice, both routes fired and that is fine.
+
 ## *** `protected_fraction` MUST COME OUT OF `.env.dspark` ***
 
 `_flag()` checks `VLLM_<NAME>` **first**, so any knob also set in the
@@ -116,18 +136,97 @@ Window-aware, at fraction 0.75 on the live pool:
 	group 0, full MLA           = 18,160 -> clamped by the LEGACY cap to 8,192
 	                            = 2,097,152 tokens  (2.25x today, 2x the 1M ceiling)
 
+## Observability (Phase 2)
+
+Eviction used to be **inferred**, after the fact, from `engine_cached_tokens` on
+the proxy side. It is observed now, per group:
+
+| | |
+|---|---|
+| lookups | hit / miss / **partial**, in calls, blocks and tokens |
+| protection | calls and blocks, counted as a **delta** of the set |
+| eviction | by **cause** — `cap` \| `pool` \| `reset` — and by **victim rule** |
+| state | the cap in blocks *and* tokens, and what is protected now |
+
+**Three lookup outcomes, not two.** A partial hit is a prefix that survived in
+*part* — exactly what tail-first eviction is meant to produce — so collapsing it
+into "hit" would make Phase 3 unmeasurable.
+
+**Eviction by cause is the point.** During the measured 373,833-token loss KV
+usage was **22–33%**, the pool two-thirds *empty*, while the cap was exceeded by
+43%. A `cap` eviction on an idle pool is a policy bug; a `pool` eviction is
+capacity. One counter for both would hide the distinction the whole plan turns
+on.
+
+**Protection is counted as a delta, not as the offer.** patch6 skips a block
+that is null, unhashed or already protected, and on an appending turn almost
+every block is already protected — so counting `len(blocks)` overstates by an
+order of magnitude.
+
+### *** A STAT LOGGER CANNOT SEE THESE NUMBERS ***
+
+The plan says to export "via the existing `vllm.stat_logger_plugins` entry point
+(as `prefill_collector.py` already does — no fork)". It cannot work. Stat
+loggers run on AsyncLLM's output-handler loop — **the API server process**,
+which `prefill_collector`'s own header states — while the KV managers run in the
+**engine core** process behind the IPC that carries `EngineCoreOutputs`. A stat
+logger reading these counters would report **zeros forever**: a number the page
+knows how to draw and the wire can never fill, which is the prefix gauge's
+failure for the third time.
+
+So the export is a loopback JSON + Prometheus endpoint served **from the process
+that holds the counters**, started from the manager's constructor rather than
+from `register()` — so it is in the right process by construction. Same shape as
+`/prefill`, which sparkstats already proxies and turns into series.
+
+	kvmgr_stats_port 9107     # 0, the default, BINDS NOTHING
+
+	GET /kv       the snapshot, with the policy in force beside the counters
+	GET /metrics  prometheus text, group/cause/rule labels
+	GET /flags    the EFFECTIVE values -- which reading the file cannot answer,
+	              because env wins over it, silently
+
+Not on `:8888`: the proxy's Caddy catch-all forwards every path to the vLLM
+pool, so a route there is reachable by every mTLS and LAN client.
+
+`kvmgr_log_level 1` logs each eviction with its cause and victim rule. Off by
+default — sixty evictions would be sixty lines on the scheduler loop.
+
+### Did the flag take?
+
+	bash local-ops/kvmgr-flag.sh                        # EFFECTIVE values, both nodes
+	bash local-ops/kvmgr-flag.sh kvmgr_enabled 1        # writes, then WAITS for the log line
+
+It merges rather than overwrites (the file carries the MNT-6b/8/9 flags too, and
+clobbering `swa_recycle_cached` restores a bug already paid for), writes
+atomically, **refuses** when the container env pins the knob, and fails if no
+confirmation line arrives. `kv-flags.sh` answers "what did I write"; this
+answers "what is the engine using", and those differ in two silent ways.
+
 ## Tests
 
 	python3.12 local-ops/kvharness/test_phase0.py    #  59 — the plan's premises
-	python3.12 local-ops/kvharness/test_phase1.py    # 111 — parity + hot config
+	python3.12 local-ops/kvharness/test_phase1.py    # 118 — parity + hot config
+	python3.12 local-ops/kvharness/test_phase2.py    #  67 — counters and exporters
 
 No GPU, no cluster, ~2 s. Both load the **real** patch6/7/8 and the pristine
 coordinator; see `local-ops/kvharness/README.md`.
 
-Every guard is verified by breaking it. Six breaks, each caught and each naming
-its own cause: a knob captured at import, the kill switch not reaching patch6,
-reconcile doing nothing, the cap not logging on change, `by_need` reverting to
-the naive reading, and an unbuilt policy value shipping silently.
+Every guard is verified by breaking it — twelve breaks, each caught and each
+naming its own cause: a knob captured at import, the kill switch not reaching
+patch6, reconcile doing nothing, the cap not logging on change, `by_need`
+reverting to the naive reading, an unbuilt policy value shipping silently, the
+patch6 hook removed, protection counted as the offer, cap and pool evictions
+conflated, a partial hit collapsed into a hit, an absent cap exported as a zero
+gauge, and the stats port binding when set to 0.
+
+**One of those breaks was not caught at first, and the fix is the lesson.** The
+"port 0 binds nothing" check asserted `_server is None` — and with the guard
+broken an earlier case had already taken the fallback port, so the re-bind
+raised "address already in use", was swallowed, and left `_server` None. The
+test went green about a server that had started. It records whether a socket was
+**attempted** now. A test that passes for the wrong reason is as unhelpful as one
+that fails for it.
 
 ## Still a box check
 

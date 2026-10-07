@@ -38,7 +38,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     SingleTypeKVCacheManager,
 )
 
-from . import flags, policy
+from . import flags, policy, serve, stats
 
 logger = init_logger(__name__)
 
@@ -64,6 +64,11 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
         self._kvmgr_was_enabled: bool | None = None
         if not _AUDITED:
             _audit_once()
+        # From the CONSTRUCTOR, not register(): this has to run in whichever
+        # process actually builds managers, which is not knowable at
+        # plugin-load time.
+        serve.maybe_start()
+        stats.group(self.kv_cache_group_id, self.block_size)
         logger.info(
             "kvmgr: DSparkMLAAttentionManager active for KV group %d "
             "(block_size %d); policy is OPT-IN -- kvmgr_enabled=%r",
@@ -113,6 +118,7 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
             sliding_windows=self.group_sliding_windows,
         )
         self._report_cap(cap, fraction, mode, num_groups)
+        stats.record_cap(self.kv_cache_group_id, cap, self.block_size)
         return cap
 
     def _report_cap(self, cap, fraction, mode, num_groups) -> None:
@@ -140,6 +146,25 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
             "" if previous is None else f" [was {previous[0]} blocks]",
         )
 
+    # -- protection, counted --------------------------------------------------
+
+    def _protect_prompt_blocks(self, blocks) -> None:
+        """Counted, not changed.
+
+        The count is taken as a DELTA of the protected set rather than from
+        len(blocks): patch6 skips a block that is null, unhashed or already
+        protected, so the argument length is what was offered and the delta is
+        what was taken. Counting the offer would report protection that never
+        happened -- and on an appending turn almost every block is already
+        protected, so the two differ by an order of magnitude.
+        """
+        before = len(self._protected_prompt_block_ids)
+        super()._protect_prompt_blocks(blocks)
+        after = len(self._protected_prompt_block_ids)
+        stats.record_protect(
+            self.kv_cache_group_id, max(0, after - before), after
+        )
+
     # -- the victim -----------------------------------------------------------
 
     def _release_one_protected_prompt_block(self, block_ids_to_skip=None) -> bool:
@@ -157,7 +182,83 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
         order = flags.knob("evict_order")
         if order != "fifo":  # unreachable while only fifo is implemented
             logger.warning("kvmgr: evict_order=%r reached the hot path; using fifo", order)
-        return super()._release_one_protected_prompt_block(block_ids_to_skip)
+
+        released = super()._release_one_protected_prompt_block(block_ids_to_skip)
+        if released:
+            stats.record_evict(
+                self.kv_cache_group_id,
+                cause=self._evict_cause,
+                victim_rule=stats.VICTIM_FIFO,
+                protected_now=len(self._protected_prompt_block_ids),
+            )
+            if flags.raw("kvmgr_log_level"):
+                logger.info(
+                    "kvmgr: KV group %d evicted a protected block "
+                    "(cause=%s, victim=%s, %d protected = %d tokens remain)",
+                    self.kv_cache_group_id, self._evict_cause,
+                    stats.VICTIM_FIFO, len(self._protected_prompt_block_ids),
+                    len(self._protected_prompt_block_ids) * self.block_size,
+                )
+        return released
+
+    # WHY A CAUSE IS CARRIED ON THE INSTANCE rather than passed down. patch6
+    # calls _release_one_protected_prompt_block from three places with
+    # IDENTICAL arguments -- the cap trim, the allocation-pressure release and
+    # our own reconcile -- so the call site is the only thing that distinguishes
+    # them, and the signature is patch6's to keep. Changing the signature would
+    # fork the file we are deliberately not forking.
+    _evict_cause = stats.EVICT_CAP
+
+    def _trim_protected_prompt_blocks(self) -> None:
+        # Only claim "cap" if nothing more specific is already in force -- the
+        # reconcile path trims too, and its cause is the flag change.
+        if self._evict_cause not in (stats.EVICT_RESET, stats.EVICT_POOL):
+            self._evict_cause = stats.EVICT_CAP
+        super()._trim_protected_prompt_blocks()
+
+    def release_protected_prompt_blocks(self, *args, **kwargs) -> None:
+        """Allocation pressure, which is a different event from the cap.
+
+        Conflating them would hide the thing the whole plan turns on: during the
+        measured 373,833-token loss, KV usage was 22-33% -- the pool two-thirds
+        EMPTY -- while the cap was exceeded by 43%. A cap eviction on an idle
+        pool is a policy bug; a pool eviction is capacity. They must be
+        countable apart.
+        """
+        self._evict_cause = stats.EVICT_POOL
+        try:
+            super().release_protected_prompt_blocks(*args, **kwargs)
+        finally:
+            self._evict_cause = stats.EVICT_CAP
+
+    # -- the lookup, counted --------------------------------------------------
+
+    @classmethod
+    def find_longest_cache_hit(cls, **kwargs):
+        """Counted, not changed. Phase 5's disk restore lands here.
+
+        A CLASSMETHOD, so there is no instance to count on -- which is why
+        kvmgr.stats is module-level and keyed by group id. The coordinator calls
+        this on the class (`manager_cls.find_longest_cache_hit`), which is also
+        what makes registering in spec_manager_map enough to be reached.
+
+        THREE OUTCOMES, NOT TWO. A partial hit -- matched less than asked -- is a
+        prefix that survived in PART, which is a different event from a miss and
+        is exactly what tail-first eviction is meant to produce. Collapsing them
+        would make Phase 3 unmeasurable.
+        """
+        blocks = super().find_longest_cache_hit(**kwargs)
+        try:
+            spec = kwargs.get("kv_cache_spec")
+            block_size = getattr(spec, "block_size", 0) or 0
+            got = len(blocks[0]) if blocks and blocks[0] is not None else 0
+            max_length = kwargs.get("max_length") or 0
+            asked = (max_length // block_size) if block_size else 0
+            for gid in kwargs.get("kv_cache_group_ids") or ():
+                stats.record_lookup(gid, block_size, got, asked)
+        except Exception:
+            pass
+        return blocks
 
     # -- reconcile on the flag-change edge -----------------------------------
 
@@ -174,8 +275,15 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
         if not flags.raw("kvmgr_enabled"):
             return 0
         before = len(self._protected_prompt_block_ids)
-        self._trim_protected_prompt_blocks()
+        self._evict_cause = stats.EVICT_RESET
+        try:
+            self._trim_protected_prompt_blocks()
+        finally:
+            self._evict_cause = stats.EVICT_CAP
         released = before - len(self._protected_prompt_block_ids)
+        stats.record_protected_now(
+            self.kv_cache_group_id, len(self._protected_prompt_block_ids)
+        )
         if released:
             logger.info(
                 "kvmgr: reconciled KV group %d after a flag change -- released %d "
