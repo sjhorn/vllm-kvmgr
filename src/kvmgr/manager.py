@@ -233,13 +233,27 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
                     continue
                 ids.append(bid)
                 self._kv_block_lineage[bid] = key
+            if not ids:
+                # *** AN EMPTY LINEAGE MUST NOT BE RETAINED. ***
+                # _kv_track is called on every protect, including ones where
+                # patch6 took nothing new (null, unhashed, or already
+                # protected). That inserted a key with an empty list which
+                # _kv_forget never reaches -- no block maps to it -- so empty
+                # lineages accumulated for the life of the process. Harmless to
+                # choose_victim, which skips them, but it grows without bound
+                # and it showed up live as rows of
+                #   blocks=0 head_intact=False reusable=0
+                # in the per-lineage report. Found by reading that report.
+                #
+                # Dropping the key loses nothing: with no blocks there is
+                # nothing to evict and nothing to order. A later protect that
+                # DOES take a block re-creates it at the most-recent position,
+                # which is the same place move_to_end would have put it.
+                self._kv_lineages.pop(key, None)
+                self._kv_lineage_head.pop(key, None)
+                return
             # Touched: this prefix is the most recently used one now.
             self._kv_lineages.move_to_end(key)
-            if not ids:
-                # Nothing new, but the touch still counts -- an appending turn
-                # re-offers a prefix whose blocks are all already protected, and
-                # that is exactly the reuse LRU must see.
-                pass
         except Exception:
             # Bookkeeping must never cost a request. Losing a lineage degrades
             # the victim choice toward patch6's; it cannot corrupt the pool.

@@ -391,6 +391,56 @@ check("an entirely-evicted lineage leaves no head record behind",
       f"{len(m._kv_lineage_head)} heads vs {len(m._kv_lineages)} lineages")
 check("the report is bounded", len(m.kvmgr_lineage_report(limit=1)) <= 1)
 
+# *** AN EMPTY LINEAGE MUST NOT BE RETAINED, and the LRU refresh must survive
+# the fix. *** _kv_track runs on every protect, including ones where patch6 took
+# nothing (null, unhashed, or already protected). That used to insert a key with
+# an empty list that _kv_forget could never reach, so empty lineages
+# accumulated for the life of the process -- seen live as rows of
+# "blocks=0 head_intact=False reusable=0" in the per-lineage report.
+harness.reset_manager_count()
+_p = harness.make_pool(num_gpu_blocks=200, hash_block_size=16)
+flags.reset_for_tests()
+F.write(kvmgr_enabled=1, protected_fraction=0.9, protect_alloc="equal",
+        evict_order="lru_tail_first")
+_m = MGR.get_manager_for_kv_cache_spec(
+    kv_cache_spec=iface.MLAAttentionSpec(block_size=16),
+    max_num_batched_tokens=8192, max_model_len=harness.LIVE_MAX_MODEL_LEN,
+    block_pool=_p, enable_caching=True, kv_cache_group_id=0,
+    dcp_world_size=1, pcp_world_size=1)
+DSparkMLAAttentionManager.group_count = 1
+DSparkMLAAttentionManager.group_block_sizes = (16,)
+DSparkMLAAttentionManager.group_sliding_windows = (None,)
+
+# a protect that takes NOTHING (no block_hash -> patch6 skips them all)
+_nohash = _p.get_new_blocks(4)
+_m._protect_prompt_blocks(_nohash)
+eq("a protect that took nothing leaves NO lineage behind",
+   len(_m._kv_lineages), 0)
+eq("and no head record either", len(_m._kv_lineage_head), 0)
+check("so the report has no blocks=0 rows", _m.kvmgr_lineage_report() == [],
+      f"{_m.kvmgr_lineage_report()}")
+
+# ...while a real prefix still tracks, and REFRESHES on an appending turn
+_a = _p.get_new_blocks(5)
+for _i, _b in enumerate(_a):
+    _b.block_hash = bh(70000 + _i)
+_b2 = _p.get_new_blocks(5)
+for _i, _x in enumerate(_b2):
+    _x.block_hash = bh(80000 + _i)
+_m._protect_prompt_blocks(_a)
+_m._protect_prompt_blocks(_b2)
+eq("two real prefixes tracked", len(_m._kv_lineages), 2)
+_order_before = list(_m._kv_lineages)
+# re-offer A with nothing new: ids is non-empty, so it must MOVE TO END
+_m._protect_prompt_blocks(_a)
+_order_after = list(_m._kv_lineages)
+check("*** re-offering an already-protected prefix still REFRESHES its LRU "
+      "position -- the fix must not break the appending-turn case ***",
+      _order_after[-1] == _order_before[0] and _order_after != _order_before,
+      f"{_order_before} -> {_order_after}")
+eq("and no empty lineage appeared", 
+   sum(1 for v in _m._kv_lineages.values() if not v), 0)
+
 # ---------------------------------------------------------------------------
 # 7. LINEAGE BOOKKEEPING CANNOT LEAK
 # ---------------------------------------------------------------------------
