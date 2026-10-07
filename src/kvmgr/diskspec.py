@@ -77,6 +77,11 @@ DISK_MEDIUM = "DSPARK_DISK"
 # A separate root is the cheap half of that and is enough today.
 DISK_FORMAT_ROOT = "dspark-kv-v1"
 
+# The name KV_TRANSFER_CONFIG must use as `spec_name`, and the one
+# register.py registers with. A constant rather than two string
+# literals, because the store path is silently inert if they disagree.
+DSPARK_SPEC_NAME = "DSparkDiskOffloadingSpec"
+
 
 class DiskLoadStoreSpec(LoadStoreSpec):
     """Addresses blocks by their OffloadKey, NOT by a block id.
@@ -364,10 +369,54 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
 
     def file_mapper(self) -> FileMapper:
         if self._mapper is None:
-            self._mapper = FileMapper.from_offloading_spec(
+            # *** NOT `from_offloading_spec`, AND THAT IS THE WHOLE BUG. ***
+            # Measured 2026-10-07: the worker wrote every file under
+            # `..._06be92914bd2_r0` while the engine core's manifest prune
+            # looked under `..._500ceb39bfc9` and discarded all 552 keys as
+            # "file is gone", with the files sitting right there. The two
+            # fingerprints differed in EXACTLY ONE field: `hash_block_size`,
+            # 256 in the worker against 4 in the engine core.
+            #
+            # `from_offloading_spec` reads `vllm_config.cache_config.block_size`
+            # (file_mapper.py:87) -- and on a HYBRID layout the engine core
+            # rewrites that attribute to the resolved GCD of the five group
+            # block sizes while the worker keeps the CLI's `--block-size 256`.
+            # So upstream's helper forks the path between the store side and the
+            # lookup side on any model with non-uniform groups. It is correct
+            # for a single-block-size model, which is why nothing upstream has
+            # tripped on it.
+            #
+            # The honest field is the spec's OWN `self.hash_block_size`, which
+            # base.py:360 resolves with `resolve_kv_cache_block_sizes` from the
+            # kv_cache_config -- the same input in both processes, so the same
+            # answer (4) in both. Every other field the helper derives already
+            # agreed, which the logged `fields=` dicts are the evidence for.
+            #
+            # Constructing directly also means the fingerprint's contents are
+            # ours rather than inherited: a fingerprint is the one thing here
+            # that must not change shape without us noticing, and
+            # `test_mapper_fields_cover_upstreams` fails if upstream adds a key.
+            parallel_config = self.vllm_config.parallel_config
+            self._mapper = FileMapper(
                 root_dir=self.root_dir,
-                offloading_spec=self,
+                model_name=self.vllm_config.model_config.model,
+                hash_block_size=self.hash_block_size,
                 gpu_blocks_per_file=self.block_size_factor,
+                tp_size=parallel_config.tensor_parallel_size,
+                pp_size=parallel_config.pipeline_parallel_size,
+                pcp_size=parallel_config.prefill_context_parallel_size,
+                dcp_size=parallel_config.decode_context_parallel_size,
+                rank=parallel_config.rank,
+                dtype=str(self.vllm_config.cache_config.cache_dtype).replace(
+                    "torch.", ""
+                ),
+                kv_cache_groups=[
+                    {
+                        "block_size": group.kv_cache_spec.block_size,
+                        "layer_names": list(group.layer_names),
+                    }
+                    for group in self.kv_cache_config.kv_cache_groups
+                ],
             )
             # *** LOG THE WHOLE FINGERPRINT, because the two processes DISAGREED
             # about it and nothing said so. *** Measured 2026-10-07: the worker

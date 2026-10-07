@@ -56,6 +56,8 @@ def register() -> None:
     if _REGISTERED:
         return
 
+    _install_hang_dump()
+
     from vllm.v1.core import single_type_kv_cache_manager as stm
     from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
@@ -111,9 +113,10 @@ def register() -> None:
     try:
         from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 
+        from kvmgr.diskspec import DSPARK_SPEC_NAME
         OffloadingSpecFactory.register_spec(
-            "DSparkDiskOffloadingSpec", "kvmgr.diskspec",
-            "DSparkDiskOffloadingSpec",
+            DSPARK_SPEC_NAME, "kvmgr.diskspec",
+            DSPARK_SPEC_NAME,
         )
         logger.info(
             "kvmgr: registered DSparkDiskOffloadingSpec (inert until "
@@ -128,6 +131,70 @@ def register() -> None:
 
     _REGISTERED = True
 
+
+
+def _install_hang_dump() -> None:
+    """Make a HANG dumpable with no ptrace, because twice now it was not.
+
+    *** THE PROBLEM THIS SOLVES. *** The store path has wedged the worker twice
+    (Phase 1c, and again 2026-10-07 at the staging-saturation point). Both times
+    the only evidence available was "the worker stopped consuming shm broadcasts"
+    plus thread wchans, because the container has no `SYS_PTRACE` -- `gdb -p`
+    answers `ptrace: Operation not permitted` and there is no py-spy. So a
+    deadlock in OUR code was diagnosable only by reading it and guessing, which
+    is how the Phase 1c attempt came to be built on a wrong premise.
+
+    `faulthandler` needs no ptrace and no attach: the signal handler runs inside
+    the process and walks every thread's Python stack itself. Output goes to
+    stderr, which is what `docker logs` shows, so the dump lands beside the log
+    lines that led up to it.
+
+        docker exec <c> kill -USR1 <worker pid>   # every thread's Python stack
+
+    SIGUSR1 rather than SIGABRT or SIGQUIT: those two kill the process, and a
+    wedged engine holding a 700K-token prefix is worth more alive than dead --
+    the dump is for diagnosis, not for a postmortem. Registered per process from
+    the plugin, so the worker, the engine core and the API server all answer it.
+
+    *** `chain=True` KILLS THE PROCESS, AND THE TEST IS WHAT FOUND IT. ***
+    faulthandler chains to whatever handler was installed when it registered,
+    and for SIGUSR1 that is normally `SIG_DFL` -- whose default action is
+    TERMINATE. So the obvious spelling dumps the stack and then kills the
+    engine, which on a box holding a 700K-token prefix would destroy the thing
+    being diagnosed in the act of diagnosing it. Measured offline: the child
+    exited with `-30`, i.e. died of its own diagnostic signal.
+
+    So chain only to a REAL handler -- one somebody actually installed -- and
+    never to the default. Checked in the running image 2026-10-07: vLLM
+    installs no SIGUSR1 or SIGUSR2 handler anywhere (0 hits across its tree),
+    so in practice nothing is chained and nothing is stolen; the check is there
+    so that a future vLLM taking SIGUSR1 keeps working rather than losing it.
+
+    The whole thing is best-effort: an instrument that can break the boot is
+    worse than no instrument.
+    """
+    try:
+        import faulthandler
+        import signal
+        import sys as _sys
+
+        if not hasattr(signal, "SIGUSR1"):
+            return
+        existing = signal.getsignal(signal.SIGUSR1)
+        chain = callable(existing) and existing not in (
+            signal.SIG_DFL, signal.SIG_IGN)
+        faulthandler.register(signal.SIGUSR1, file=_sys.stderr,
+                              all_threads=True, chain=chain)
+        logger.info(
+            "kvmgr: hang dump armed -- `kill -USR1 <pid>` prints every "
+            "thread's Python stack to the container log. No ptrace needed, "
+            "which is the point: gdb cannot attach in this container and the "
+            "store path has wedged the worker twice with no stack available. "
+            "chain=%s (a real handler was already installed: %s).",
+            chain, chain,
+        )
+    except Exception:
+        logger.exception("kvmgr: could not arm the hang dump (continuing)")
 
 def _install_group_geometry_hook(manager_cls) -> None:
     """Stamp the real group count / block sizes from the KVCacheConfig."""

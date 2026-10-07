@@ -256,10 +256,29 @@ def snapshot() -> dict[str, Any]:
             "protected_fraction": float(flags.raw("protected_fraction")),
             "protect_alloc": flags.peek("protect_alloc"),
             "evict_order": flags.peek("evict_order"),
-            # knob() rather than raw(), so a BLOCKED knob reports what is in
-            # force (False) rather than what somebody asked for -- a reader
-            # must not see disk_enabled true against a tier that cannot exist.
-            "disk_enabled": bool(flags.peek("disk_enabled")),
+            # *** NOT A FLAG READ, BECAUSE NO FLAG GOVERNS THIS. *** Measured
+            # 2026-10-07: this line reported `disk_enabled: false` while the
+            # worker was demonstrably writing ("staging pool saturated (32
+            # blocks); store jobs are proceeding in rounds"). `disk_enabled` is
+            # BLOCKED and toggles nothing -- what actually turns the store path
+            # on is KV_TRANSFER_CONFIG naming our spec -- so reading the flag
+            # printed a confident False about a tier that was running. Same
+            # shape as `disk_restore` reporting False while live, one knob
+            # along, and the same rule applies: report the FACT, not the ask.
+            "disk_store_live": _disk_spec_is_live(),
+            "disk_enabled_flag_governs_nothing": True,
+            # *** THE REFUSAL HAS TO REACH THE LOG FROM SOMEWHERE, and tying it
+            # to a reported field is what broke it twice. *** First when
+            # snapshot() moved from knob() to peek(), leaving nothing calling
+            # the validator on a disk flag -- `disk_enabled=1` was then refused
+            # SILENTLY on the live engine. Then again when `disk_enabled` stopped
+            # being reported at all, for being a flag that governs nothing. So
+            # the refusal is driven by the BLOCKED table itself rather than by
+            # whichever fields this dict happens to carry: every blocked knob
+            # somebody has SET gets validated here, once per snapshot, and a
+            # future blocked knob is covered without anybody remembering to
+            # wire it. The values are discarded; the log line is the product.
+            "blocked_refused": _refuse_blocked(),
             "disk_restore": bool(flags.peek("disk_restore")),
             "blocked": {k: True for k in flags.BLOCKED},
         },
@@ -267,6 +286,51 @@ def snapshot() -> dict[str, Any]:
         "groups": [g.as_dict() for _, g in sorted(_groups.items())],
     }
 
+
+
+
+def _refuse_blocked() -> list[str]:
+    """Validate every BLOCKED knob so a set-but-inert one is refused OUT LOUD.
+
+    Returns the names that were actually asked for, which is strictly more
+    useful on the endpoint than a copy of the BLOCKED table: `blocked` already
+    says what cannot be used, and this says what somebody TRIED.
+    """
+    from . import flags   # local, as snapshot() does -- stats is imported early
+
+    asked: list[str] = []
+    for name in flags.BLOCKED:
+        try:
+            if flags.raw(name):
+                asked.append(name)
+                flags.knob(name)   # the validator logs the refusal
+        except Exception:
+            continue
+    return asked
+
+def _disk_spec_is_live() -> bool:
+    """Is OUR disk spec the one the connector was configured with?
+
+    The honest condition, and the only one visible from this process: the store
+    handler lives worker-side, so the engine core cannot ask it directly. What
+    both processes can see is the connector config that selected the spec.
+    Parsed defensively -- this is an observability field, so it must never be
+    the thing that raises.
+    """
+    try:
+        import json
+        import os
+        from kvmgr.diskspec import DSPARK_SPEC_NAME
+    except Exception:
+        return False
+    raw = os.environ.get("KV_TRANSFER_CONFIG") or ""
+    if not raw:
+        return False
+    try:
+        cfg = json.loads(raw)
+    except Exception:
+        return DSPARK_SPEC_NAME in raw
+    return DSPARK_SPEC_NAME in json.dumps(cfg)
 
 def prometheus() -> str:
     """Prometheus text format.

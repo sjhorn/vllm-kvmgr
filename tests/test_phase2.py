@@ -312,8 +312,20 @@ flags.reset_for_tests()
 harness.clear_log()
 F.write(kvmgr_enabled=1, disk_enabled=1)
 snap = stats.snapshot()
-eq("a reader still reports the blocked knob as OFF",
-   snap["policy"]["disk_enabled"], False)
+# `disk_enabled` is no longer REPORTED at all, and that is the point: it
+# governs nothing, so printing it -- either value -- was a claim about a tier
+# it does not control. Measured 2026-10-07: /kv said `disk_enabled: false`
+# while the worker logged "store jobs are proceeding in rounds". What the
+# endpoint carries now is the fact (`disk_store_live`, from the connector
+# config that really selects the spec) plus an explicit note that the flag is
+# inert. The REFUSAL below still has to reach the log, which is the half of
+# this assertion that was always about behaviour rather than wording.
+check("the inert knob is no longer reported as though it governed the tier",
+      "disk_enabled" not in snap["policy"])
+check("...and the endpoint says so rather than leaving it unexplained",
+      snap["policy"].get("disk_enabled_flag_governs_nothing") is True)
+eq("what IS reported is the fact, and no spec is configured here",
+   snap["policy"]["disk_store_live"], False)
 txt = harness.log_text()
 check("and the REFUSAL is logged through the reader path", "REFUSED" in txt)
 check("carrying the reason and a pointer (re-aimed: the old assertion pinned "
