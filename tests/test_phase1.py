@@ -289,9 +289,10 @@ del os.environ[flags.LEGACY_FRACTION_ENV]
 flags.reset_for_tests()
 harness.clear_log()
 F.write(kvmgr_enabled=1, protect_alloc="by_need")
-eq("by_need is recognised but refused in Phase 1",
-   flags.knob("protect_alloc"), "equal")
-check("and says so, naming the knob", "NOT YET IMPLEMENTED" in harness.log_text())
+eq("by_need is BUILT as of Phase 3, so it is honoured",
+   flags.knob("protect_alloc"), "by_need")
+F.write(kvmgr_enabled=1, evict_order="lru_tail_first")
+eq("and so is lru_tail_first", flags.knob("evict_order"), "lru_tail_first")
 
 flags.reset_for_tests()
 harness.clear_log()
@@ -299,10 +300,22 @@ F.write(protect_alloc="nonsense")
 eq("an invalid value falls back to the default", flags.knob("protect_alloc"), "equal")
 check("and is reported as invalid", "is not one of" in harness.log_text())
 
+# THE REFUSAL MECHANISM IS STILL TESTED, with a synthetic unbuilt value -- the
+# next arm anyone adds must refuse rather than ship looking live, and a test
+# that only covered Phase 1's two values would go vacuous the moment they were
+# built. Which is exactly what happened to it.
 flags.reset_for_tests()
 harness.clear_log()
-F.write(evict_order="lru_tail_first")
-eq("lru_tail_first likewise refused for now", flags.knob("evict_order"), "fifo")
+flags._VALID["evict_order"] = ("fifo", "lru", "lru_tail_first", "future_arm")
+flags._IMPLEMENTED["evict_order"] = ("fifo", "lru", "lru_tail_first")
+try:
+    F.write(evict_order="future_arm")
+    eq("a recognised-but-unbuilt value falls back", flags.knob("evict_order"), "fifo")
+    check("and says NOT YET IMPLEMENTED, naming the knob",
+          "NOT YET IMPLEMENTED" in harness.log_text())
+finally:
+    flags._VALID["evict_order"] = ("fifo", "lru", "lru_tail_first")
+    flags._IMPLEMENTED.pop("evict_order", None)
 
 try:
     flags.raw("knob_that_does_not_exist")

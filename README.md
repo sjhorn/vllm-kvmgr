@@ -55,8 +55,8 @@ so an empty file behaves exactly as today.**
 |---|---|---|---|
 | `kvmgr_enabled` | 0 | our policy vs patch6's, per call | yes |
 | `protected_fraction` | 0.30 | the cap, moved off `os.environ` | yes |
-| `protect_alloc` | `equal` | `equal` \| `by_need` | Phase 3 |
-| `evict_order` | `fifo` | `fifo` \| `lru` \| `lru_tail_first` | Phase 3 |
+| `protect_alloc` | `equal` | `equal` \| `by_need` | yes |
+| `evict_order` | `fifo` | `fifo` \| `lru` \| `lru_tail_first` | yes |
 | `disk_enabled` / `disk_budget_gb` / `disk_restore` | off | the disk tier | Phase 4/5 |
 | `kvmgr_log_level` | 0 | per-decision eviction logging | Phase 2 |
 
@@ -135,6 +135,56 @@ Window-aware, at fraction 0.75 on the live pool:
 	groups 1-4, windowed        =  3 + 3 + 33 + 17 = 56 blocks  (0.2% of the pool)
 	group 0, full MLA           = 18,160 -> clamped by the LEGACY cap to 8,192
 	                            = 2,097,152 tokens  (2.25x today, 2x the 1M ceiling)
+
+## The two policies (Phase 3)
+
+Two independent knobs, so they can be A/B'd on one engine without a restart.
+
+### `protect_alloc=by_need` — which group gets the budget
+
+	equal    (today)  group 0 -> 3,643 blocks =   932,608 tokens
+	by_need           group 0 -> 8,192 blocks = 2,097,152 tokens   (2.25x)
+
+The four windowed groups take **56 blocks between them** — 0.2% of the pool —
+and full attention takes the remainder. Group 0 then hits the **legacy** cap
+(`2 x max_model_len / block_size`), which is why this is 2.25x and not the
+4.2x the plan expected: past that point raising the fraction buys group 0
+nothing at all.
+
+### `evict_order` — which prefix, and which end
+
+Two dimensions, and conflating them is why the measured loss was total:
+
+| | victim prefix | end eaten | the half-evicted prefix |
+|---|---|---|---|
+| `fifo` (today) | the longest-**held** | head | reuses **nothing** |
+| `lru` | the most **abandoned** | head | reuses **nothing** |
+| `lru_tail_first` | the most **abandoned** | **tail** | still **hits** |
+
+`lru` fixes the prefix and **not** the end, which is why tail-first is its own
+arm rather than a refinement. Measured in the harness — three 20-block
+prefixes, the oldest still active, cap cut to 30:
+
+	fifo             A gone          B  10/20 head LOST   C 20/20
+	lru              A 10/20 head LOST   B gone           C 20/20
+	lru_tail_first   A 10/20 HEAD KEPT   B gone           C 20/20
+
+Same residency, different **value**: because reuse is a contiguous match from
+token 0, the 30 surviving blocks are worth 20 under `lru` and 30 under
+`lru_tail_first`. On the real case that is the difference between a ~518 s
+recompute of a 740K prefix and ~35 s for the 40K tail.
+
+A prefix is identified by its **head block's hash**, the convention MNT-9
+already uses for head pins — the one handle that is stable across turns and
+distinct between two lineages that share no prefix. Tracking hangs off the fact
+that `MLAAttentionManager.cache_blocks` passes a prefix *in order*, so
+`blocks[0]` is the head; nothing else in the manager knows which end is which.
+A shared head is attributed to the first lineage that protected it, and is then
+refreshed whenever **either** conversation protects — so a shared head is harder
+to evict, which is the right bias.
+
+`fifo` remains literally patch6's own release: the lineage structures are kept
+*beside* its set and deque rather than replacing them, so the two cannot drift.
 
 ## Observability (Phase 2)
 

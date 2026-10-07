@@ -92,10 +92,9 @@ _VALID = {
 # Values implemented SO FAR.  A knob set to a recognised-but-unbuilt value falls
 # back to the safe default and SAYS SO -- shipping a half-built policy as though
 # it were live is worse than refusing it.
-_IMPLEMENTED = {
-    "protect_alloc": ("equal",),
-    "evict_order": ("fifo",),
-}
+# Phase 3 built all of them. The table stays, because the next unbuilt value
+# must refuse rather than ship looking live.
+_IMPLEMENTED: dict[str, tuple] = {}
 
 _last_seen: dict[str, Any] = {}
 

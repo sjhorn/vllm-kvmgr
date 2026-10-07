@@ -18,6 +18,8 @@ THE NUMBERS THIS REPRODUCES, measured on the live engine 2026-10-07:
 
 from __future__ import annotations
 
+from collections import OrderedDict  # noqa: F401  (used in an annotation)
+
 from vllm.utils.math_utils import cdiv
 
 # Deliberately NOT a copy of patch6's constant: this is the same formula
@@ -153,3 +155,63 @@ def cap_tokens(cap_blocks: int | None, block_size: int) -> int | None:
     if cap_blocks is None:
         return None
     return cap_blocks * block_size
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: which block leaves the protected set
+# ---------------------------------------------------------------------------
+
+def choose_victim(
+    lineages: "OrderedDict[object, list[int]]",
+    protected: set[int],
+    skip: set[int] | None,
+    tail_first: bool,
+) -> tuple[object, int] | None:
+    """Pick (lineage_key, block_id) to release, or None if nothing can go.
+
+    `lineages` is in LRU order: least-recently-touched FIRST.  Each value is
+    that prefix's block ids **in prefix order**, so index 0 is the head.
+
+    *** TWO DIMENSIONS, AND CONFLATING THEM IS WHY THE MEASURED LOSS WAS
+    TOTAL. ***
+
+      WHICH prefix   -- today it is whichever was protected FIRST, so the
+                        conversation held longest goes first. LRU makes it the
+                        most ABANDONED one instead.
+      WHICH END      -- reuse is a contiguous match from token 0, so losing the
+                        head writes off everything behind it. Taking the TAIL
+                        leaves a shorter prefix that still hits.
+
+    `lru` fixes the first and NOT the second: the blocks of one lineage are
+    protected together, so insertion order within it is prefix order and the
+    head still goes first. That is why `lru_tail_first` exists as its own arm --
+    and why it is the one the measured case needs: head-first costs a full
+    ~518 s recompute of a 740K prefix, tail-first turns it into 700K warm plus
+    40K cold, about 35 s.
+
+    A block in `skip` is passed over rather than removed, exactly as patch6's
+    own release does -- it is a block the current allocation needs, not a block
+    that has stopped being a candidate.
+    """
+    for key, block_ids in lineages.items():
+        candidates = reversed(block_ids) if tail_first else iter(block_ids)
+        for block_id in candidates:
+            if block_id not in protected:
+                continue  # stale: it left the set by another route
+            if skip is not None and block_id in skip:
+                continue
+            return key, block_id
+    return None
+
+
+def lineage_key(block) -> object:
+    """The handle a prefix is tracked by: its HEAD block's hash.
+
+    MNT-9 already keys its head pins this way, and reusing the convention is
+    deliberate -- it is the one identifier that is stable across turns of a
+    conversation and distinct between two lineages that share no prefix (a main
+    thread and a sub-agent differ from token 0, so their head blocks differ).
+
+    A block hash, never a token. Nothing here can reconstruct content.
+    """
+    return getattr(block, "block_hash", None)

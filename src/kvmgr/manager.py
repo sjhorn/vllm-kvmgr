@@ -32,6 +32,8 @@ and keeps working whichever way the switch is set.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 from vllm.logger import init_logger
 from vllm.v1.core.single_type_kv_cache_manager import (
     MLAAttentionManager,
@@ -62,6 +64,12 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
         super().__init__(*args, **kwargs)
         self._kvmgr_cap_reported: tuple | None = None
         self._kvmgr_was_enabled: bool | None = None
+        # Phase 3. PREFIX -> its protected block ids IN PREFIX ORDER, the dict
+        # itself in LRU order of last protect (least-recently-touched first).
+        # Kept BESIDE patch6's own set and deque rather than replacing them, so
+        # `fifo` remains literally patch6's code path and the two cannot drift.
+        self._kv_lineages: OrderedDict[object, list[int]] = OrderedDict()
+        self._kv_block_lineage: dict[int, object] = {}
         if not _AUDITED:
             _audit_once()
         # From the CONSTRUCTOR, not register(): this has to run in whichever
@@ -158,12 +166,71 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
         happened -- and on an appending turn almost every block is already
         protected, so the two differ by an order of magnitude.
         """
-        before = len(self._protected_prompt_block_ids)
+        before = set(self._protected_prompt_block_ids)
         super()._protect_prompt_blocks(blocks)
-        after = len(self._protected_prompt_block_ids)
+        after_ids = self._protected_prompt_block_ids
         stats.record_protect(
-            self.kv_cache_group_id, max(0, after - before), after
+            self.kv_cache_group_id, max(0, len(after_ids) - len(before)),
+            len(after_ids),
         )
+        self._kv_track(blocks, newly=after_ids - before)
+
+    def _kv_track(self, blocks, newly: set[int]) -> None:
+        """Record this prefix's identity, order, and that it was just used.
+
+        `blocks` is a PREFIX -- MLAAttentionManager.cache_blocks passes
+        `req_to_blocks[rid][:num_hit_blocks]` -- so its order IS prefix order
+        and `blocks[0]` is the head. That is the whole reason tail-first is
+        possible at all: nothing else in the manager knows which end is which.
+
+        A SHARED HEAD IS ATTRIBUTED TO THE FIRST LINEAGE THAT PROTECTED IT, and
+        that is accepted rather than fixed. patch6 skips a block that is already
+        protected, so a second conversation sharing a prefix adds only its own
+        new blocks. The consequence is benign: the shared part is refreshed
+        whenever EITHER conversation protects, because the touch is on the
+        lineage, so a shared head is harder to evict, which is the right bias.
+        """
+        if not blocks:
+            return
+        try:
+            key = policy.lineage_key(blocks[0])
+            if key is None:
+                return
+            ids = self._kv_lineages.get(key)
+            if ids is None:
+                ids = []
+                self._kv_lineages[key] = ids
+            for block in blocks:
+                bid = getattr(block, "block_id", None)
+                if bid is None or bid not in newly:
+                    continue
+                ids.append(bid)
+                self._kv_block_lineage[bid] = key
+            # Touched: this prefix is the most recently used one now.
+            self._kv_lineages.move_to_end(key)
+            if not ids:
+                # Nothing new, but the touch still counts -- an appending turn
+                # re-offers a prefix whose blocks are all already protected, and
+                # that is exactly the reuse LRU must see.
+                pass
+        except Exception:
+            # Bookkeeping must never cost a request. Losing a lineage degrades
+            # the victim choice toward patch6's; it cannot corrupt the pool.
+            logger.exception("kvmgr: lineage tracking failed; victim choice degrades")
+
+    def _kv_forget(self, block_id: int) -> None:
+        key = self._kv_block_lineage.pop(block_id, None)
+        if key is None:
+            return
+        ids = self._kv_lineages.get(key)
+        if ids is None:
+            return
+        try:
+            ids.remove(block_id)
+        except ValueError:
+            pass
+        if not ids:
+            self._kv_lineages.pop(key, None)
 
     # -- the victim -----------------------------------------------------------
 
@@ -179,27 +246,69 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
         if not flags.knob("kvmgr_enabled", quiet=True):
             return super()._release_one_protected_prompt_block(block_ids_to_skip)
 
-        order = flags.knob("evict_order")
-        if order != "fifo":  # unreachable while only fifo is implemented
-            logger.warning("kvmgr: evict_order=%r reached the hot path; using fifo", order)
+        order = flags.knob("evict_order", quiet=True)
 
-        released = super()._release_one_protected_prompt_block(block_ids_to_skip)
+        if order == "fifo":
+            released = super()._release_one_protected_prompt_block(block_ids_to_skip)
+            rule = stats.VICTIM_FIFO
+            if released:
+                # Keep our own view consistent with patch6's, which just took a
+                # block we are not tracking the choice of.
+                for bid in list(self._kv_block_lineage):
+                    if bid not in self._protected_prompt_block_ids:
+                        self._kv_forget(bid)
+        else:
+            tail_first = order == "lru_tail_first"
+            rule = stats.VICTIM_LRU_TAIL if tail_first else stats.VICTIM_LRU
+            released = self._kv_release_lru(block_ids_to_skip, tail_first)
+
         if released:
             stats.record_evict(
                 self.kv_cache_group_id,
                 cause=self._evict_cause,
-                victim_rule=stats.VICTIM_FIFO,
+                victim_rule=rule,
                 protected_now=len(self._protected_prompt_block_ids),
             )
             if flags.raw("kvmgr_log_level"):
                 logger.info(
                     "kvmgr: KV group %d evicted a protected block "
-                    "(cause=%s, victim=%s, %d protected = %d tokens remain)",
-                    self.kv_cache_group_id, self._evict_cause,
-                    stats.VICTIM_FIFO, len(self._protected_prompt_block_ids),
+                    "(cause=%s, victim=%s, %d lineage(s) held, "
+                    "%d protected = %d tokens remain)",
+                    self.kv_cache_group_id, self._evict_cause, rule,
+                    len(self._kv_lineages),
+                    len(self._protected_prompt_block_ids),
                     len(self._protected_prompt_block_ids) * self.block_size,
                 )
         return released
+
+    def _kv_release_lru(self, block_ids_to_skip, tail_first: bool) -> bool:
+        """Release one block, chosen by lineage LRU and optionally tail-first.
+
+        The bookkeeping is patch6's, deliberately line for line: remove from
+        `_protected_prompt_block_ids`, and free the block ONLY if it still
+        carries a reference. patch6's stale entries in `_protected_prompt_block_queue`
+        are left alone -- its own release skips an id that is no longer in the
+        set, so a stale entry is already a case it handles, and pruning the
+        deque here would be a second writer to a structure we do not own.
+        """
+        chosen = policy.choose_victim(
+            self._kv_lineages, self._protected_prompt_block_ids,
+            block_ids_to_skip, tail_first,
+        )
+        if chosen is None:
+            # Nothing we track can go. Fall back to patch6 rather than
+            # reporting "cannot release" -- a block protected before this
+            # manager started tracking lineages is still a legitimate victim,
+            # and refusing would hold the cap over its budget forever.
+            return super()._release_one_protected_prompt_block(block_ids_to_skip)
+
+        _key, block_id = chosen
+        self._kv_forget(block_id)
+        self._protected_prompt_block_ids.discard(block_id)
+        block = self.block_pool.blocks[block_id]
+        if block.ref_cnt > 0:
+            self.block_pool.free_blocks([block])
+        return True
 
     # WHY A CAUSE IS CARRIED ON THE INSTANCE rather than passed down. patch6
     # calls _release_one_protected_prompt_block from three places with
