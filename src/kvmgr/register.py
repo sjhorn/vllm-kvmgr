@@ -85,6 +85,14 @@ def register() -> None:
     )
 
     _install_group_geometry_hook(DSparkMLAAttentionManager)
+
+    # Opt-in, and it logs nothing unless offload_allow_hybrid is set. Installed
+    # from register() so it lands in every process that loads the plugin --
+    # the scheduler side is the one that raises.
+    from . import offload
+
+    offload.install()
+
     _REGISTERED = True
 
 

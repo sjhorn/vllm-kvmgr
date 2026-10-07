@@ -80,6 +80,10 @@ DEFAULTS: dict[str, Any] = {
     # 0 means BIND NOTHING, deliberately unlike a route that answers 404
     # because a boolean said so. Same convention as METER_TAP_PORT.
     "kvmgr_stats_port": 0,
+    # Relax TieringOffloadingSpec's UNCONDITIONAL single-block-size assert so a
+    # hybrid KV layout can reach the disk tier. See kvmgr/offload.py for why
+    # that is defensible and -- more importantly -- what it does NOT prove.
+    "offload_allow_hybrid": False,
     # pre-existing, preserved unchanged -- listed so this table is the whole
     # surface and nothing is hot-by-accident or cold-by-omission.
     "swa_recycle": True,
