@@ -387,8 +387,18 @@ class DiskStoreHandler:
             "kvmgr: the disk handler batches per group, which assumes "
             f"block_size_factor == 1 (got {spec.block_size_factor}). Do not set "
             "'block_size' in kv_connector_extra_config.")
+        # *** NOT the flags directory: it is mounted READ-ONLY into the
+        # container, which the first attempt discovered the honest way --
+        # "OSError: [Errno 30] Read-only file system". The offload root is
+        # writable by definition, since it is where we write KV. ***
+        #
+        # And the failure was HARMLESS, which is the design working: the
+        # snapshot logged its reason and the boot carried on to construct the
+        # handler. A diagnostic that can break a boot is worse than no
+        # diagnostic -- the inverse of the lesson from the round before, where
+        # my own instrumentation broke a test.
         write_geometry(kv_caches, spec,
-                       os.environ.get("KVMGR_SNAPSHOT_DIR", "/etc/vllm-kv-flags"))
+                       os.environ.get("KVMGR_SNAPSHOT_DIR", spec.root_dir))
         self._pool = SlotPool(staging_blocks)
         self._writers = ThreadPoolExecutor(max_workers=write_threads,
                                            thread_name_prefix="kvmgr_disk")
