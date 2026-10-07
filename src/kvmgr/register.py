@@ -93,6 +93,39 @@ def register() -> None:
 
     offload.install()
 
+    # *** OUR OWN OffloadingSpec, registered by NAME through the factory's public
+    # registry -- no upstream file is patched. *** It exists because upstream's
+    # tiering offload cannot capture half of this cluster's KV: it consolidates
+    # every rank's shard into ONE SHARED HOST region, which is single-host TP by
+    # construction, while ours is one rank per node. Measured: every .bin the
+    # tiering tier wrote has rank>0's half EXACTLY ZERO.
+    #
+    # Registering the name is INERT. Nothing selects it unless
+    # KV_TRANSFER_CONFIG names it as spec_name, and that lives in .env.dspark
+    # per node -- so the committed default stays "no offload at all", and a
+    # restart without it reverts to known-good rather than to a half-built path.
+    #
+    # Import is DEFERRED into the factory's own resolution (module_path +
+    # class_name) rather than imported here, so a syntax error in diskspec.py
+    # cannot take down the manager registration that every boot depends on.
+    try:
+        from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+
+        OffloadingSpecFactory.register_spec(
+            "DSparkDiskOffloadingSpec", "kvmgr.diskspec",
+            "DSparkDiskOffloadingSpec",
+        )
+        logger.info(
+            "kvmgr: registered DSparkDiskOffloadingSpec (inert until "
+            "KV_TRANSFER_CONFIG names it as spec_name)"
+        )
+    except ValueError:
+        pass          # already registered: register() ran twice in one process
+    except Exception:
+        # A missing kv_offload is not a reason to lose the KV manager, which is
+        # what this plugin is actually for.
+        logger.exception("kvmgr: could not register the disk offloading spec")
+
     _REGISTERED = True
 
 
