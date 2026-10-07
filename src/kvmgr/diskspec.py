@@ -369,6 +369,26 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
                 offloading_spec=self,
                 gpu_blocks_per_file=self.block_size_factor,
             )
+            # *** LOG THE WHOLE FINGERPRINT, because the two processes DISAGREED
+            # about it and nothing said so. *** Measured 2026-10-07: the worker
+            # wrote every file under `..._06be92914bd2_r0` while the engine
+            # core's prune looked somewhere else and discarded all 552 manifest
+            # keys as "file is gone" -- with the files sitting right there. The
+            # scheduler and the worker build their FileMapper independently from
+            # their own vllm_config/kv_cache_config, so any field that differs
+            # between the processes silently forks the path. Printing the FIELDS
+            # rather than just the hash is what names the culprit in one boot
+            # instead of one boot per guess.
+            try:
+                import json as _json
+                logger.info(
+                    "kvmgr: file_mapper base=%s fields=%s",
+                    self._mapper.base_path,
+                    _json.dumps(self._mapper.fields, sort_keys=True,
+                                default=str)[:1200],
+                )
+            except Exception:
+                logger.exception("kvmgr: could not log the mapper fingerprint")
         return self._mapper
 
     def get_manager(self) -> OffloadingManager:
