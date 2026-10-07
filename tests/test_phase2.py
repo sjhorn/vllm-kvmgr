@@ -277,6 +277,43 @@ eq("with no groups at all, prometheus is empty rather than malformed",
    stats.prometheus(), "")
 
 # ---------------------------------------------------------------------------
+# 6b. *** READING THE STATS MUST NOT CONSUME THE CHANGE EDGE ***
+# ---------------------------------------------------------------------------
+# Observed live 2026-10-07: the stats endpoint called knob(), which records what
+# it saw, so new_step_starts() then found nothing changed -- the endpoint
+# reported protect_alloc=by_need as in force while having prevented it being
+# applied. Observability must not alter behaviour.
+flags.reset_for_tests()
+F.write(kvmgr_enabled=1, protect_alloc="equal")
+flags.knob("protect_alloc")                 # the manager's first look
+F.write(kvmgr_enabled=1, protect_alloc="by_need")
+snap = stats.snapshot()                     # a READER polls, as the dashboard would
+eq("the reader reports the new value", snap["policy"]["protect_alloc"], "by_need")
+check("...and the manager STILL sees the change afterwards",
+      flags.changed("protect_alloc"),
+      "a reader that consumes the edge makes flag changes intermittent")
+
+# ten polls must not change that
+flags.reset_for_tests()
+F.write(kvmgr_enabled=1, evict_order="fifo")
+flags.knob("evict_order")
+F.write(kvmgr_enabled=1, evict_order="lru_tail_first")
+for _ in range(10):
+    stats.snapshot()
+check("ten reads still leave the edge for the manager",
+      flags.changed("evict_order"))
+
+# peek must validate exactly as knob does, minus the recording
+flags.reset_for_tests()
+F.write(protect_alloc="nonsense")
+eq("peek falls back on an invalid value like knob does",
+   flags.peek("protect_alloc"), "equal")
+F.write(disk_enabled=1)
+eq("peek refuses a BLOCKED knob like knob does",
+   flags.peek("disk_enabled"), False)
+F.write(disk_enabled=0)
+
+# ---------------------------------------------------------------------------
 # 7. THE RECORDERS ARE TOTAL -- they cannot harm a request
 # ---------------------------------------------------------------------------
 stats.reset_for_tests()

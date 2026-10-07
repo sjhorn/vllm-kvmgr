@@ -217,16 +217,19 @@ def snapshot() -> dict[str, Any]:
         "uptime_s": round(time.monotonic() - _START, 1),
         # The policy in force, beside the counters, so a reader never has to
         # correlate two sources to know which arm produced these numbers.
+        # peek(), never knob(): a reader must not consume the change edge that
+        # new_step_starts() reconciles on. See flags.peek's docstring -- polling
+        # this endpoint used to suppress the very change it then reported.
         "policy": {
             "kvmgr_enabled": bool(flags.raw("kvmgr_enabled")),
             "protected_fraction": float(flags.raw("protected_fraction")),
-            "protect_alloc": flags.knob("protect_alloc", quiet=True),
-            "evict_order": flags.knob("evict_order", quiet=True),
+            "protect_alloc": flags.peek("protect_alloc"),
+            "evict_order": flags.peek("evict_order"),
             # knob() rather than raw(), so a BLOCKED knob reports what is in
             # force (False) rather than what somebody asked for -- a reader
             # must not see disk_enabled true against a tier that cannot exist.
-            "disk_enabled": bool(flags.knob("disk_enabled", quiet=True)),
-            "disk_restore": bool(flags.knob("disk_restore", quiet=True)),
+            "disk_enabled": bool(flags.peek("disk_enabled")),
+            "disk_restore": bool(flags.peek("disk_restore")),
             "blocked": {k: True for k in flags.BLOCKED},
         },
         "env_pinned": flags.audit_env(),

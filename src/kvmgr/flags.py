@@ -206,6 +206,32 @@ class _Missing:
 _MISSING = _Missing()
 
 
+def peek(name: str):
+    """The validated value WITHOUT touching `_last_seen`.
+
+    *** A READER MUST NOT CONSUME THE CHANGE EDGE. ***  `knob()` and `changed()`
+    both record what they saw, which is what makes "log on change" and
+    "reconcile on the edge" work -- and it means a READER calling `knob()` can
+    swallow a flag change before the manager ever notices it.
+
+    Observed live 2026-10-07: the stats endpoint polled `knob("protect_alloc")`,
+    recorded the new value, and `new_step_starts()` then found nothing changed --
+    so `protect_alloc=by_need` was reported as in force by the very endpoint that
+    had prevented it being applied. Observability must not alter behaviour, and a
+    dashboard polling every 30s would have made flag changes intermittent.
+    """
+    value = raw(name)
+    allowed = _VALID.get(name)
+    if allowed is not None and value not in allowed:
+        return DEFAULTS[name]
+    built = _IMPLEMENTED.get(name)
+    if built is not None and value not in built:
+        return DEFAULTS[name]
+    if BLOCKED.get(name) is not None and value != DEFAULTS[name]:
+        return DEFAULTS[name]
+    return value
+
+
 def changed(name: str) -> bool:
     """True if `name` differs from the last value `knob()`/`changed()` saw.
 
