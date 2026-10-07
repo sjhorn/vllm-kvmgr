@@ -237,6 +237,50 @@ because the fraction became hot the same day. Both eviction causes separated
 correctly (`cap` on the trim, `reset` on the flag-change reconcile; `pool`
 stayed 0 on an idle box) and `vllm:num_preemptions_total` stayed 0.
 
+### The gentle squeeze, 2026-10-07: head-first stranding MEASURED LIVE
+
+The `fifo` arm is the clean result, and it is the first live measurement of the
+damage the whole policy exists to avoid. Four distinct 12K-token prefixes, 46
+blocks each, then the cap squeezed from 3,413 to 114 blocks:
+
+	before   lineages=4  surviving=184  REUSABLE=184  (100%)
+	after    lineages=4  surviving=114  REUSABLE= 93  ( 82%)
+	           blocks= 21  head_intact=FALSE  reusable=  0   <- STRANDED
+	           blocks= 46  head_intact=True   reusable= 46
+	           blocks= 46  head_intact=True   reusable= 46
+	           blocks=  1  head_intact=True   reusable=  1
+
+**21 of 114 surviving blocks — 18% — are worth nothing.** They are resident,
+they cost pool, and the cache cannot use one token of them, because the head of
+their prefix went first. That is the mechanism, on the real engine.
+
+### ...AND THE OTHER TWO ARMS DID NOT GET A FAIR TEST
+
+Recorded because the numbers look like a win and are not evidence of one. Both
+`lru` and `lru_tail_first` came out at **100% reusable** — but with
+**`lineages=1`**. The squeeze removed whole prefixes rather than half-evicting
+one, so there was no partial victim to inspect and nothing to discriminate.
+
+Two design faults, both mine:
+
+- **State accumulated between arms.** Each arm set `protected_fraction=0.75`
+  (cap 3,413), which trims nothing, so the previous arm's blocks survived:
+  `protected` went 184 → 902 → 920 across the three arms. The squeeze target was
+  computed as 5/8 of that inflated total, which is far more than one prefix.
+- **The prefixes merged.** Distinct seeds but identical filler, so later prompts
+  shared prefixes and collapsed into one 604-block lineage. A 46-block prefix
+  and a 604-block one do not squeeze comparably.
+
+**What a fair run needs:** reset the protected set between arms (squeeze to
+near-zero, then back up), filler that genuinely differs per prefix so lineages
+cannot merge, and a target chosen to land **mid-lineage** — total minus half of
+one prefix — rather than as a fraction of the total.
+
+So: **head-first stranding is confirmed live; tail-first beating `lru` is still
+offline-only.** `lru` and `lru_tail_first` are *selected* correctly live (the
+victim counters prove that) and their outcome difference is not yet measured on
+the box.
+
 **WHAT THIS DOES *NOT* SHOW, and it is the interesting half.** It proves the
 rules fire, are selected live, and are attributed correctly. It does **not**
 prove the differential OUTCOME — which prefix survived, and whether it kept its
