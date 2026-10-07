@@ -134,9 +134,22 @@ class SlotPool:
 
     A pool rather than a counter because the whole point of staging is that it is
     SMALL: a few dozen blocks against the 510-block, 1.07 GB CPU tier we are
-    replacing. Exhaustion is therefore normal and must be survivable -- the
-    connector keeps unsubmitted store jobs and retries, so `transfer_async`
-    returning False is an expected answer and not an error.
+    replacing.
+
+    *** THIS DOCSTRING USED TO SAY EXHAUSTION WAS SURVIVABLE BECAUSE "the
+    connector keeps unsubmitted store jobs and retries". THAT IS FALSE AND IT
+    KILLED THE ENGINE ON THE FIRST REQUEST. *** `_unsubmitted_store_jobs` is a
+    DEFERRAL queue, not a retry queue: `prepare_store_kv` appends to it so the
+    store starts after token sampling, and then `handle_preemptions` and
+    `start_kv_transfers` BOTH submit the whole list with a bare `assert success`
+    and clear it. There is no backpressure protocol anywhere in the connector,
+    so `transfer_async` returning False is FATAL on every path. I inferred a
+    retry mechanism from the queue's name and an offline test asserted it.
+
+    So the pool must never be the reason a transfer is refused, and `take_upto`
+    rather than `take` is the interface that makes that possible: the handler
+    chunks a job across as many staging rounds as it needs. Staging stays small
+    AND a job of any size is accepted.
     """
 
     def __init__(self, size: int):
@@ -147,9 +160,25 @@ class SlotPool:
         self.high_water = 0
 
     def take(self, n: int) -> list[int] | None:
+        """All-or-nothing. Kept for the tests that pin the boundary; the handler
+        uses take_upto, because an all-or-nothing pool cannot serve a job larger
+        than the pool."""
         if n > len(self._free):
             return None
         out = [self._free.pop() for _ in range(n)]
+        self.high_water = max(self.high_water, self.size - len(self._free))
+        return out
+
+    def take_upto(self, n: int) -> list[int]:
+        """As many as are free, up to n. May return fewer, never None.
+
+        The handler needs a PARTIAL answer: a store job can be hundreds of
+        blocks (a 48K prompt is ~190 blocks in group 0 alone) against a pool of
+        32, and refusing it is fatal. Returning what is available lets the job
+        proceed in rounds.
+        """
+        k = min(n, len(self._free))
+        out = [self._free.pop() for _ in range(k)]
         self.high_water = max(self.high_water, self.size - len(self._free))
         return out
 
@@ -263,13 +292,22 @@ class DiskStoreHandler:
             block_size_factor=spec.block_size_factor,
             kv_cache_groups_data_refs=self._refs, gpu_to_cpu=True,
         )
+        # Batching per group is only trivial at factor 1 (block_indices enters
+        # the inner arithmetic as `block_idx % factor`). Asserted rather than
+        # assumed, because a silently wrong offset is the F8_E8M0 class.
+        assert spec.block_size_factor == 1, (
+            "kvmgr: the disk handler batches per group, which assumes "
+            f"block_size_factor == 1 (got {spec.block_size_factor}). Do not set "
+            "'block_size' in kv_connector_extra_config.")
         self._pool = SlotPool(staging_blocks)
         self._writers = ThreadPoolExecutor(max_workers=write_threads,
                                            thread_name_prefix="kvmgr_disk")
-        self._inflight: dict[int, dict] = {}   # inner job id -> state
-        self._writing: list[tuple[int, Any, list[int], int]] = []
+        self._jobs: dict[int, dict] = {}          # OUR job id -> rounds left
+        self._inner_to_job: dict[int, tuple] = {}  # inner job id -> round
+        self._writing: list[tuple[int, Any, list[int]]] = []
         self._next_inner = 1
-        self.stats = {"submitted": 0, "refused_full": 0, "refused_pairing": 0,
+        self._saturated = False
+        self.stats = {"submitted": 0, "refused_pairing": 0,
                       "files": 0, "bytes": 0, "errors": 0}
         logger.info(
             "kvmgr: disk store handler -- staging %d blocks x %d tensors "
@@ -280,110 +318,195 @@ class DiskStoreHandler:
         )
 
     def transfer_async(self, job_id: int, spec) -> bool:
+        """Accept a job of ANY size, and submit it over as many rounds as needed.
+
+        *** WHY THIS CANNOT JUST RETURN False WHEN STAGING IS FULL. *** It used
+        to, and it killed the engine on the first request. The connector's
+        `_unsubmitted_store_jobs` is a DEFERRAL queue, not a retry queue, and
+        both `handle_preemptions` and `start_kv_transfers` submit it with a bare
+        `assert success`. So False is fatal on every path -- there is no
+        backpressure protocol to lean on. A single 48K-token prompt is ~190
+        blocks in group 0 alone against a pool of 32, so "refuse when full"
+        meant "refuse always".
+
+        The job is therefore QUEUED and pumped from get_finished(), which the
+        engine calls every step. Deferring submission is safe because the
+        framework's notion of done is our completion report, and we only report
+        a job when every one of its rounds has been written.
+        """
         from vllm.v1.kv_offload.base import get_offload_group_idx
-        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 
         gpu_spec, disk_spec = spec
-        keys = disk_spec.keys
+        keys = list(disk_spec.keys)
         block_ids = list(gpu_spec.block_ids)
+        group_sizes = list(gpu_spec.group_sizes)
 
-        # REFUSE RATHER THAN WRITE. See check_pairing's docstring: a desync here
-        # produces files of the right size holding another block's KV.
-        why = check_pairing(keys, block_ids, gpu_spec.group_sizes,
-                            get_offload_group_idx)
+        # The one refusal that REMAINS fatal, on purpose: a desync would write
+        # one block's KV into another block's file, at the right size and with
+        # no zero tail. A dead engine is strictly better than that.
+        why = check_pairing(keys, block_ids, group_sizes, get_offload_group_idx)
         if why is not None:
             self.stats["refused_pairing"] += 1
             logger.error("kvmgr: REFUSING store job %d -- %s", job_id, why)
             return False
 
-        slots = self._pool.take(len(block_ids))
-        if slots is None:
-            # Expected, not an error: staging is small by design and the
-            # connector retries unsubmitted store jobs.
-            self.stats["refused_full"] += 1
-            return False
-
-        inner = self._next_inner
-        self._next_inner += 1
-        if not self._inner.transfer_async(inner, (gpu_spec,
-                                                  CPULoadStoreSpec(slots))):
-            self._pool.give(slots)
-            return False
-        self._inflight[inner] = {"job_id": job_id, "slots": slots, "keys": keys}
+        # Batch PER GROUP, because the inner handler walks group_sizes and a
+        # batch that spans groups would need its own block_indices arithmetic.
+        # Per group that arithmetic is trivial, which is why the constructor
+        # asserts block_size_factor == 1.
+        batches = []
+        off = 0
+        for g, n in enumerate(group_sizes):
+            if n:
+                batches.append([g, keys[off:off + n], block_ids[off:off + n]])
+            off += n
+        self._jobs[job_id] = {"batches": batches, "pending": 0, "bytes": 0,
+                              "files": 0, "failed": False}
         self.stats["submitted"] += 1
+        self._pump()
         return True
+
+    def _pump(self) -> None:
+        """Submit as many queued rounds as staging allows. Never raises."""
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        ngroups = len(self._refs)
+        for job_id, st in self._jobs.items():
+            while st["batches"] and not st["failed"]:
+                g, bkeys, bids = st["batches"][0]
+                slots = self._pool.take_upto(len(bids))
+                if not slots:
+                    if not self._saturated:
+                        # Said ONCE: a saturated pool is now a throughput note,
+                        # not an error -- but silence here is what made the
+                        # original failure diagnosable only by elimination.
+                        self._saturated = True
+                        logger.info(
+                            "kvmgr: staging pool saturated (%d blocks); store "
+                            "jobs are proceeding in rounds. Raise "
+                            "staging_blocks if disk writes fall behind.",
+                            self._pool.size)
+                    return
+                n = len(slots)
+                gs = [0] * ngroups
+                gs[g] = n
+                inner = self._next_inner
+                self._next_inner += 1
+                try:
+                    ok = self._inner.transfer_async(
+                        inner,
+                        (GPULoadStoreSpec(bids[:n], group_sizes=gs,
+                                          block_indices=[0] * ngroups),
+                         CPULoadStoreSpec(slots)))
+                except Exception:
+                    logger.exception("kvmgr: inner GPU->staging submit raised")
+                    ok = False
+                if not ok:
+                    self._pool.give(slots)
+                    st["failed"] = True
+                    return
+                self._inner_to_job[inner] = (job_id, bkeys[:n], slots, g)
+                st["pending"] += 1
+                if n == len(bids):
+                    st["batches"].pop(0)
+                else:
+                    st["batches"][0] = [g, bkeys[n:], bids[n:]]
 
     def _read_row(self, tensor_idx: int, slot: int, nbytes: int):
         return self._staging[tensor_idx][slot][:nbytes].numpy().data
 
-    def _write_job(self, keys, slots) -> int:
-        from vllm.v1.kv_offload.base import get_offload_group_idx
-
-        total = 0
+    def _write_batch(self, keys, slots, group_idx) -> tuple[int, int]:
+        total = files = 0
         for key, slot in zip(keys, slots):
-            g = get_offload_group_idx(key)
             path = self._mapper.get_file_name(key)
             if os.path.exists(path):
-                # Already ours and complete -- write_chunks renames, so an
-                # existing path is never a partial. This is the dedup that made
-                # boot 2 write zero new files.
+                # write_chunks renames, so an existing path is never a partial.
                 continue
-            total += write_chunks(path, file_plan(self._refs, g, slot),
+            total += write_chunks(path, file_plan(self._refs, group_idx, slot),
                                   self._read_row)
-            self.stats["files"] += 1
-        return total
+            files += 1
+        return total, files
 
     def get_finished(self) -> list:
         from vllm.v1.kv_offload.worker.worker import TransferResult
 
-        out = []
+        # 1. GPU -> staging completions become file writes.
         for res in self._inner.get_finished():
-            st = self._inflight.pop(res.job_id, None)
+            ent = self._inner_to_job.pop(res.job_id, None)
+            if ent is None:
+                continue
+            job_id, bkeys, slots, g = ent
+            st = self._jobs.get(job_id)
             if st is None:
+                self._pool.give(slots)
                 continue
             if not res.success:
-                self._pool.give(st["slots"])
-                out.append(TransferResult(job_id=st["job_id"], success=False))
+                self._pool.give(slots)
+                st["failed"] = True
+                st["pending"] -= 1
                 continue
-            # Stage 1 done => the staging rows for these slots are valid NOW.
-            fut = self._writers.submit(self._write_job, st["keys"], st["slots"])
-            self._writing.append((st["job_id"], fut, st["slots"],
-                                  len(st["keys"])))
+            self._writing.append(
+                (job_id, self._writers.submit(self._write_batch, bkeys, slots, g),
+                 slots))
 
+        # 2. finished writes free their slots and credit their job.
         still = []
-        for job_id, fut, slots, n in self._writing:
+        for job_id, fut, slots in self._writing:
             if not fut.done():
-                still.append((job_id, fut, slots, n))
+                still.append((job_id, fut, slots))
                 continue
             self._pool.give(slots)
+            st = self._jobs.get(job_id)
             try:
-                nbytes = fut.result()
+                nbytes, nfiles = fut.result()
+                if st is not None:
+                    st["bytes"] += nbytes
+                    st["files"] += nfiles
                 self.stats["bytes"] += nbytes
-                out.append(TransferResult(
-                    job_id=job_id, success=True, transfer_size=nbytes,
-                    transfer_type=("GPU", self._spec.disk_medium)))
+                self.stats["files"] += nfiles
             except Exception:
                 self.stats["errors"] += 1
-                logger.exception("kvmgr: disk write failed for job %d", job_id)
-                out.append(TransferResult(job_id=job_id, success=False))
+                logger.exception("kvmgr: disk write failed (job %d)", job_id)
+                if st is not None:
+                    st["failed"] = True
+            if st is not None:
+                st["pending"] -= 1
         self._writing = still
+
+        # 3. room may have freed up; keep the queue moving.
+        self._pump()
+
+        # 4. a job is done only when every round of it is.
+        out = []
+        for job_id in [j for j, st in self._jobs.items()
+                       if st["pending"] == 0 and (not st["batches"] or st["failed"])]:
+            st = self._jobs.pop(job_id)
+            if st["failed"]:
+                out.append(TransferResult(job_id=job_id, success=False))
+            else:
+                out.append(TransferResult(
+                    job_id=job_id, success=True, transfer_size=st["bytes"],
+                    transfer_type=("GPU", self._spec.disk_medium)))
         return out
 
     def wait(self, job_ids: set) -> None:
         import time
-        deadline = time.monotonic() + 300.0
-        while time.monotonic() < deadline:
-            done = {r.job_id for r in self.get_finished()}
-            job_ids -= done
-            if not job_ids:
-                return
-            time.sleep(0.001)
-        logger.error("kvmgr: wait() timed out with %d jobs outstanding",
-                     len(job_ids))
+        deadline = time.monotonic() + 600.0
+        remaining = set(job_ids)
+        while remaining and time.monotonic() < deadline:
+            for r in self.get_finished():
+                remaining.discard(r.job_id)
+            if remaining:
+                time.sleep(0.0005)
+        if remaining:
+            logger.error("kvmgr: wait() timed out with %d job(s) outstanding",
+                         len(remaining))
 
     def shutdown(self) -> None:
         self._writers.shutdown(wait=True)
 
     def snapshot(self) -> dict:
         return dict(self.stats, staging=self._pool.snapshot(),
-                    group_file_sizes=self._sizes)
+                    group_file_sizes=self._sizes,
+                    jobs_open=len(self._jobs), writes_open=len(self._writing))

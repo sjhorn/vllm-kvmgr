@@ -40,7 +40,7 @@ def eq(name, got, want):
 
 
 base = harness.load_kv_offload()
-from kvmgr import diskio  # noqa: E402
+from kvmgr import diskio, diskspec  # noqa: E402
 
 
 class Ref:
@@ -137,12 +137,21 @@ eq("starts full", pool.available, 4)
 s1 = pool.take(3)
 eq("hands out distinct slots", len(set(s1)), 3)
 eq("...and accounts for them", pool.available, 1)
-check("*** over-asking returns None rather than raising -- the connector "
-      "retries ***", pool.take(2) is None)
+# *** THIS ASSERTION USED TO READ "the connector retries", WHICH IS FALSE AND
+# IS WHY THE FIRST DEPLOY KILLED THE ENGINE. *** take() is all-or-nothing and
+# that boundary is still worth pinning, but refusing a transfer because the pool
+# is full is fatal -- see (b6). take_upto is what the handler uses.
+check("take() is all-or-nothing and returns None rather than raising",
+      pool.take(2) is None)
 eq("...and nothing was consumed by the refusal", pool.available, 1)
+part = pool.take_upto(3)
+eq("*** take_upto gives what it CAN -- the interface chunking needs ***",
+   len(part), 1)
+pool.give(part)
 pool.give(s1)
 eq("returning restores them", pool.available, 4)
-eq("high water is remembered", pool.snapshot()["high_water"], 3)
+eq("high water counts BOTH take paths (3 + the partial 1)",
+   pool.snapshot()["high_water"], 4)
 twice = False
 try:
     pool.give([s1[0]])
@@ -233,6 +242,195 @@ except ValueError:
     short = True
 check("a staging row of the wrong length is REFUSED", short)
 check("...with no file left", not os.path.exists(os.path.join(d, "short.bin")))
+
+
+
+# ---------------------------------------------------------------------------
+# (b6) THE CHUNKING STATE MACHINE -- added after the box killed the engine.
+#
+# The first deploy died on the first request: transfer_async returned False
+# because a store job (~190 blocks in group 0 for a 48K prompt) exceeded the
+# 32-block staging pool, and the connector's `assert success` is fatal.
+# `_unsubmitted_store_jobs` is a DEFERRAL queue, not a retry queue -- I inferred
+# backpressure from its name, and the (b4) test above asserted that false
+# premise in as many words.
+#
+# So the handler now queues a job and pumps it over rounds. That state machine
+# is the new risk, and it is exercised here against fakes by constructing the
+# handler WITHOUT __init__ -- the real transfer_async, _pump and get_finished
+# run, which is where a bug would be.
+# ---------------------------------------------------------------------------
+print()
+print("== (b6) chunking: a job larger than the pool must still be accepted ==")
+
+from kvmgr.diskio import DiskStoreHandler  # noqa: E402
+
+wrk = sys.modules["vllm.v1.kv_offload.worker.worker"]
+
+
+class FakeInner:
+    """Stands in for SingleDirectionOffloadingHandler: records and completes."""
+
+    def __init__(self):
+        self.subs = []
+        self._done = []
+        self.fail_next = False
+
+    def transfer_async(self, job_id, spec):
+        gpu, cpu = spec
+        self.subs.append((job_id, list(gpu.block_ids), list(gpu.group_sizes),
+                          list(cpu.block_ids)))
+        self._done.append(wrk.TransferResult(job_id=job_id,
+                                            success=not self.fail_next))
+        return True
+
+    def get_finished(self):
+        out, self._done = self._done, []
+        return out
+
+
+class SyncWriters:
+    """A ThreadPoolExecutor stand-in that runs inline, so the test is ordered."""
+
+    class _F:
+        def __init__(self, fn):
+            try:
+                self._v, self._e = fn(), None
+            except BaseException as e:      # noqa: BLE001
+                self._v, self._e = None, e
+
+        def done(self):
+            return True
+
+        def result(self):
+            if self._e:
+                raise self._e
+            return self._v
+
+    def submit(self, fn, *a):
+        return SyncWriters._F(lambda: fn(*a))
+
+    def shutdown(self, wait=True):
+        pass
+
+
+def mkhandler(pool_size, nrefs=REFS):
+    h = DiskStoreHandler.__new__(DiskStoreHandler)
+    h._spec = type("S", (), {"disk_medium": "DSPARK_DISK"})()
+    h._mapper = type("M", (), {"get_file_name": staticmethod(
+        lambda k: os.path.join(WDIR, base.get_offload_block_hash(k).hex()[:20]
+                               + f"_g{base.get_offload_group_idx(k)}.bin"))})()
+    h._refs = nrefs
+    h._sizes = diskio.group_file_sizes(nrefs)
+    h._inner = FakeInner()
+    h._pool = diskio.SlotPool(pool_size)
+    h._writers = SyncWriters()
+    h._jobs, h._inner_to_job, h._writing = {}, {}, []
+    h._next_inner, h._saturated = 1, False
+    h.stats = {"submitted": 0, "refused_pairing": 0, "files": 0, "bytes": 0,
+               "errors": 0}
+    h._read_row = lambda t, s, n: b"\xab" * n
+    return h
+
+
+WDIR = tempfile.mkdtemp(prefix="kvchunk-")
+K, gidx = base.make_offload_key, base.get_offload_group_idx
+
+
+def gkeys(group, n, salt=0):
+    return [K(bytes([group + 1, salt, i // 256, i % 256]) * 8, group)
+            for i in range(n)]
+
+
+# 100 blocks in group 0 against a pool of 8: the shape that killed the engine.
+h = mkhandler(8)
+ks = gkeys(0, 100)
+gpu = base.GPULoadStoreSpec(list(range(1000, 1100)), group_sizes=[100, 0, 0, 0, 0],
+                            block_indices=[0] * 5)
+check("*** a 100-block job against an 8-block pool is ACCEPTED, not refused ***",
+      h.transfer_async(77, (gpu, diskspec.DiskLoadStoreSpec(ks))) is True)
+eq("...and only a pool's worth is submitted at first", len(h._inner.subs), 1)
+eq("...of exactly the pool size", len(h._inner.subs[0][1]), 8)
+check("...with the job still queued", h._jobs[77]["batches"] != [])
+check("...and the saturation note said ONCE", h._saturated is True)
+
+rounds, done = 0, []
+while not done and rounds < 100:
+    done = h.get_finished()
+    rounds += 1
+eq("the job completes after pumping", len(done), 1)
+eq("...reporting OUR job id, not an inner one", done[0].job_id, 77)
+check("...as a success", done[0].success is True)
+eq("...over ceil(100/8) rounds", len(h._inner.subs), 13)
+eq("...covering every block exactly once",
+   sorted(b for s in h._inner.subs for b in s[1]), list(range(1000, 1100)))
+eq("...and every key got a file", h.stats["files"], 100)
+eq("all staging slots are returned", h._pool.available, 8)
+eq("no job state is left behind", len(h._jobs), 0)
+check("the transfer_type label names our medium",
+      done[0].transfer_type == ("GPU", "DSPARK_DISK"))
+
+print()
+print("== (b7) batching is PER GROUP, because the inner walks group_sizes ==")
+h2 = mkhandler(4)
+mixed = gkeys(0, 3) + gkeys(2, 2) + gkeys(4, 1)
+gpu2 = base.GPULoadStoreSpec([1, 2, 3, 4, 5, 6], group_sizes=[3, 0, 2, 0, 1],
+                             block_indices=[0] * 5)
+h2.transfer_async(9, (gpu2, diskspec.DiskLoadStoreSpec(mixed)))
+done2 = []
+for _ in range(30):
+    done2 += h2.get_finished()
+eq("the job completes", [d.job_id for d in done2], [9])
+for jid, bids, gs, slots in h2._inner.subs:
+    nz = [i for i, v in enumerate(gs) if v]
+    eq(f"round {jid} touches exactly one group", len(nz), 1)
+    eq(f"...and its group_sizes matches its block count", gs[nz[0]], len(bids))
+eq("...and the files are named by their own group",
+   sorted({os.path.basename(p).split('_g')[1][0]
+           for p in os.listdir(WDIR) if p.endswith(".bin")}), ["0", "2", "4"])
+
+# *** AND EACH FILE MUST BE ITS OWN GROUP'S SIZE. *** The name comes from the
+# KEY, so a handler that used the wrong group for the BYTE PLAN would write
+# group 0's layout under a group-2 name -- right name, wrong content, which is
+# the exact silent corruption this suite exists for. Break-verification found
+# this gap: passing the wrong group index to the write was NOT caught until
+# this assertion existed.
+want = {str(g): sz for g, sz in enumerate(diskio.group_file_sizes(REFS))}
+got = {}
+for f in os.listdir(WDIR):
+    if not f.endswith(".bin"):
+        continue
+    got.setdefault(f.split("_g")[1][0], set()).add(
+        os.path.getsize(os.path.join(WDIR, f)))
+for g in sorted(got):
+    eq(f"*** group {g}'s files are group {g}'s size, not another group's ***",
+       got[g], {want[g]})
+
+print()
+print("== (b8) a failed round fails the JOB, and frees everything ==")
+h3 = mkhandler(4)
+h3._inner.fail_next = True
+h3.transfer_async(5, (base.GPULoadStoreSpec([1, 2], group_sizes=[2, 0, 0, 0, 0],
+                                            block_indices=[0] * 5),
+                      diskspec.DiskLoadStoreSpec(gkeys(0, 2, salt=9))))
+d3 = []
+for _ in range(20):
+    d3 += h3.get_finished()
+eq("the job is reported", [x.job_id for x in d3], [5])
+check("*** as a FAILURE, not silently dropped ***", d3[0].success is False)
+eq("...and the slots came back", h3._pool.available, 4)
+
+print()
+print("== (b9) the pairing refusal is STILL fatal, on purpose ==")
+h4 = mkhandler(8)
+# one key too few: the off-by-one the scheduler's block_id==0 skip produces
+check("a desynced job is refused",
+      h4.transfer_async(1, (base.GPULoadStoreSpec([1, 2, 3], group_sizes=[3, 0, 0, 0, 0],
+                                                  block_indices=[0] * 5),
+                            diskspec.DiskLoadStoreSpec(gkeys(0, 2, salt=3)))) is False)
+eq("...counted", h4.stats["refused_pairing"], 1)
+eq("...and nothing was submitted", len(h4._inner.subs), 0)
+eq("...nor any slot consumed", h4._pool.available, 8)
 
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")

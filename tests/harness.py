@@ -107,6 +107,16 @@ def load_kv_offload() -> types.ModuleType:
     _load_file(os.path.join(kvo, "worker", "worker.py"),
                "vllm.v1.kv_offload.worker.worker")
     _load_file(os.path.join(kvo, "factory.py"), "vllm.v1.kv_offload.factory")
+    # cpu/common.py holds CPULoadStoreSpec, which the disk handler uses as the
+    # inner (staging) destination -- so the chunking tests need it.
+    for name in ("vllm.v1.kv_offload.cpu",):
+        if name not in sys.modules:
+            mod = types.ModuleType(name)
+            sys.modules[name] = mod
+            parent, _, leaf = name.rpartition(".")
+            setattr(sys.modules[parent], leaf, mod)
+    _load_file(os.path.join(kvo, "cpu", "common.py"),
+               "vllm.v1.kv_offload.cpu.common")
     _load_file(os.path.join(kvo, "file_mapper.py"),
                "vllm.v1.kv_offload.file_mapper")
     return sys.modules["vllm.v1.kv_offload.base"]
