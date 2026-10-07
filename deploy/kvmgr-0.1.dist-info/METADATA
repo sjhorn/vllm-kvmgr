@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: kvmgr
+Version: 0.1
+Summary: DSpark KV cache manager: hot-configurable protection policy for the full-MLA group

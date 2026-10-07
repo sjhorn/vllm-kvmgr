@@ -29,6 +29,11 @@ PATCHES = os.path.join(REPO, "patches")
 # the engine's own "legacy cap" lines; `--block-size 256` is group 0's only.
 LIVE_BLOCK_SIZES = (256, 64, 64, 4, 8)
 
+# Group 0 is full MLA, so its need is unbounded (None). The other four are
+# windowed; `cache_config_info` reports sliding_window=128 across the five
+# KV managers, which is why a windowed group needs its window and no more.
+LIVE_SLIDING_WINDOWS = (None, 128, 128, 128, 128)
+
 # The live pool, for cap arithmetic that must match the box.
 LIVE_NUM_GPU_BLOCKS = 24288
 LIVE_MAX_MODEL_LEN = 1_048_576
@@ -53,6 +58,7 @@ class Loaded:
     utils: types.ModuleType
     pool_mod: types.ModuleType
     mgr_mod: types.ModuleType
+    coord_mod: types.ModuleType
 
 
 _loaded: Loaded | None = None
@@ -77,6 +83,15 @@ def load(force: bool = False) -> Loaded:
         os.path.join(PATCHES, "patch6-single_type_kv_cache_manager.py"),
         "vllm.v1.core.single_type_kv_cache_manager",
     )
+    # The coordinator is NOT one of our overlays -- it is the pristine capture,
+    # loaded so the layer ABOVE the managers is under test too: the group
+    # geometry hook wraps its __init__, and the fixed-point hit loop that makes
+    # a group-0-only disk restore pointless lives here.
+    coord_mod = _load_file(
+        os.path.join(REPO, "patches", "pristine", "vllm", "v1", "core",
+                     "kv_cache_coordinator.py"),
+        "vllm.v1.core.kv_cache_coordinator",
+    )
 
     # The thing that silently goes wrong: a stub winning over the real file.
     assert pool_mod.KVCacheBlock is utils.KVCacheBlock, (
@@ -88,7 +103,14 @@ def load(force: bool = False) -> Loaded:
     assert hasattr(mgr_mod, "_flag"), "patch6 has no _flag(): not the patched file"
     assert hasattr(mgr_mod, "spec_manager_map"), "patch6 has no spec_manager_map"
 
-    _loaded = Loaded(utils, pool_mod, mgr_mod)
+    assert coord_mod.BlockPool is pool_mod.BlockPool, (
+        "coordinator bound a different BlockPool -- load order"
+    )
+    assert (
+        coord_mod.get_manager_for_kv_cache_spec is mgr_mod.get_manager_for_kv_cache_spec
+    ), "coordinator bound a different manager factory -- load order"
+
+    _loaded = Loaded(utils, pool_mod, mgr_mod, coord_mod)
     return _loaded
 
 
