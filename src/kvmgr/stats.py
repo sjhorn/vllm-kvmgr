@@ -65,6 +65,8 @@ class GroupStats:
         "victims", "cap_blocks", "cap_tokens", "protected_now",
         "restore_hits", "restore_blocks", "restore_refused",
         "lineages",
+        # disk round-trip verification
+        "verify_ok", "verify_mismatch",
     )
 
     def __init__(self, group_id: int, block_size: int):
@@ -95,6 +97,9 @@ class GroupStats:
         self.restore_refused = 0
         # per-prefix survivors, refreshed by the manager
         self.lineages: list = []
+        # disk round-trip verification
+        self.verify_ok = 0
+        self.verify_mismatch = 0
 
     def as_dict(self) -> dict[str, Any]:
         total = self.hit_calls + self.miss_calls
@@ -126,6 +131,8 @@ class GroupStats:
             "restore_blocks": self.restore_blocks,
             "restore_refused": self.restore_refused,
             "lineages": list(self.lineages),
+            "verify_ok": self.verify_ok,
+            "verify_mismatch": self.verify_mismatch,
         }
 
 
@@ -200,6 +207,19 @@ def record_cap(group_id: int, cap_blocks: int | None, block_size: int) -> None:
         g = group(group_id, block_size)
         g.cap_blocks = cap_blocks
         g.cap_tokens = None if cap_blocks is None else cap_blocks * block_size
+    except Exception:
+        pass
+
+
+def record_verify(ok: bool, group_id: int = 0) -> None:
+    """A disk round trip matched, or did not. A mismatch is the one counter here
+    that means the data path is WRONG rather than merely slow or absent."""
+    try:
+        g = group(group_id)
+        if ok:
+            g.verify_ok += 1
+        else:
+            g.verify_mismatch += 1
     except Exception:
         pass
 

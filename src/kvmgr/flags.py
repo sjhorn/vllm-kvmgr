@@ -88,6 +88,10 @@ DEFAULTS: dict[str, Any] = {
     # lengths; our 2,103,552-byte blocks are not (mod 512 = 256), so every
     # write failed with EINVAL. False drops the flag. See kvmgr/offload.py.
     "offload_odirect": False,
+    # Round-trip every disk write and byte-compare it. A TEST MODE: it doubles
+    # store I/O. Exists because this engine's OUTPUT is not deterministic, so an
+    # output-equivalence gate proves nothing -- see kvmgr/offload.install_verify.
+    "offload_verify": False,
     # pre-existing, preserved unchanged -- listed so this table is the whole
     # surface and nothing is hot-by-accident or cold-by-omission.
     "swa_recycle": True,

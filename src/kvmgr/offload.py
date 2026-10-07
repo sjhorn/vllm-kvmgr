@@ -64,6 +64,7 @@ from __future__ import annotations
 from vllm.logger import init_logger
 
 from . import flags
+from . import stats
 
 logger = init_logger("vllm." + __name__)
 
@@ -160,6 +161,88 @@ def install_io() -> bool:
     return True
 
 
+def install_verify() -> bool:
+    """Round-trip every block written to disk and compare it byte for byte.
+
+    *** WHY THIS AND NOT AN OUTPUT-EQUIVALENCE TEST. *** The output gate was
+    worthless: measured 2026-10-07, four runs of the same prompt on ONE
+    unchanged configuration gave two different answers (eq1 at 156 and 157
+    tokens, differing even in capitalisation), because
+    `SpeculativeConfig(num_spec_tokens=5)` plus `--async-scheduling` and chunked
+    prefill move the float reduction order and flip a near-tie argmax. A SHA of
+    this engine's output fingerprints nothing, so "the hashes matched" was luck.
+
+    A byte compare of the data path has no such problem: it is exact, it needs
+    no determinism, and it tests precisely what the O_DIRECT change touched.
+
+    *** WHAT IT PROVES: *** that what `load_block` reads back equals what
+    `store_block` was handed -- so the write, the file, and the read agree. That
+    is the disk round trip, which is the thing we changed.
+
+    *** WHAT IT CANNOT PROVE, and this must not be glossed: *** that the bytes
+    handed in were the RIGHT bytes. It compares against the same slice the
+    writer received, so a wrong offset or a wrong length upstream of here would
+    round-trip perfectly and still be wrong. The open question it cannot touch:
+    every file on disk is 2,103,552 bytes for ALL FIVE groups, and five of those
+    exceed the CPU page computed for one block index -- either the page
+    arithmetic is off by the world_size factor or the write length is uniform
+    where it should be per-group. Answering that needs the GPU-side bytes, which
+    only the worker can read.
+
+    Reassurance that is NOT proof: the same block hash stored under different
+    groups has different content on disk (distinct md5s), so per-group selection
+    is picking different data rather than duplicating one buffer.
+
+    DOUBLES THE I/O of every store, so it is off by default and is a test mode,
+    not something to leave on.
+    """
+    try:
+        from vllm.v1.kv_offload.tiering.fs import io as fsio
+    except Exception:
+        return False
+
+    if getattr(fsio, "_kvmgr_verify_wrapped", False):
+        return True
+
+    orig_store = fsio.store_block
+
+    def store_block(dest_path, buffer, offset, block_size, *a, **kw):
+        result = orig_store(dest_path, buffer, offset, block_size, *a, **kw)
+        try:
+            if not flags.raw("offload_verify"):
+                return result
+            back = bytearray(block_size)
+            # Through load_block, not a raw read: the READER is part of what we
+            # are testing, and it carries its own O_DIRECT handling.
+            fsio.load_block(dest_path, memoryview(back), 0, block_size, *a, **kw)
+            src = bytes(buffer.cast("B")[offset : offset + block_size])
+            if bytes(back) == src:
+                stats.record_verify(True)
+            else:
+                stats.record_verify(False)
+                first = next(
+                    (i for i, (x, y) in enumerate(zip(back, src)) if x != y), -1
+                )
+                logger.error(
+                    "kvmgr: *** DISK ROUND TRIP MISMATCH *** %s: %d bytes, "
+                    "first differing byte at %d. The KV written to disk is not "
+                    "the KV that was handed to the writer.",
+                    dest_path, block_size, first,
+                )
+        except Exception:
+            # Verification must never break a transfer it is only observing.
+            logger.exception("kvmgr: round-trip verify failed to run")
+        return result
+
+    fsio.store_block = store_block
+    fsio._kvmgr_verify_wrapped = True  # type: ignore[attr-defined]
+    logger.info(
+        "kvmgr: disk round-trip verifier installed (off unless offload_verify "
+        "is set; it doubles store I/O)"
+    )
+    return True
+
+
 def install() -> bool:
     """Wrap `TieringOffloadingSpec.get_manager`. Idempotent and total.
 
@@ -246,4 +329,5 @@ def install() -> bool:
     # The fs tier's O_DIRECT is a separate defect with a separate knob, so the
     # two can be A/B'd independently.
     install_io()
+    install_verify()
     return True

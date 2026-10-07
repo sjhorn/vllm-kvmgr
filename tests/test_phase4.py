@@ -76,6 +76,7 @@ from kvmgr import flags  # noqa: E402
 import importlib  # noqa: E402
 
 offload = importlib.import_module("kvmgr.offload")
+stats = importlib.import_module("kvmgr.stats")
 
 F = harness.Flags(os.path.join(tempfile.mkdtemp(prefix="kvmgr4-"), "flags.json"))
 LIVE = (256, 64, 64, 4, 8)
@@ -333,6 +334,118 @@ offload._real_odirect = None
 harness.clear_log()
 eq("install_io() returns False when the fs tier is absent",
    offload.install_io(), False)
+
+# --------------------------------------------------------------------------
+# (4c) the disk ROUND-TRIP VERIFIER
+#
+# WHY IT EXISTS: the output-equivalence gate was worthless. Four runs of one
+# prompt on ONE unchanged config gave two different answers (156 vs 157 tokens,
+# differing in capitalisation), because num_spec_tokens=5 plus async scheduling
+# moves the reduction order and flips a near-tie argmax. A byte compare needs no
+# determinism.
+#
+# Both directions are exercised, because a verifier that cannot FAIL is the
+# vacuous test this suite has already caught twice.
+# --------------------------------------------------------------------------
+print()
+print("== (4c) the disk round-trip verifier ==")
+
+for _n in ("vllm.v1.kv_offload", "vllm.v1.kv_offload.tiering",
+           "vllm.v1.kv_offload.tiering.fs", "vllm.v1.kv_offload.tiering.fs.io"):
+    if _n not in sys.modules:
+        _m = types.ModuleType(_n)
+        sys.modules[_n] = _m
+        _par, _, _leaf = _n.rpartition(".")
+        setattr(sys.modules[_par], _leaf, _m)
+_fsio = sys.modules["vllm.v1.kv_offload.tiering.fs.io"]
+_fsio.O_DIRECT = 0
+
+# A byte-faithful fake disk, and a corrupting one. `store_block` is handed a
+# buffer plus an OFFSET and a LENGTH, exactly as the real fs tier is.
+_disk: dict = {}
+_corrupt = {"on": False}
+
+
+def _store_block(path, buffer, offset, block_size, *a, **kw):
+    b = bytes(buffer.cast("B")[offset:offset + block_size])
+    if _corrupt["on"]:
+        b = b[:-1] + bytes([(b[-1] + 1) & 0xFF])     # flip the LAST byte
+    _disk[path] = b
+    return None
+
+
+def _load_block(path, view, offset, block_size, *a, **kw):
+    view.cast("B")[offset:offset + block_size] = _disk[path]
+    return None
+
+
+_fsio.store_block = _store_block
+_fsio.load_block = _load_block
+_fsio._kvmgr_verify_wrapped = False
+
+check("install_verify() reports success", offload.install_verify() is True)
+check("install_verify() is idempotent", offload.install_verify() is True)
+
+import array
+_src = array.array("B", bytes(range(256)) * 16)      # 4096 bytes
+_buf = memoryview(_src)
+
+flags.reset_for_tests()
+F.write(offload_verify=0)
+stats.reset_for_tests()
+_fsio.store_block("/d/a.bin", _buf, 0, 4096)
+eq("OFF by default: nothing verified", stats.group(0).verify_ok, 0)
+eq("and no mismatch recorded either", stats.group(0).verify_mismatch, 0)
+check("but the block still reached the fake disk", "/d/a.bin" in _disk)
+
+F.write(offload_verify=1)
+stats.reset_for_tests()
+_fsio.store_block("/d/b.bin", _buf, 0, 4096)
+eq("*** HOT: a faithful round trip VERIFIES, with no restart ***",
+   stats.group(0).verify_ok, 1)
+eq("and nothing is reported as a mismatch", stats.group(0).verify_mismatch, 0)
+
+# a NON-ZERO offset, because the real tier slices into one big page and an
+# off-by-one there is exactly the class of bug this is for
+stats.reset_for_tests()
+_fsio.store_block("/d/c.bin", _buf, 1024, 2048)
+eq("a mid-buffer slice verifies too", stats.group(0).verify_ok, 1)
+eq("and the right 2,048 bytes landed", _disk["/d/c.bin"], bytes(_src[1024:3072]))
+
+# *** THE DIRECTION THAT MATTERS: it must be able to FAIL. ***
+_corrupt["on"] = True
+stats.reset_for_tests()
+harness.clear_log()
+_fsio.store_block("/d/d.bin", _buf, 0, 4096)
+_corrupt["on"] = False
+eq("*** a ONE-BYTE corruption is CAUGHT ***",
+   stats.group(0).verify_mismatch, 1)
+eq("and is not also counted as a success", stats.group(0).verify_ok, 0)
+check("the mismatch is LOGGED, loudly",
+      "DISK ROUND TRIP MISMATCH" in harness.log_text())
+check("and the log names where it diverged",
+      "first differing byte at 4095" in harness.log_text())
+
+# a read that EXPLODES must not break the write it was only observing
+def _boom_load(*a, **kw):
+    raise OSError("read failed")
+
+
+_keep = _fsio.load_block
+_fsio.load_block = _boom_load
+stats.reset_for_tests()
+try:
+    _fsio.store_block("/d/e.bin", _buf, 0, 4096)
+    check("a failing read-back does NOT break the store", "/d/e.bin" in _disk)
+    eq("and records neither outcome", (stats.group(0).verify_ok,
+                                      stats.group(0).verify_mismatch), (0, 0))
+finally:
+    _fsio.load_block = _keep
+
+check("offload_verify is in DEFAULTS so the hot-config suite covers it",
+      "offload_verify" in flags.DEFAULTS)
+eq("and it is OFF by default -- it doubles store I/O",
+   flags.DEFAULTS["offload_verify"], False)
 
 check("offload_odirect is in DEFAULTS so the hot-config suite covers it",
       "offload_odirect" in flags.DEFAULTS)

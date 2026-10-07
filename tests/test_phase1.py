@@ -279,6 +279,7 @@ PROBE = {
     "kvmgr_stats_port": (0, 9107),
     "offload_allow_hybrid": (0, 1),
     "offload_odirect": (0, 1),
+    "offload_verify": (0, 1),
     "swa_recycle": (1, 0),
     "swa_recycle_cached": (0, 1),
     "free_queue_prepend_uncached": (0, 1),
