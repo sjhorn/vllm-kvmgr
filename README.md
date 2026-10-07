@@ -223,6 +223,31 @@ token 0, the 30 surviving blocks are worth 20 under `lru` and 30 under
 `lru_tail_first`. On the real case that is the difference between a ~518 s
 recompute of a 740K prefix and ~35 s for the 40K tail.
 
+**CONFIRMED LIVE 2026-10-07.** All three rules fired on the real engine, each
+logging its own victim rule, with `cause=cap` and the surviving extent in
+tokens:
+
+	victims={'fifo_oldest_protected': 492,
+	         'lru_least_recently_reused': 105,
+	         'lru_tail_first': 105}
+
+Driven by squeezing `protected_fraction` to 0.004 (cap 18 blocks) against ~108
+protected blocks across six distinct prefixes — which is only testable at all
+because the fraction became hot the same day. Both eviction causes separated
+correctly (`cap` on the trim, `reset` on the flag-change reconcile; `pool`
+stayed 0 on an idle box) and `vllm:num_preemptions_total` stayed 0.
+
+**WHAT THIS DOES *NOT* SHOW, and it is the interesting half.** It proves the
+rules fire, are selected live, and are attributed correctly. It does **not**
+prove the differential OUTCOME — which prefix survived, and whether it kept its
+head. The squeeze to 18 blocks destroys nearly everything, so there is no
+interesting partial survivor to inspect; the per-decision lines read
+`1 lineage(s) held` by the end because only one was left. **The head-vs-tail
+difference is still verified offline only**, in `test_phase3.py`, where the
+scenario is built to leave exactly one half-evicted prefix. Showing it live
+needs a cap that bites *gently* — a few hundred blocks below the protected
+total, not two orders of magnitude.
+
 A prefix is identified by its **head block's hash**, the convention MNT-9
 already uses for head pins — the one handle that is stable across turns and
 distinct between two lineages that share no prefix. Tracking hangs off the fact
