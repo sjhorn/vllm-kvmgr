@@ -411,23 +411,35 @@ DSparkMLAAttentionManager.group_count = 1
 DSparkMLAAttentionManager.group_block_sizes = (16,)
 DSparkMLAAttentionManager.group_sliding_windows = (None,)
 
-# a protect that takes NOTHING (no block_hash -> patch6 skips them all)
+# UNHASHED blocks are NOT the trigger -- lineage_key returns None and _kv_track
+# returns before creating anything. The first version of this test used them and
+# so asserted nothing: it passed against the leak. Verified by breaking it.
 _nohash = _p.get_new_blocks(4)
 _m._protect_prompt_blocks(_nohash)
-eq("a protect that took nothing leaves NO lineage behind",
+eq("unhashed blocks create no lineage (an early return, not the fix)",
    len(_m._kv_lineages), 0)
-eq("and no head record either", len(_m._kv_lineage_head), 0)
-check("so the report has no blocks=0 rows", _m.kvmgr_lineage_report() == [],
-      f"{_m.kvmgr_lineage_report()}")
 
-# ...while a real prefix still tracks, and REFRESHES on an appending turn
+# *** THE REAL TRIGGER: a SUB-PREFIX whose head is a new key but whose every
+# block is already protected. *** Offer A, then offer A[1:] -- key(A[1]) has
+# never been a lineage key, so a fresh empty list is created, and patch6 takes
+# nothing because all of A is already protected. Measured against the broken
+# version: 1 lineage -> 2, one of them with 0 blocks.
 _a = _p.get_new_blocks(5)
 for _i, _b in enumerate(_a):
     _b.block_hash = bh(70000 + _i)
+_m._protect_prompt_blocks(_a)
+eq("the full prefix is one lineage", len(_m._kv_lineages), 1)
+_m._protect_prompt_blocks(_a[1:])
+eq("*** a sub-prefix that takes nothing leaves NO empty lineage ***",
+   len(_m._kv_lineages), 1)
+eq("and no orphan head record", len(_m._kv_lineage_head), 1)
+eq("so the report has no blocks=0 rows",
+   sum(1 for e in _m.kvmgr_lineage_report() if e["blocks"] == 0), 0)
+
+# ...and a real prefix still tracks and REFRESHES on an appending turn
 _b2 = _p.get_new_blocks(5)
 for _i, _x in enumerate(_b2):
     _x.block_hash = bh(80000 + _i)
-_m._protect_prompt_blocks(_a)
 _m._protect_prompt_blocks(_b2)
 eq("two real prefixes tracked", len(_m._kv_lineages), 2)
 _order_before = list(_m._kv_lineages)
