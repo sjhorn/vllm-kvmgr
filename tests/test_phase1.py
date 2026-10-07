@@ -363,6 +363,25 @@ MGR._flags_checked_at = -1.0
 
 # the compose must not re-introduce a default, or the knob goes cold again
 _compose = open(os.path.join(REPO_ROOT, "docker-compose.dspark.yml")).read()
+# A BLANK env value must not be reported as a PIN. The first version reported
+# "pinned by VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION=''" on the very boot where the
+# knob had just been made hot -- telling the operator a live knob was cold.
+for _blank in ("", "  "):
+    os.environ[flags.LEGACY_FRACTION_ENV] = _blank
+    check(f"a blank env value {_blank!r} is NOT reported as a pin",
+          not any("protected_fraction" in e for e in flags.audit_env()),
+          f"audit_env() -> {flags.audit_env()}")
+    harness.clear_log()
+    flags.log_env_audit()
+    check(f"and the audit says nothing is pinned, not that it CANNOT move",
+          "CANNOT move this knob" not in harness.log_text(),
+          harness.log_text()[:140])
+os.environ[flags.LEGACY_FRACTION_ENV] = "0.75"
+check("while a REAL value is still reported as a pin",
+      any("protected_fraction" in e for e in flags.audit_env()))
+del os.environ[flags.LEGACY_FRACTION_ENV]
+MGR._flags_checked_at = -1.0
+
 check("the compose does NOT default VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION",
       'VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION: "${PROTECTED_FRACTION:-}"' in _compose,
       "a default there wins over the flags file and makes the knob restart-only")

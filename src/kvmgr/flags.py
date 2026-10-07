@@ -270,8 +270,17 @@ def audit_env() -> list[str]:
     pinned = []
     for name in DEFAULTS:
         env_name = LEGACY_FRACTION_ENV if name == "protected_fraction" else "VLLM_" + name.upper()
-        if os.environ.get(env_name) is not None:
-            pinned.append(f"{name} (pinned by {env_name}={os.environ[env_name]!r})")
+        value = os.environ.get(env_name)
+        # *** A BLANK VALUE IS NOT A PIN. *** docker-compose emits "" for
+        # ${VAR:-} when the variable is unset, and "" is not None -- so the
+        # first version of this reported
+        #   protected_fraction (pinned by VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION='')
+        # on the very boot where the knob had just been made hot. Worse than
+        # noise: it tells the operator a live knob is cold, and invites them to
+        # go hunting for an env var that is already effectively unset.
+        # _protected_fraction() treats blank as absent; this must agree with it.
+        if value is not None and value.strip() != "":
+            pinned.append(f"{name} (pinned by {env_name}={value!r})")
     return pinned
 
 
