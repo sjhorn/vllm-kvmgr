@@ -103,6 +103,62 @@ _LIVE_MANAGER: "DiskPresenceManager | None" = None
 _LIVE_OFFLOAD_SCHED: list = []
 
 
+SCHED_CLS_NAME = "OffloadingConnectorScheduler"
+
+
+def capture_offload_sched_from_caller(depth: int = 5) -> bool:
+    """Grab the connector scheduler off the CALL STACK. One-shot, exact.
+
+    *** A gc SCAN CANNOT FIND IT, AND THAT IS NOT A BUG IN THE SCAN. ***
+    `EngineCore.__init__` calls `freeze_gc_heap()` -> `gc.freeze()`, which moves
+    every object allocated during boot into the permanent generation -- and
+    `gc.get_objects()` DOES NOT RETURN frozen objects. The connector scheduler
+    is built at boot, so it is permanently invisible to a scan. Measured
+    2026-10-08: the scan reported "no live instance" after 17,003 objects, which
+    is implausibly few for an engine core and is the tell -- those 17,003 are
+    only the POST-freeze allocations.
+    
+    The general rule, worth more than this function: **in the engine core, a gc
+    scan can only ever see objects created after boot.** Any discovery of a
+    boot-time object has to come from a hook or from the call stack.
+    
+    So: the connector scheduler is the thing that CALLS us. `prepare_store` and
+    `lookup` are invoked from its own methods, so its `self` is sitting in a
+    caller frame. That is exact rather than heuristic, needs no restart, and
+    costs one dict lookup per call once it has succeeded.
+    
+    Matched on the class NAME rather than with isinstance, deliberately: an
+    upstream module move would make isinstance fail against a class we imported
+    from the old path, and this is a diagnostic -- a name match that is right
+    99% of the time beats an import that is wrong after a version bump. The
+    attribute reads in the snapshot are all getattr-guarded anyway.
+    """
+    if _LIVE_OFFLOAD_SCHED:
+        return True
+    f = None
+    try:
+        import inspect
+        f = inspect.currentframe()
+        for _ in range(depth):
+            if f is None:
+                break
+            f = f.f_back
+            if f is None:
+                break
+            cand = f.f_locals.get("self")
+            if cand is not None and type(cand).__name__ == SCHED_CLS_NAME:
+                del _LIVE_OFFLOAD_SCHED[:]
+                _LIVE_OFFLOAD_SCHED.append(cand)
+                return True
+    except Exception:
+        return False
+    finally:
+        # Frames hold references to their locals; keeping one alive would pin
+        # a request's state and build a cycle on the scheduler's hot path.
+        del f
+    return False
+
+
 def _discover_offload_sched():
     """Find a live OffloadingConnectorScheduler by scanning gc. On demand only.
 
@@ -421,6 +477,11 @@ class DiskPresenceManager(OffloadingManager):
     # -- reads ------------------------------------------------------------
     def lookup(self, key: "OffloadKey", req_context: "ReqContext") -> bool | None:
         self._stats["lookup"] += 1
+        # One-shot, and `lookup` is the right place: it is called by the
+        # connector scheduler on every request whether or not the store path is
+        # enabled, so the handle is captured even with the tier paused.
+        if not _LIVE_OFFLOAD_SCHED:
+            capture_offload_sched_from_caller()
         if not flags.peek("disk_restore"):
             # Write-only by construction: the scheduler only calls prepare_load
             # for keys lookup claimed, so returning False here means no file can

@@ -396,6 +396,82 @@ for _attr in _OPTIONAL_ATTRS:
                and not _is_decl(ln, _attr)]
     eq(f"every read of self.{_attr} outside __init__ uses getattr", _direct, [])
 
+print("== (1x) capturing the connector scheduler off the CALL STACK ==")
+# A gc scan cannot find it: EngineCore.__init__ calls freeze_gc_heap() ->
+# gc.freeze(), and gc.get_objects() does not return frozen objects. The
+# connector scheduler is built at boot, so it is permanently invisible to a
+# scan -- measured live, "no live instance after 17,003 objects", which is
+# implausibly few for an engine core and is the tell.
+#
+# It is, however, the thing that CALLS us, so its `self` is in a caller frame.
+del diskspec._LIVE_OFFLOAD_SCHED[:]
+
+
+class OffloadingConnectorScheduler:  # name is what is matched, deliberately
+    def call_it(self, mgr, key, ctx):
+        return mgr.lookup(key, ctx)
+
+
+class SomethingElse:
+    def call_it(self, mgr, key, ctx):
+        return mgr.lookup(key, ctx)
+
+
+_m = diskspec.DiskPresenceManager(sp.file_mapper(), num_workers=WORLD)
+check("nothing captured before any call", not diskspec._LIVE_OFFLOAD_SCHED)
+_wrong = SomethingElse()
+_wrong.call_it(_m, k1, ctx)
+check("*** a caller of the WRONG type is not captured ***",
+      not diskspec._LIVE_OFFLOAD_SCHED)
+_right = OffloadingConnectorScheduler()
+_right.call_it(_m, k1, ctx)
+eq("*** the connector scheduler IS captured, from the call stack ***",
+   diskspec._LIVE_OFFLOAD_SCHED and diskspec._LIVE_OFFLOAD_SCHED[0] is _right,
+   True)
+# *** AND "len == 1" WAS A VACUOUS ONE-SHOT TEST. *** The capture clears the
+# list before appending, so removing the early return leaves the length at 1 and
+# the assertion passes while the stack walk runs on every single lookup.
+# Break-verification caught it. The behavioural difference is STABILITY: once a
+# handle is captured it must not be replaced, because a later caller is just as
+# valid a match and the handle would flap between request-scoped objects.
+_right2 = OffloadingConnectorScheduler()
+_right2.call_it(_m, k2, ctx)
+eq("*** the captured handle is STABLE -- a later caller does not replace it ***",
+   diskspec._LIVE_OFFLOAD_SCHED[0] is _right, True)
+eq("...and there is still exactly one", len(diskspec._LIVE_OFFLOAD_SCHED), 1)
+
+# A frame held after the walk pins a request's locals and builds a cycle on the
+# scheduler's hot path, so the function must not retain one.
+#
+# *** THE FIRST VERSION OF THIS ASSERTION WAS VACUOUS. *** It scanned gc for a
+# frame whose code name contained "capture_offload_sched" -- but the walk ends
+# holding the CALLER's frame, so the name to look for was "call_it", and the
+# filter could never match. Break-verification proved it: the mutation
+# (`_LEAKED_FRAMES.append(f)` instead of `del f`) applied cleanly and every
+# assertion stayed green.
+#
+# What is actually checkable is RETENTION BY OUR MODULE: a leaked frame has to
+# be reachable from diskspec's own globals to survive, so look there rather
+# than guessing at a code name.
+def _frames_held_by(mod):
+    found = []
+    for name, val in vars(mod).items():
+        if type(val).__name__ == "frame":
+            found.append(name)
+        elif isinstance(val, (list, tuple, set)):
+            for item in val:
+                if type(item).__name__ == "frame":
+                    found.append(name)
+        elif isinstance(val, dict):
+            for item in val.values():
+                if type(item).__name__ == "frame":
+                    found.append(name)
+    return sorted(set(found))
+
+eq("*** the capture retains no frame in the module's globals ***",
+   _frames_held_by(diskspec), [])
+del diskspec._LIVE_OFFLOAD_SCHED[:]
+
 print("== (1y) the scheduler-side job set: ABSENT IS NOT ZERO ==")
 # The worker reports jobs_open: 0 while the scheduler can hold a hundred jobs,
 # and the scheduler's _jobs is what `jobs_to_flush` names -- so this field is
