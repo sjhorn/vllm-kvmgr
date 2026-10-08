@@ -381,6 +381,158 @@ def write_geometry(kv_caches: Any, spec: Any, out_dir: str) -> str | None:
 # turned out to be unreachable from the box.
 _LIVE_HANDLERS: list = []
 
+# -- the stall watchdog ---------------------------------------------------
+#
+# *** WHY THIS EXISTS, AND IT IS A SPECIFIC TEN MINUTES WE WASTED. ***
+# On 2026-10-08 the worker went deaf with 21 store jobs outstanding. The engine
+# core logged `No available shared memory broadcast block found in 60 seconds`
+# TEN TIMES -- a full ten minutes during which the worker was alive and had a
+# perfectly walkable Python stack -- and then `VllmWorker-0 died unexpectedly`
+# with no traceback at all. The evidence we needed existed for ten minutes and
+# nobody was there to send SIGUSR1.
+#
+# So the dump has to be automatic. `faulthandler.enable()` (register.py) covers
+# a DEATH; this covers the far more useful case of a worker that is WEDGED BUT
+# ALIVE, which is every store-path failure this project has had.
+#
+# Three deliberate choices:
+#   - the verdict is a PURE FUNCTION, so the interesting logic is testable with
+#     no threads, no torch and no GPU -- the same split as file_plan and
+#     check_pairing;
+#   - it only ever LOGS and DUMPS. A watchdog that cancels jobs or restarts
+#     anything is a second failure mode on the critical path, and this repo's
+#     rule is that an instrument which can break what it measures is worse than
+#     no instrument;
+#   - it fires on LACK OF PROGRESS, not on elapsed time. A legitimately slow
+#     flush of a 700K prefix advances its counters; a wedge does not. Timing
+#     alone would cry wolf on exactly the workload this is for.
+_WATCHDOG_HEARTBEAT_S = 30.0
+_WATCHDOG_STALL_S = 120.0
+_watchdog_started = False
+
+
+def watchdog_verdict(outstanding, fingerprint, prev_fingerprint,
+                     stalled_since, now, stall_s=_WATCHDOG_STALL_S):
+    """Decide whether the store path is stalled. Pure.
+
+    Returns `(verdict, stalled_since)` with verdict one of:
+      "idle"      nothing outstanding -- nothing to say
+      "progress"  outstanding, and a counter moved since last look
+      "waiting"   outstanding, nothing moved, but not long enough yet
+      "stalled"   outstanding and NOTHING has moved for `stall_s`
+
+    `fingerprint` is any comparable snapshot of progress counters. Comparing a
+    fingerprint rather than timing a job is what keeps a slow-but-working flush
+    out of the "stalled" bucket.
+    """
+    if not outstanding:
+        return "idle", None
+    if fingerprint != prev_fingerprint:
+        return "progress", None
+    since = now if stalled_since is None else stalled_since
+    if now - since >= stall_s:
+        return "stalled", since
+    return "waiting", since
+
+
+def _handler_progress():
+    """(outstanding jobs, oldest age in seconds, progress fingerprint).
+
+    Best-effort: a handler mid-construction or mid-reload must not make the
+    watchdog raise, so anything unreadable is simply skipped.
+    """
+    outstanding = 0
+    oldest = 0.0
+    fp = []
+    now = _now()
+    for h in list(_LIVE_HANDLERS):
+        try:
+            jobs = getattr(h, "_jobs", None) or {}
+            outstanding += len(jobs)
+            for st in list(jobs.values()):
+                t0 = st.get("t0")
+                if t0 is not None:
+                    oldest = max(oldest, now - t0)
+            st = getattr(h, "stats", {}) or {}
+            fp.append((type(h).__name__, st.get("files"), st.get("bytes"),
+                       st.get("submitted"), st.get("errors"),
+                       st.get("wait_rounds")))
+        except Exception:
+            continue
+    return outstanding, oldest, tuple(fp)
+
+
+def _watchdog_loop():
+    import faulthandler
+    import sys as _sys
+    import time
+
+    prev_fp = None
+    stalled_since = None
+    dumped_for = None
+    last_beat = 0.0
+    while True:
+        try:
+            time.sleep(5.0)
+            outstanding, oldest, fp = _handler_progress()
+            now = _now()
+            verdict, stalled_since = watchdog_verdict(
+                outstanding, fp, prev_fp, stalled_since, now)
+            prev_fp = fp
+            if verdict == "idle":
+                dumped_for = None
+                continue
+            if verdict == "stalled" and dumped_for != stalled_since:
+                dumped_for = stalled_since
+                # ERROR first, so the reason is ABOVE the stack in the log and
+                # whoever reads it knows what the dump is for.
+                logger.error(
+                    "kvmgr: STORE PATH STALLED -- %d job(s) outstanding, "
+                    "oldest %.0fs, and NOT ONE progress counter has moved for "
+                    "%.0fs. The engine is probably fenced behind these jobs "
+                    "(jobs_to_flush), which presents as the worker going deaf "
+                    "rather than as a slow store. Dumping every thread's "
+                    "Python stack below -- this is the evidence that was "
+                    "missing when a worker died on 2026-10-08. Nothing has "
+                    "been cancelled or restarted.",
+                    outstanding, oldest, now - stalled_since)
+                try:
+                    faulthandler.dump_traceback(file=_sys.stderr,
+                                                all_threads=True)
+                except Exception:
+                    logger.exception("kvmgr: stack dump failed")
+            elif now - last_beat >= _WATCHDOG_HEARTBEAT_S:
+                last_beat = now
+                logger.info(
+                    "kvmgr: store path busy -- %d job(s) outstanding, oldest "
+                    "%.0fs, verdict=%s", outstanding, oldest, verdict)
+        except Exception:
+            # Never let the watchdog be the thing that dies.
+            try:
+                logger.exception("kvmgr: watchdog iteration failed")
+            except Exception:
+                pass
+
+
+def _start_watchdog() -> None:
+    global _watchdog_started
+    if _watchdog_started:
+        return
+    _watchdog_started = True
+    try:
+        import threading
+        t = threading.Thread(target=_watchdog_loop, name="kvmgr-watchdog",
+                             daemon=True)
+        t.start()
+        logger.info(
+            "kvmgr: stall watchdog armed -- if store jobs are outstanding and "
+            "no progress counter moves for %.0fs it logs the reason and dumps "
+            "every thread's Python stack, automatically. A wedged-but-alive "
+            "worker is the failure mode this path actually has, and it needs "
+            "nobody present to send a signal.", _WATCHDOG_STALL_S)
+    except Exception:
+        logger.exception("kvmgr: could not arm the stall watchdog (continuing)")
+
 
 def _now() -> float:
     import time
@@ -592,6 +744,7 @@ class DiskStoreHandler:
             sum(self._sizes), spec.whole_page_bytes,
         )
         _LIVE_HANDLERS.append(self)
+        _start_watchdog()
 
     def transfer_async(self, job_id: int, spec) -> bool:
         """Accept a job of ANY size, and submit it over as many rounds as needed.
@@ -909,6 +1062,7 @@ class DiskLoadHandler:
                       "saturations": 0}
         logger.info("kvmgr: disk LOAD handler installed (restore is live)")
         _LIVE_HANDLERS.append(self)
+        _start_watchdog()
 
     def _write_row(self, tensor_idx: int, slot: int, buf) -> None:
         # copy_into, never a bare `[:] = buf`: the staging tensor's view is

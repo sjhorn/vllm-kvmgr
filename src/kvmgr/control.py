@@ -191,6 +191,12 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     ("kvmgr.stats", "_groups", "all per-group counters -- the observability"),
     ("kvmgr.offload", "_real_odirect", "the saved platform O_DIRECT value"),
     ("kvmgr.serve", "_server", "the stats HTTP server handle"),
+    # A reload re-executes the module, so this would go back to False and
+    # _start_watchdog() would start a SECOND thread on the next handler --
+    # every reload leaking one more, each dumping the same stacks. Fifth
+    # instance of the reload-destroys-module-state family, and the first one
+    # caught by remembering the table exists rather than by a live failure.
+    ("kvmgr.diskio", "_watchdog_started", "the stall watchdog's one-shot flag"),
 )
 
 
@@ -373,6 +379,35 @@ def reload_modules() -> dict:
     report["overrides_restored"] = sorted(saved_state.get(
         ("kvmgr.flags", "_OVERRIDE"), {}))
     report["found"] = {k: len(v) for k, v in targets.items()}
+
+    # *** RE-ARM THE CRASH WITNESS, because otherwise a hot deploy cannot
+    # *** install one. `_install_hang_dump` runs from `register()` at plugin
+    # load, so faulthandler.enable() -- the thing whose absence lost us the
+    # 2026-10-08 traceback -- would otherwise only arrive on the next engine
+    # start, i.e. after the very crash it exists to witness. A reload fans out
+    # to both ranks and the API server, which is exactly the reach needed.
+    #
+    # Safe to repeat: faulthandler.enable() and .register() are both idempotent,
+    # and _install_hang_dump is best-effort by construction. Reported so a
+    # reload that could NOT arm it says so rather than implying it did.
+    try:
+        from kvmgr import register as _reg
+        _reg._install_hang_dump()
+        report["hang_dump_rearmed"] = True
+    except Exception as exc:
+        # A WARNING, NOT AN ERROR, and the distinction is the point: the
+        # reload itself succeeded, and failing to arm a diagnostic must never
+        # be reported as a failed code deploy. Putting it in `errors` made
+        # `ok` False for a reload that had worked perfectly -- an instrument
+        # breaking the thing it measures, which is the rule this file already
+        # carries twice. `ok` means "the reload worked"; the warning says the
+        # witness is not armed, which is a separate fact and still visible.
+        report["hang_dump_rearmed"] = False
+        report.setdefault("warnings", []).append(
+            "could not re-arm the crash witness (faulthandler): %r -- the "
+            "reload itself was fine; a fatal signal will not leave a stack "
+            "until the next engine start" % (exc,))
+
     report["ok"] = not report["errors"]
     logger.info("kvmgr: reload -- %d module(s), %d instance(s), %d error(s)",
                 len(report["reloaded"]), len(report["rebound"]),

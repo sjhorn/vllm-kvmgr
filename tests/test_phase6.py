@@ -773,10 +773,32 @@ for _f in sorted(os.listdir(_kvdir)):
             _names, _val = [_node.target.id], _node.value
         else:
             continue
-        _is_state = isinstance(_val, (_ast6.Dict, _ast6.List, _ast6.Set)) or (
+        # *** A ONE-SHOT BOOL IS STATE, AND THIS AUDIT COULD NOT SEE ONE. ***
+        # The first version recognised only container literals and None, so
+        # `_watchdog_started = False` was invisible to it -- and a reload
+        # resetting that flag leaks one more watchdog thread per reload, each
+        # dumping the same stacks. Found by break-verification: deleting the
+        # _PRESERVE entry left this assertion GREEN and only a hardcoded count
+        # elsewhere complained, which is "a lint that cannot fail reads as
+        # coverage" with the lint being mine.
+        #
+        # So a `False` / `0` initialiser counts too -- that is the shape of
+        # every one-shot flag and every accumulator. ALL-CAPS names are exempt
+        # from the NEW shapes only, because by convention they are tunables
+        # (_WATCHDOG_STALL_S = 120.0) and re-executing one restores the same
+        # value. The None rule stays unconditional, so this cannot weaken what
+        # the audit already caught.
+        _container_or_none = isinstance(
+            _val, (_ast6.Dict, _ast6.List, _ast6.Set)) or (
             isinstance(_val, _ast6.Constant) and _val.value is None)
+        _oneshot = (isinstance(_val, _ast6.Constant)
+                    and _val.value in (False, 0))
         for _n in _names:
-            if not _n.startswith("_") or not _is_state:
+            if not _n.startswith("_"):
+                continue
+            _is_state = _container_or_none or (
+                _oneshot and not _n.lstrip("_").isupper())
+            if not _is_state:
                 continue
             _key = f"{_mod}.{_n}"
             if _key in _EXEMPT or _key in _preserved:
@@ -785,8 +807,17 @@ for _f in sorted(os.listdir(_kvdir)):
 
 eq("*** every stateful module global is in _PRESERVE or explicitly exempt ***",
    sorted(set(_missing)), [])
-eq("...and _PRESERVE names six, each with a reason",
-   len(control._PRESERVE), 6)
+# A pinned COUNT is the brittle assertion here and it is kept deliberately
+# small in ambition: it only guards against an entry being DELETED, which is
+# how three real ones came to be unprotected. The assertion that carries the
+# weight is the package audit immediately above -- it scans the tree, so it
+# grows with the code, whereas a magic number has to be edited every time the
+# table legitimately changes (as it just was, for _watchdog_started). Asserting
+# a floor rather than equality keeps the guard without the chore.
+check("...and _PRESERVE names at least the seven we know about",
+      len(control._PRESERVE) >= 7)
+check("...and names no duplicates (a dup would silently restore twice)",
+      len({(m, a) for m, a, _ in control._PRESERVE}) == len(control._PRESERVE))
 check("...every entry carrying one",
       all(isinstance(w, str) and w for _, _, w in control._PRESERVE))
 for name in ("_LIVE_HANDLERS", "_OVERRIDE", "_LIVE_MANAGER", "_groups"):

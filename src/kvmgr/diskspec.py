@@ -175,6 +175,10 @@ class DiskPresenceManager(OffloadingManager):
         self._stats = {"lookup": 0, "hit": 0, "stored": 0, "skipped_present": 0,
                        "manifest_loaded": 0, "manifest_pruned": 0,
                        "manifest_writes": 0, "paused": 0}
+        # offered / to_store / completed, keyed by group index. A plain dict of
+        # dicts rather than a list, because the group count is not known here
+        # and a missing group must read as ABSENT rather than as 0.
+        self._gcounts: dict[str, dict[int, int]] = {}
         self._manifest = manifest_path
         self._unflushed = 0
         self._last_flush = _now()
@@ -331,6 +335,24 @@ class DiskPresenceManager(OffloadingManager):
         # second line of defence rather than the only one.
         todo = [k for k in keys if bytes(k) not in self._present]
         self._stats["skipped_present"] += len(keys) - len(todo)
+        # *** THE RATIONING INSTRUMENT. *** The restorable prefix grows by a
+        # fixed +13,312 tokens / +1,196 keys per pass, LINEARLY, so one 180K
+        # prompt needs ~14 passes before it fully restores. Three
+        # indistinguishable causes: upstream only OFFERS a fraction per pass,
+        # or we offer them all and the store jobs never COMPLETE (so
+        # complete_store never marks them present and the next pass re-offers
+        # them -- which is also the shape of the 21 never-completing jobs that
+        # killed a worker), or the already-present filter is misfiring.
+        #
+        # One pass tells them apart only if all three quantities are counted
+        # SEPARATELY and PER GROUP, because the five groups have wildly
+        # different block sizes and the SWA groups are deliberately filtered
+        # upstream. `skipped_present` reading 0 on every sample so far -- with
+        # 102,386 keys held and the same prompt sent seven times -- is either
+        # upstream never re-offering a stored key, or this filter not working,
+        # and those want opposite fixes.
+        self._count_groups("offered", keys)
+        self._count_groups("to_store", todo)
         if not todo:
             return _nothing_to_store()
         return PrepareStoreOutput(
@@ -348,6 +370,10 @@ class DiskPresenceManager(OffloadingManager):
         for k in new:
             self._present.add(bytes(k))
         self._stats["stored"] += len(new)
+        # The all-ranks edge. Counted per group so `offered - completed` is
+        # readable: a gap here is a job that never finished, not a key nobody
+        # wanted.
+        self._count_groups("completed", keys)
         if new:
             self._events.append(
                 OffloadingEvent(keys=list(new), medium=DISK_MEDIUM, removed=False)
@@ -382,10 +408,44 @@ class DiskPresenceManager(OffloadingManager):
         self._present.clear()
         self.flush_manifest(force=True)
 
+    def _count_groups(self, what: str, keys: "Collection[OffloadKey]") -> None:
+        """Tally `keys` by group index under `what`. Best-effort by design.
+
+        An instrument that can break the path it measures is worse than no
+        instrument -- this repo has paid for that twice in two days (a debug
+        monkeypatch that lied for several rounds, and a geometry snapshot that
+        nearly broke a boot by writing to a read-only mount). So this never
+        raises into prepare_store: a key whose group cannot be read is counted
+        under -1 and named as such, which is a visible absence rather than a
+        silent miscount.
+        """
+        try:
+            from vllm.v1.kv_offload.base import get_offload_group_idx
+        except Exception:
+            return
+        bucket = self._gcounts.setdefault(what, {})
+        for k in keys:
+            try:
+                g = get_offload_group_idx(k)
+            except Exception:
+                g = -1
+            bucket[g] = bucket.get(g, 0) + 1
+
     # -- ours, for the /kv endpoint ---------------------------------------
     def snapshot(self) -> dict[str, Any]:
+        # by_group is the rationing diagnostic. Read it as three numbers per
+        # group: OFFERED is what upstream asked us to store, TO_STORE is what
+        # survived the already-present filter, COMPLETED is what every rank
+        # confirmed. offered >> completed means jobs are not finishing;
+        # offered small means upstream is rationing; to_store == offered
+        # forever means the present filter never matches.
+        by_group = {
+            what: {str(g): n for g, n in sorted(d.items())}
+            for what, d in sorted(self._gcounts.items())
+        }
         return dict(self._stats, present=len(self._present),
                     num_workers=self._num_workers,
+                    by_group=by_group,
                     restore_enabled=bool(flags.peek("disk_restore")),
                     store_paused=bool(flags.peek("disk_store_paused")))
 

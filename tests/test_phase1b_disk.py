@@ -1250,6 +1250,96 @@ check("...and carries pid and thread, so two PROCESSES cannot collide either",
       all(str(os.getpid()) in n for n in _seen), sorted(_seen)[:1])
 
 print()
+# -- (b16) the stall watchdog's verdict ------------------------------------
+#
+# This is the instrument that was MISSING when a worker died on 2026-10-08: the
+# engine complained for ten minutes about a worker that was alive and had a
+# walkable stack, and nobody was there to send SIGUSR1. The verdict is a pure
+# function so the part that decides "stalled" is testable with no threads, no
+# torch and no GPU -- the same split as file_plan and check_pairing.
+#
+# The property that matters most is the one in the middle: a LEGITIMATELY SLOW
+# flush must never be called stalled. That is why the verdict keys on a
+# progress fingerprint and not on elapsed time; a 700K flush takes rounds of a
+# 32-block pool and would trip any pure timer.
+wv = diskio.watchdog_verdict
+
+eq("nothing outstanding is idle, whatever the clock says",
+   wv(0, ("a",), ("a",), 1000.0, 9999.0)[0], "idle")
+eq("...and idle CLEARS any stall in progress",
+   wv(0, ("a",), ("a",), 1000.0, 9999.0)[1], None)
+eq("a moving counter is progress, however long the job has run",
+   wv(5, ("b",), ("a",), None, 500.0)[0], "progress")
+eq("...and progress clears the stall clock too",
+   wv(5, ("b",), ("a",), 100.0, 500.0)[1], None)
+eq("outstanding and unmoved STARTS the clock rather than crying stall",
+   wv(5, ("a",), ("a",), None, 500.0)[0], "waiting")
+eq("...stamping the clock at now",
+   wv(5, ("a",), ("a",), None, 500.0)[1], 500.0)
+eq("still waiting one second short of the deadline",
+   wv(5, ("a",), ("a",), 500.0, 500.0 + diskio._WATCHDOG_STALL_S - 1.0)[0],
+   "waiting")
+eq("STALLED exactly at the deadline",
+   wv(5, ("a",), ("a",), 500.0, 500.0 + diskio._WATCHDOG_STALL_S)[0], "stalled")
+eq("...and it reports the stall's START, not now, so the log can say how long",
+   wv(5, ("a",), ("a",), 500.0, 9999.0)[1], 500.0)
+
+# *** THE FALSE-POSITIVE GUARD, STATED AS A SCENARIO. *** A slow flush that
+# advances by one file every look must stay out of "stalled" forever, even past
+# many multiples of the deadline. If this ever fails, the watchdog will dump
+# stacks in the middle of the exact workload the disk tier exists for.
+_since, _t, _verdicts = None, 0.0, set()
+for _i in range(50):
+    _t += 5.0
+    _v, _since = wv(9, ("files", _i), ("files", _i - 1), _since, _t)
+    _verdicts.add(_v)
+eq("a slow-but-advancing flush is NEVER stalled, even over 250s",
+   sorted(_verdicts), ["progress"])
+
+# And the mirror: genuinely frozen counters must reach stalled and stay there.
+_since, _t, _hit = None, 0.0, False
+for _i in range(50):
+    _t += 5.0
+    _v, _since = wv(9, ("frozen",), ("frozen",), _since, _t)
+    _hit = _hit or _v == "stalled"
+check("...while frozen counters DO reach stalled", _hit)
+
+# *** AND THAT ASSERTION WAS VACUOUS WHEN FIRST WRITTEN. *** It read
+# `is False or is True`, which is true of every bool that will ever exist. The
+# property worth asserting is IDEMPOTENCE: _start_watchdog must create exactly
+# one thread however many handlers are constructed, because a second watchdog
+# means two stack dumps for one stall and a thread leaked per reload. Tested by
+# counting Thread() constructions rather than by starting real threads, so the
+# harness stays free of a daemon that outlives it.
+import threading as _th  # noqa: E402
+
+_made = []
+_real_thread = _th.Thread
+
+
+class _CountingThread:
+    def __init__(self, *a, **kw):
+        _made.append(kw.get("name"))
+
+    def start(self):
+        pass
+
+
+_saved_flag = diskio._watchdog_started
+try:
+    _th.Thread = _CountingThread
+    diskio._watchdog_started = False
+    diskio._start_watchdog()
+    diskio._start_watchdog()
+    diskio._start_watchdog()
+finally:
+    _th.Thread = _real_thread
+    diskio._watchdog_started = _saved_flag
+
+eq("three _start_watchdog calls arm exactly ONE watchdog", len(_made), 1)
+eq("...and it is named, so it is identifiable in a stack dump",
+   _made, ["kvmgr-watchdog"])
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
     for f in FAIL:

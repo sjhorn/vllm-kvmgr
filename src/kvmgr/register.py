@@ -207,17 +207,41 @@ def _install_hang_dump() -> None:
 
         if not hasattr(signal, "SIGUSR1"):
             return
+        # *** THE PASSIVE NET, AND ITS ABSENCE COST US THE 2026-10-08
+        # *** TRACEBACK. `register(SIGUSR1)` only answers a signal somebody
+        # SENDS, so it is useless for a process that dies on its own -- and on
+        # 2026-10-08 `Worker proc VllmWorker-0 died unexpectedly` with NO Python
+        # traceback anywhere, which is the signature of a fatal signal. There
+        # was no kernel log either (dmesg needs root here), so the cause is
+        # still unknown and cannot now be recovered.
+        #
+        # `faulthandler.enable()` installs handlers for SIGSEGV, SIGBUS,
+        # SIGFPE, SIGABRT and SIGILL, dumps every thread's Python stack to
+        # stderr -- i.e. into `docker logs` -- and then RE-RAISES, so the
+        # process still dies exactly as it would have. It is a witness, not a
+        # mitigation: it changes nothing about behaviour and cannot keep a
+        # broken process alive.
+        #
+        # Unlike register(), chaining is not a hazard here: enable() always
+        # re-raises on the default handler for a genuinely fatal signal, which
+        # is the correct outcome. The register() trap below is specifically
+        # about SIGUSR1, whose default action is terminate.
+        faulthandler.enable(file=_sys.stderr, all_threads=True)
+
         existing = signal.getsignal(signal.SIGUSR1)
         chain = callable(existing) and existing not in (
             signal.SIG_DFL, signal.SIG_IGN)
         faulthandler.register(signal.SIGUSR1, file=_sys.stderr,
                               all_threads=True, chain=chain)
         logger.info(
-            "kvmgr: hang dump armed -- `kill -USR1 <pid>` prints every "
-            "thread's Python stack to the container log. No ptrace needed, "
-            "which is the point: gdb cannot attach in this container and the "
-            "store path has wedged the worker twice with no stack available. "
-            "chain=%s (a real handler was already installed: %s).",
+            "kvmgr: hang dump armed -- faulthandler.enable() is the PASSIVE "
+            "net (a fatal signal now dumps every thread's Python stack to the "
+            "container log and then re-raises, so a death is no longer "
+            "silent), and `kill -USR1 <pid>` is the ACTIVE one for a process "
+            "that is wedged but alive. No ptrace needed, which is the point: "
+            "gdb cannot attach in this container and the store path has wedged "
+            "the worker twice with no stack available. chain=%s (a real "
+            "handler was already installed: %s).",
             chain, chain,
         )
     except Exception:
