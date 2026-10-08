@@ -131,6 +131,58 @@ def check_pairing(keys: "Sequence[bytes]", block_ids: "Sequence[int]",
     return None
 
 
+def check_bounds(block_ids: "Sequence[int]", slots: "Sequence[int]",
+                 gpu_rows: int, staging_rows: int, group_sizes: "Sequence[int]",
+                 direction: str) -> str | None:
+    """Refuse a transfer whose indices are out of range. PURE. Returns a reason
+    or None.
+
+    *** WHY THIS EXISTS: AN Xid 13, AND IT IS THE ONE THING OUR CODE COULD DO
+    *** TO CAUSE ONE. *** 2026-10-08, one second before the engine took
+    `CUDA error: unspecified launch failure`:
+
+        NVRM: Xid (PCI:000f:01:00): 13, Graphics Exception: ... Data deaddead
+
+    Xid 13 is a graphics exception -- in practice an illegal memory access from
+    a kernel, i.e. a SOFTWARE fault. And this box logged **zero** Xid lines
+    across the previous two boots (three weeks of uptime) and **six** on the
+    boot where the disk offload path went live, which is the only new thing
+    doing bulk GPU<->pinned-host DMA.
+
+    `check_pairing` already guards which KEY goes with which block, but it
+    explicitly does NOT bound the indices themselves -- and a block id past the
+    GPU tensor's row count, or a staging slot past the pinned buffer's, is
+    exactly how a copy kernel reads or writes off the end. The kernel does not
+    validate; it faults, asynchronously, and the traceback lands somewhere
+    unrelated. So bound them HERE, where the numbers are still Python and a
+    refusal can name them.
+
+    This is a guard, not a diagnosis: if it never fires, our indices were never
+    the cause and the Xid is somewhere else -- which is itself worth knowing and
+    is why the counter is reported rather than only logged.
+    """
+    if len(block_ids) != len(slots):
+        return ("%s: %d block ids against %d staging slots -- the pairing is "
+                "positional, so a length mismatch would silently transfer the "
+                "wrong rows" % (direction, len(block_ids), len(slots)))
+    tot = sum(group_sizes)
+    if tot != len(block_ids):
+        return ("%s: group_sizes sum to %d but there are %d block ids; the "
+                "inner handler splits one flat array by these counts"
+                % (direction, tot, len(block_ids)))
+    for b in block_ids:
+        if not (0 <= b < gpu_rows):
+            return ("%s: GPU block id %d is outside [0, %d) -- a copy kernel "
+                    "would read or write off the end of the KV tensor, which "
+                    "is an illegal access and surfaces as Xid 13"
+                    % (direction, b, gpu_rows))
+    for sl in slots:
+        if not (0 <= sl < staging_rows):
+            return ("%s: staging slot %d is outside [0, %d) -- past the end of "
+                    "the pinned buffer" % (direction, sl, staging_rows))
+    return None
+
+
 def staging_plan(pool_capacity: int, slots_knob: int, write_floor_knob: int,
                  read_floor_knob: int) -> tuple[int, int, int]:
     """Resolve the three staging knobs. PURE, so the arithmetic is testable.
@@ -593,6 +645,8 @@ def conn_worker_snapshot() -> dict:
 #   - it fires on LACK OF PROGRESS, not on elapsed time. A legitimately slow
 #     flush of a 700K prefix advances its counters; a wedge does not. Timing
 #     alone would cry wolf on exactly the workload this is for.
+_LEDGER_RING = 24
+_LEDGER_EVERY = 2000
 _WATCHDOG_HEARTBEAT_S = 30.0
 _WATCHDOG_STALL_S = 120.0
 _watchdog_started = False
@@ -916,6 +970,18 @@ class DiskStoreHandler:
             "path is a corruption risk, not a tuning knob.",
             staging_blocks, len(kv_caches.tensors),
             staging_blocks * _per_block / 1e6, _per_block)
+        # The bounds a copy kernel would fault past. Captured once: these are
+        # the numbers check_bounds compares against, and logging them means an
+        # Xid investigation starts from facts instead of a shape dump.
+        _gpu_rows = min((int(t.shape[0]) for t in gpu_tensors), default=0)
+        _staging_rows = min((int(t.shape[0]) for t in self._staging), default=0)
+        logger.info(
+            "kvmgr: transfer bounds -- GPU rows %d, staging rows %d. Every "
+            "block id and slot is checked against these BEFORE submit, because "
+            "an index past them is an illegal access in a copy kernel and "
+            "surfaces as Xid 13 (seen once on 2026-10-08), not as an error "
+            "anywhere near the cause.",
+            _gpu_rows, _staging_rows)
         self._pool = SlotPool(staging_blocks)
         self._writers = ThreadPoolExecutor(max_workers=write_threads,
                                            thread_name_prefix="kvmgr_disk")
@@ -945,7 +1011,7 @@ class DiskStoreHandler:
         # only thing that drains this list, because it is the only path that
         # reaches upstream. `wait()` reads it without draining.
         self._ready: list = []
-        self.stats = {"submitted": 0, "refused_pairing": 0,
+        self.stats = {"submitted": 0, "refused_pairing": 0, "refused_bounds": 0,
                       "files": 0, "bytes": 0, "errors": 0,
                       # *** THE FENCE, MEASURED. *** `handle_preemptions`
                       # calls `worker.wait(jobs_to_flush)` SYNCHRONOUSLY on the
@@ -970,6 +1036,84 @@ class DiskStoreHandler:
         )
         _LIVE_HANDLERS.append(self)
         _start_watchdog()
+
+    def _bounds(self) -> tuple[int, int]:
+        """(gpu_rows, staging_rows), derived lazily. REBIND-SAFE.
+
+        *** A RELOAD NEVER RUNS __init__ -- third time in this file. ***
+        `_gcounts` crashed the engine that way and `_ready` would have, so
+        these are DERIVED from `_staging` and the gpu tensors, which every
+        already-constructed handler has, rather than read from attributes only
+        a new __init__ would set. Cached on the instance after the first call.
+        """
+        got = getattr(self, "_bounds_cache", None)
+        if got is not None:
+            return got
+        def _rows(seq):
+            try:
+                return min(int(t.shape[0]) for t in seq)
+            except Exception:
+                return 0
+        gt = (getattr(self, "_gpu_tensors", None)
+              or getattr(getattr(self, "_inner", None), "gpu_tensors", None)
+              or [])
+        got = (_rows(gt), _rows(getattr(self, "_staging", None) or []))
+        self._bounds_cache = got
+        return got
+
+    def _ledger_snapshot(self) -> dict:
+        led = getattr(self, "_ledger", None)
+        if led is None:
+            return {"transfers": 0, "why": "nothing transferred yet -- an "
+                                           "ABSENCE, not an index range of 0"}
+        return {"transfers": led["n"],
+                "block_id_range": [led["bid_min"], led["bid_max"]],
+                "slot_range": [led["slot_min"], led["slot_max"]],
+                "recent": led["recent"][-8:]}
+
+    def _ledger_note(self, kind: str, group: int, bids, slots) -> None:
+        """Record the SHAPE of a transfer, cheaply. Never raises.
+
+        *** WHAT WAS MISSING WHEN THE ENGINE TOOK AN Xid. *** A GPU fault is
+        reported asynchronously, so the traceback lands at an unrelated API
+        call and `faulthandler` gives a Python stack that says nothing about
+        which transfer was in flight. What an investigation actually needs is
+        the RANGE of indices recently handed to the copy kernel -- and that is
+        four integers per transfer, not the data.
+
+        Deliberately a running min/max plus a small ring rather than a line per
+        transfer: a 180K prefill submits thousands of rounds, so per-transfer
+        logging would be its own outage. The ring is reported through
+        /kv/workers and summarised every `_LEDGER_EVERY` transfers, so a fault
+        can be read against the last thing we asked the GPU to do.
+        """
+        try:
+            led = getattr(self, "_ledger", None)
+            if led is None:
+                led = {"n": 0, "bid_min": None, "bid_max": None,
+                       "slot_min": None, "slot_max": None, "recent": []}
+                self._ledger = led
+            lo, hi = (min(bids), max(bids)) if bids else (None, None)
+            slo, shi = (min(slots), max(slots)) if slots else (None, None)
+            led["n"] += 1
+            for k, v, f in (("bid_min", lo, min), ("bid_max", hi, max),
+                            ("slot_min", slo, min), ("slot_max", shi, max)):
+                if v is not None:
+                    led[k] = v if led[k] is None else f(led[k], v)
+            led["recent"].append((kind, group, len(bids), lo, hi, slo, shi))
+            if len(led["recent"]) > _LEDGER_RING:
+                del led["recent"][:-_LEDGER_RING]
+            if led["n"] % _LEDGER_EVERY == 0:
+                logger.info(
+                    "kvmgr: transfer ledger -- %d transfers, block ids seen in "
+                    "[%s, %s] of %d rows, slots in [%s, %s] of %d. Any index "
+                    "at or past a row count is the illegal access that shows "
+                    "up as an Xid.",
+                    led["n"], led["bid_min"], led["bid_max"],
+                    self._bounds()[0], led["slot_min"], led["slot_max"],
+                    self._bounds()[1])
+        except Exception:
+            return
 
     def transfer_async(self, job_id: int, spec) -> bool:
         """Accept a job of ANY size, and submit it over as many rounds as needed.
@@ -1051,6 +1195,25 @@ class DiskStoreHandler:
                 gs[g] = n
                 inner = self._next_inner
                 self._next_inner += 1
+                _gr, _sr = self._bounds()
+                why = check_bounds(bids[:n], slots, _gr, _sr, gs,
+                                   "GPU->staging")
+                if why is not None:
+                    # .get, not += : a REBOUND handler's stats dict was built
+                    # by the OLD __init__ and has no such key -- the same
+                    # reload trap as _gcounts and _ready, now in a dict.
+                    self.stats["refused_bounds"] = self.stats.get(
+                        "refused_bounds", 0) + 1
+                    logger.error(
+                        "kvmgr: REFUSING a store round -- %s. job=%s group=%s "
+                        "n=%d. Refused rather than submitted: handing these to "
+                        "a copy kernel is an illegal access, which kills the "
+                        "worker with an Xid and a traceback nowhere near here.",
+                        why, job_id, g, n)
+                    self._pool.give(slots)
+                    st["failed"] = True
+                    return
+                self._ledger_note("store", g, bids[:n], slots)
                 try:
                     ok = self._inner.transfer_async(
                         inner,
@@ -1298,6 +1461,9 @@ class DiskStoreHandler:
         return dict(self.stats, staging=self._pool.snapshot(),
                     group_file_sizes=self._sizes,
                     jobs_open=len(self._jobs), writes_open=len(self._writing),
+                    gpu_rows=self._bounds()[0],
+                    staging_rows=self._bounds()[1],
+                    ledger=self._ledger_snapshot(),
                     conn_worker=conn_worker_snapshot())
 
 
@@ -1336,6 +1502,9 @@ class DiskLoadHandler:
         # slot at once -- the pool is what serialises them.
         self._staging = store._staging
         self._pool = store._pool
+        # Kept so _bounds() can find the row count without reaching through
+        # the inner handler, whose attribute name is upstream's to change.
+        self._gpu_tensors = getattr(store, "_gpu_tensors", None) or []
         self._inner = SingleDirectionOffloadingHandler(
             gpu_tensors=store._inner.gpu_tensors
             if hasattr(store._inner, "gpu_tensors") else store._gpu_tensors,
@@ -1355,6 +1524,7 @@ class DiskLoadHandler:
         # bug the offline fixture-parity assertion caught before it shipped.
         self._ready: list = []
         self.stats = {"submitted": 0, "refused_pairing": 0, "files": 0,
+                      "refused_bounds": 0,
                       "bytes": 0, "errors": 0,
                       "wait_calls": 0, "wait_ours": 0, "wait_blocked_ms": 0,
                       "wait_max_pending": 0, "wait_rounds": 0,
@@ -1378,6 +1548,84 @@ class DiskLoadHandler:
                                  self._write_row)
             self.stats["files"] += 1
         return total
+
+    def _bounds(self) -> tuple[int, int]:
+        """(gpu_rows, staging_rows), derived lazily. REBIND-SAFE.
+
+        *** A RELOAD NEVER RUNS __init__ -- third time in this file. ***
+        `_gcounts` crashed the engine that way and `_ready` would have, so
+        these are DERIVED from `_staging` and the gpu tensors, which every
+        already-constructed handler has, rather than read from attributes only
+        a new __init__ would set. Cached on the instance after the first call.
+        """
+        got = getattr(self, "_bounds_cache", None)
+        if got is not None:
+            return got
+        def _rows(seq):
+            try:
+                return min(int(t.shape[0]) for t in seq)
+            except Exception:
+                return 0
+        gt = (getattr(self, "_gpu_tensors", None)
+              or getattr(getattr(self, "_inner", None), "gpu_tensors", None)
+              or [])
+        got = (_rows(gt), _rows(getattr(self, "_staging", None) or []))
+        self._bounds_cache = got
+        return got
+
+    def _ledger_snapshot(self) -> dict:
+        led = getattr(self, "_ledger", None)
+        if led is None:
+            return {"transfers": 0, "why": "nothing transferred yet -- an "
+                                           "ABSENCE, not an index range of 0"}
+        return {"transfers": led["n"],
+                "block_id_range": [led["bid_min"], led["bid_max"]],
+                "slot_range": [led["slot_min"], led["slot_max"]],
+                "recent": led["recent"][-8:]}
+
+    def _ledger_note(self, kind: str, group: int, bids, slots) -> None:
+        """Record the SHAPE of a transfer, cheaply. Never raises.
+
+        *** WHAT WAS MISSING WHEN THE ENGINE TOOK AN Xid. *** A GPU fault is
+        reported asynchronously, so the traceback lands at an unrelated API
+        call and `faulthandler` gives a Python stack that says nothing about
+        which transfer was in flight. What an investigation actually needs is
+        the RANGE of indices recently handed to the copy kernel -- and that is
+        four integers per transfer, not the data.
+
+        Deliberately a running min/max plus a small ring rather than a line per
+        transfer: a 180K prefill submits thousands of rounds, so per-transfer
+        logging would be its own outage. The ring is reported through
+        /kv/workers and summarised every `_LEDGER_EVERY` transfers, so a fault
+        can be read against the last thing we asked the GPU to do.
+        """
+        try:
+            led = getattr(self, "_ledger", None)
+            if led is None:
+                led = {"n": 0, "bid_min": None, "bid_max": None,
+                       "slot_min": None, "slot_max": None, "recent": []}
+                self._ledger = led
+            lo, hi = (min(bids), max(bids)) if bids else (None, None)
+            slo, shi = (min(slots), max(slots)) if slots else (None, None)
+            led["n"] += 1
+            for k, v, f in (("bid_min", lo, min), ("bid_max", hi, max),
+                            ("slot_min", slo, min), ("slot_max", shi, max)):
+                if v is not None:
+                    led[k] = v if led[k] is None else f(led[k], v)
+            led["recent"].append((kind, group, len(bids), lo, hi, slo, shi))
+            if len(led["recent"]) > _LEDGER_RING:
+                del led["recent"][:-_LEDGER_RING]
+            if led["n"] % _LEDGER_EVERY == 0:
+                logger.info(
+                    "kvmgr: transfer ledger -- %d transfers, block ids seen in "
+                    "[%s, %s] of %d rows, slots in [%s, %s] of %d. Any index "
+                    "at or past a row count is the illegal access that shows "
+                    "up as an Xid.",
+                    led["n"], led["bid_min"], led["bid_max"],
+                    self._bounds()[0], led["slot_min"], led["slot_max"],
+                    self._bounds()[1])
+        except Exception:
+            return
 
     def transfer_async(self, job_id: int, spec) -> bool:
         from vllm.v1.kv_offload.base import get_offload_group_idx
@@ -1463,6 +1711,21 @@ class DiskLoadHandler:
             gs[g] = len(bids)
             inner = self._next_inner
             self._next_inner += 1
+            _gr, _sr = self._bounds()
+            why = check_bounds(bids, slots, _gr, _sr, gs, "staging->GPU")
+            if why is not None:
+                self.stats["refused_bounds"] = self.stats.get(
+                    "refused_bounds", 0) + 1
+                logger.error(
+                    "kvmgr: REFUSING a restore round -- %s. job=%s group=%s. "
+                    "A bad index here would write off the end of the KV tensor, "
+                    "which is worse than a missed restore.", why, job_id, g)
+                self._pool.give(slots)
+                if st is not None:
+                    st["failed"] = True
+                    st["pending"] -= 1
+                continue
+            self._ledger_note("load", g, bids, slots)
             ok = self._inner.transfer_async(
                 inner, (CPULoadStoreSpec(slots),
                         GPULoadStoreSpec(bids, group_sizes=gs,

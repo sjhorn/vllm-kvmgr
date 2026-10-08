@@ -336,11 +336,19 @@ def mkhandler(pool_size, nrefs=REFS):
     # updating for a field the real object gained. Mirrored from
     # DiskStoreHandler.__init__; the fence counters are the ones that measure
     # whether a synchronous flush is what costs the ~2x prefill slowdown.
-    h.stats = {"submitted": 0, "refused_pairing": 0, "files": 0, "bytes": 0,
+    h.stats = {"submitted": 0, "refused_pairing": 0, "refused_bounds": 0,
+               "files": 0, "bytes": 0,
                "errors": 0, "wait_calls": 0, "wait_ours": 0,
                "wait_blocked_ms": 0, "wait_max_pending": 0, "wait_rounds": 0,
                "saturations": 0}
     h._read_row = lambda t, s, n: b"\xab" * n
+    # *** THE FIXTURE MUST DECLARE ITS TRANSFER BOUNDS. *** `_bounds()` derives
+    # them from the real tensors, which this shell does not have -- so without
+    # this it reports (0, 0) and the bounds guard correctly refuses every
+    # transfer, which is a fixture that cannot express the behaviour under test.
+    # 22,756 is the real GPU row count from the live geometry snapshot, and
+    # staging rows equal the pool capacity by construction.
+    h._bounds_cache = (22756, pool_size)
     return h
 
 
@@ -1599,6 +1607,87 @@ except Exception:
 finally:
     flags.clear_override("staging_slots")
 check("*** a failing resize cannot raise into the scheduler step ***", _ok)
+
+# -- (b20) the bounds guard: turn an Xid into a named refusal ---------------
+#
+# 2026-10-08, one second before the engine took a CUDA launch failure:
+#   NVRM: Xid (PCI:000f:01:00): 13, Graphics Exception: ... Data deaddead
+# Xid 13 is in practice an illegal memory access FROM A KERNEL, and this box
+# logged zero Xid lines across the previous two boots (three weeks) and six on
+# the boot where the disk offload went live -- the only new thing doing bulk
+# GPU<->pinned-host DMA.
+#
+# check_pairing already guards WHICH key goes with which block but explicitly
+# does not bound the indices. A block id past the GPU tensor's row count is
+# exactly how a copy kernel reads off the end, and the kernel does not
+# validate: it faults asynchronously, with the traceback landing somewhere
+# unrelated. So bound them while they are still Python.
+cb = diskio.check_bounds
+eq("a well-formed round passes", cb([1, 2, 3], [0, 1, 2], 100, 8, [3], "x"), None)
+check("*** a block id AT the row count is refused -- off-by-one is the whole "
+      "class of bug ***",
+      cb([99, 100], [0, 1], 100, 8, [2], "x") is not None)
+check("a negative block id is refused", cb([-1], [0], 100, 8, [1], "x") is not None)
+check("a slot past the pinned buffer is refused",
+      cb([1], [8], 100, 8, [1], "x") is not None)
+check("a length mismatch is refused (the pairing is positional)",
+      cb([1, 2], [0], 100, 8, [2], "x") is not None)
+check("group_sizes that do not sum to the block count is refused",
+      cb([1, 2, 3], [0, 1, 2], 100, 8, [2], "x") is not None)
+for _args, _want in (
+    (([100], [0], 100, 8, [1], "GPU->staging"), "Xid 13"),
+    (([1], [9], 100, 8, [1], "staging->GPU"), "pinned buffer"),
+):
+    _why = cb(*_args)
+    check(f"...and the reason NAMES the hazard ({_want})", _want in (_why or ""))
+check("...and names the direction, because the two are different code paths",
+      "GPU->staging" in (cb([100], [0], 100, 8, [1], "GPU->staging") or ""))
+eq("an empty round is not an error", cb([], [], 100, 8, [0], "x"), None)
+
+# *** AND IT MUST REFUSE RATHER THAN SUBMIT. *** A guard that logs and then
+# hands the kernel the same indices is worse than none: it would read as
+# diagnosed while still faulting.
+hb = mkhandler(8)
+hb._bounds_cache = (50, 8)          # tiny GPU, so real ids are out of range
+ksb = gkeys(0, 4)
+gpub = base.GPULoadStoreSpec([1000, 1001, 1002, 1003],
+                             group_sizes=[4, 0, 0, 0, 0], block_indices=[0] * 5)
+_before = len(hb._inner.subs)
+hb.transfer_async(99, (gpub, diskspec.DiskLoadStoreSpec(ksb)))
+eq("*** nothing was submitted to the copy kernel ***",
+   len(hb._inner.subs), _before)
+eq("...the refusal is counted", hb.stats["refused_bounds"], 1)
+check("...and the job is marked failed rather than left pending for ever",
+      hb._jobs[99]["failed"] is True)
+eq("...and every staging slot was returned, so the pool does not leak",
+   hb._pool.snapshot()["available"], 8)
+
+# the ledger: shape only, never data, and absent is not a range of zero
+hl = mkhandler(8)
+eq("*** an untouched ledger is an ABSENCE, not an index range of 0 ***",
+   hl._ledger_snapshot()["transfers"], 0)
+check("...and says so", "ABSENCE" in hl._ledger_snapshot().get("why", ""))
+hl._ledger_note("store", 2, [5, 9, 7], [1, 0, 2])
+hl._ledger_note("load", 0, [40], [3])
+_ls = hl._ledger_snapshot()
+eq("the ledger counts transfers", _ls["transfers"], 2)
+eq("...and keeps the RANGE of block ids handed to the kernel",
+   _ls["block_id_range"], [5, 40])
+eq("...and of staging slots", _ls["slot_range"], [0, 3])
+eq("...and the recent ring records shape, not data",
+   _ls["recent"][-1], ("load", 0, 1, 40, 40, 3, 3))
+check("the ring is bounded, so a 180K prefill cannot grow it without limit",
+      diskio._LEDGER_RING <= 64)
+for _i in range(diskio._LEDGER_RING * 3):
+    hl._ledger_note("store", 0, [_i], [0])
+check("...and stays bounded in practice",
+      len(hl._ledger["recent"]) <= diskio._LEDGER_RING)
+_ok = True
+try:
+    hl._ledger_note("store", 0, None, None)   # hostile input
+except Exception:
+    _ok = False
+check("*** the ledger can never raise into the transfer path ***", _ok)
 
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
