@@ -335,6 +335,69 @@ def write_geometry(kv_caches: Any, spec: Any, out_dir: str) -> str | None:
         return None
 
 
+def _now() -> float:
+    import time
+    return time.monotonic()
+
+
+def _elapsed(t0) -> float | None:
+    """Seconds since `t0`, or None if it was never recorded.
+
+    None rather than 0.0, and that distinction is load-bearing: the connector
+    gates its metric on `transfer_time` being TRUTHY, so a 0.0 would be
+    silently dropped exactly as a None is -- but a floor of one microsecond
+    keeps a genuinely fast transfer observable instead of invisible. A restore
+    nobody can prove happened is the state this whole field exists to leave.
+    """
+    if t0 is None:
+        return None
+    return max(_now() - t0, 1e-6)
+
+
+def copy_into(dst, src) -> int:
+    """Copy `src` bytes into the memoryview `dst`, as RAW BYTES on both sides.
+
+    *** THE ONE LINE THAT KILLED THE FIRST REAL RESTORE. *** It was
+
+        self._staging[t][slot][:len(buf)].numpy().data[:] = buf
+
+    and it raised `ValueError: memoryview assignment: lvalue and rvalue have
+    different structures` on the first restore that ever reached a GPU tensor.
+    The staging tensor is int8, so `.numpy().data` has format `'b'` (signed
+    char), while a buffer read off a file is `bytes`, format `'B'`. memoryview
+    assignment requires the FORMAT and the SHAPE to agree; it does not coerce.
+
+    It was invisible until the box because the STORE side only ever READS that
+    same view -- `_read_row` hands the memoryview to `write_chunks`, which
+    writes it out, and reading needs no format agreement at all. So the two
+    directions are not symmetric even though they look it, and the asymmetry
+    lives in one subscript.
+
+    `.cast("B")` on both sides is the fix, and it is why this is a named
+    function rather than an expression: a cast requires a C-contiguous buffer,
+    which is a precondition worth stating once and testing once rather than
+    re-deriving at each call site. Returns the byte count so a caller can
+    account without re-measuring.
+    """
+    out = memoryview(dst)
+    if out.format != "B" or out.ndim != 1:
+        out = out.cast("B")
+    inp = memoryview(src)
+    if inp.format != "B" or inp.ndim != 1:
+        inp = inp.cast("B")
+    if len(out) != len(inp):
+        # A length disagreement here means the file and the geometry disagree,
+        # which `read_chunks` is supposed to have already refused. Saying so
+        # explicitly beats memoryview's own message, which names neither side.
+        raise ValueError(
+            f"copy_into: destination is {len(out)} bytes and the source is "
+            f"{len(inp)} -- the file and the tensor geometry disagree, so the "
+            f"KV would be wrong. Delete presence.json beside the KV and "
+            f"restart.")
+    out[:] = inp
+    return len(inp)
+
+
 def read_chunks(path: str, plan: "Sequence[Chunk]", write_row: Any) -> int:
     """Read one file back into staging, refusing anything that is not exact.
 
@@ -512,7 +575,7 @@ class DiskStoreHandler:
                 batches.append([g, keys[off:off + n], block_ids[off:off + n]])
             off += n
         self._jobs[job_id] = {"batches": batches, "pending": 0, "bytes": 0,
-                              "files": 0, "failed": False}
+                              "files": 0, "failed": False, "t0": _now()}
         self.stats["submitted"] += 1
         self._pump()
         return True
@@ -636,8 +699,22 @@ class DiskStoreHandler:
             if st["failed"]:
                 out.append(TransferResult(job_id=job_id, success=False))
             else:
+        # *** transfer_time IS NOT OPTIONAL, and my own Phase 0 note said so.
+        # *** `kv_connector_offloading/worker.py:274` gates record_transfer on
+        # all THREE of transfer_time (truthily!), transfer_size and
+        # transfer_type -- so omitting the time means
+        # `vllm:kv_offload_total_bytes_total` has NO SERIES AT ALL. Measured
+        # 2026-10-08: the store path was demonstrably writing 1,051 files a run
+        # and `transfer_type="..."` matched nothing in /metrics.
+        #
+        # That is not cosmetic. The ABSENCE of a restore series is exactly what
+        # proved `prepare_load` had never been called, back when the tiering
+        # tier was in the path -- a stronger statement than "the lookup
+        # missed". A handler that omits the time makes its own path
+        # unobservable, and this one did.
                 out.append(TransferResult(
                     job_id=job_id, success=True, transfer_size=st["bytes"],
+                    transfer_time=_elapsed(st.get("t0")),
                     transfer_type=("GPU", self._spec.disk_medium)))
         return out
 
@@ -757,7 +834,11 @@ class DiskLoadHandler:
         logger.info("kvmgr: disk LOAD handler installed (restore is live)")
 
     def _write_row(self, tensor_idx: int, slot: int, buf) -> None:
-        self._staging[tensor_idx][slot][:len(buf)].numpy().data[:] = buf
+        # copy_into, never a bare `[:] = buf`: the staging tensor's view is
+        # format 'b' and a file buffer is 'B', and memoryview assignment does
+        # not coerce. See copy_into's docstring -- this is the line that killed
+        # the first restore that ever reached a GPU tensor.
+        copy_into(self._staging[tensor_idx][slot][:len(buf)].numpy().data, buf)
 
     def _read_batch(self, keys, slots, group_idx) -> int:
         total = 0
@@ -786,7 +867,7 @@ class DiskLoadHandler:
                 batches.append([g, keys[off:off + n], block_ids[off:off + n]])
             off += n
         self._jobs[job_id] = {"batches": batches, "pending": 0, "bytes": 0,
-                              "failed": False}
+                              "failed": False, "t0": _now()}
         self.stats["submitted"] += 1
         self._pump()
         return True
@@ -876,9 +957,13 @@ class DiskLoadHandler:
         for job_id in [j for j, st in self._jobs.items()
                        if st["pending"] == 0 and (not st["batches"] or st["failed"])]:
             st = self._jobs.pop(job_id)
+            # The time matters more on this side than on the store's: see
+            # DiskStoreHandler.get_finished. A restore with no series is a
+            # restore nobody can prove happened.
             out.append(TransferResult(
                 job_id=job_id, success=not st["failed"],
                 transfer_size=st["bytes"] if not st["failed"] else None,
+                transfer_time=_elapsed(st.get("t0")),
                 transfer_type=(self._spec.disk_medium, "GPU")))
         return out
 

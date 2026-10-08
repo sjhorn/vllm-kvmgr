@@ -617,6 +617,173 @@ F.write(disk_restore=0)
 flags.reset_for_tests()
 
 
+print("\n== (b12b) copy_into: the one line that killed the first real restore ==")
+
+# *** REPRODUCED WITH NO TORCH, which is the point. *** The live failure was
+#     ValueError: memoryview assignment: lvalue and rvalue have different
+#     structures
+# from `self._staging[t][slot][:len(buf)].numpy().data[:] = buf`. The staging
+# tensor is int8, so its view has format 'b' (signed char), while a buffer read
+# off a file is `bytes`, format 'B'. memoryview assignment requires format AND
+# shape to agree and does NOT coerce.
+#
+# It was invisible until the box because the STORE side only ever READS that
+# same view: `_read_row` hands the memoryview to write_chunks, and reading needs
+# no format agreement at all. Two directions that look symmetric and are not,
+# with the asymmetry in one subscript. An `array('b')` reproduces it exactly.
+import array as _array
+
+_signed = _array.array("b", [0] * 16)          # format 'b', like int8 staging
+_payload = bytes(range(16))                     # format 'B', like a file read
+
+try:
+    memoryview(_signed)[:] = _payload
+    check("*** the bare assignment IS the live bug (it did not raise here) ***",
+          False, "if this passes, the premise changed")
+except ValueError as e:
+    check("*** the bare assignment raises exactly the live error ***",
+          "different structures" in str(e), str(e)[:70])
+
+n = diskio.copy_into(memoryview(_signed), _payload)
+eq("copy_into copies it anyway, by casting both sides", n, 16)
+eq("...and the BYTES are right, not merely accepted",
+   bytes(memoryview(_signed).cast("B")), _payload)
+
+# The reverse pairing, and the already-matching one, must both work: the helper
+# is called with whatever the tensor's dtype gives, which is not ours to choose.
+_dst_u = bytearray(8)
+eq("a 'B' destination from a 'B' source still works",
+   diskio.copy_into(memoryview(_dst_u), bytes(range(8))), 8)
+eq("...correctly", bytes(_dst_u), bytes(range(8)))
+
+_wide = _array.array("i", [0] * 4)             # 4-byte items: 16 bytes total
+eq("a MULTI-BYTE itemsize destination casts too",
+   diskio.copy_into(memoryview(_wide), bytes(range(16))), 16)
+eq("...and lands byte for byte",
+   bytes(memoryview(_wide).cast("B")), bytes(range(16)))
+
+# A length disagreement must name BOTH sides and the recovery. memoryview's own
+# message names neither, which is what made the live failure take a log dive.
+try:
+    diskio.copy_into(bytearray(10), bytes(4))
+    check("a length mismatch is refused", False, "it did not raise")
+except ValueError as e:
+    msg = str(e)
+    check("*** a length mismatch names both sizes ***",
+          "10" in msg and "4" in msg, msg[:90])
+    check("...and the recovery, so it is actionable from the log alone",
+          "presence.json" in msg)
+
+print("\n== (b12c) transfer_time: without it the path is UNOBSERVABLE ==")
+
+# *** `kv_connector_offloading/worker.py:274` gates record_transfer on ALL
+# THREE of transfer_time (truthily), transfer_size and transfer_type. *** So
+# omitting the time means `vllm:kv_offload_total_bytes_total` has NO SERIES AT
+# ALL -- measured 2026-10-08, with the store path demonstrably writing 1,051
+# files a run and `transfer_type="..."` matching nothing in /metrics.
+#
+# Not cosmetic: the ABSENCE of a restore series is precisely what proved
+# `prepare_load` had never been called back when the tiering tier was in the
+# path. A handler that omits the time makes its own path unprovable, and this
+# one did. My own Phase 0 note said so in as many words.
+ht = mkhandler(64)
+kt = gkeys(2, 4, salt=55)
+gput = base.GPULoadStoreSpec(list(range(4000, 4004)),
+                             group_sizes=[0, 0, 4, 0, 0], block_indices=[0] * 5)
+ht.transfer_async(1234, (gput, diskspec.DiskLoadStoreSpec(kt)))
+res = []
+for _ in range(50):
+    res.extend(ht.get_finished())
+    if res:
+        break
+eq("the job reports finished", [r.job_id for r in res], [1234])
+r0 = res[0]
+check("*** transfer_time is SET, or the connector drops the metric ***",
+      r0.transfer_time is not None, repr(r0.transfer_time))
+check("...and TRUTHY, because the gate is `if transfer_result.transfer_time`",
+      bool(r0.transfer_time), repr(r0.transfer_time))
+check("...with transfer_size beside it", r0.transfer_size is not None)
+check("...and transfer_type naming OUR medium, so the series is findable",
+      r0.transfer_type == ("GPU", diskspec.DISK_MEDIUM), repr(r0.transfer_type))
+
+# A transfer too fast to measure must still be observable: 0.0 is dropped by
+# the same truthiness gate that drops None, so the floor is what keeps a fast
+# restore from being invisible.
+eq("an unrecorded start is None, not 0.0", diskio._elapsed(None), None)
+check("a zero-length interval floors above zero rather than reading 0.0",
+      diskio._elapsed(diskio._now()) > 0,
+      repr(diskio._elapsed(diskio._now())))
+
+# And the lint: the bare memoryview assignment must not come back. It is one
+# subscript, it looks right, and it only fails in the load direction.
+_dpath = os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr", "diskio.py")
+_dsrc = open(_dpath).read()
+
+
+def code_only(path):
+    """The source with comments and string literals BLANKED IN PLACE.
+
+    *** THIS REPO HAS LEARNED THE FIRST HALF TWICE ALREADY. *** A lint that
+    reads raw source matches the paragraph EXPLAINING the trap, so the prose
+    naming the bad idiom is itself a failure -- the `.sysdiag` CSS lint and the
+    CHARTS per-second lint both shipped with that bug. `copy_into`'s docstring
+    quotes the bare assignment verbatim, on purpose.
+
+    *** AND THE OBVIOUS FIX MADE THE LINT VACUOUS, which is the second half and
+    cost a break-verification to find. *** Joining the surviving tokens with a
+    separator turns `.data[:] =` into `. data [ : ] =`, so the pattern can
+    NEVER match and the lint passes however broken the module is. Verified by
+    reintroducing the bug: only the other assertion fired.
+
+    So the regions are blanked IN PLACE, by position, leaving every other byte
+    and all the original spacing exactly as written. A lint that cannot fail
+    is worse than no lint, because it reads as coverage.
+    """
+    import tokenize
+
+    with open(path, "rb") as f:
+        lines = f.read().decode().splitlines(keepends=True)
+    with open(path, "rb") as f:
+        toks = list(tokenize.tokenize(f.readline))
+    for tok in toks:
+        if tok.type not in (tokenize.COMMENT, tokenize.STRING):
+            continue
+        (r1, c1), (r2, c2) = tok.start, tok.end
+        for r in range(r1, r2 + 1):
+            line = lines[r - 1]
+            a = c1 if r == r1 else 0
+            b = c2 if r == r2 else len(line.rstrip("\n"))
+            keep_nl = "\n" if line.endswith("\n") and b >= len(line.rstrip("\n")) else ""
+            lines[r - 1] = line[:a] + " " * (b - a) + line[b:] if not keep_nl \
+                else line[:a] + " " * (b - a) + "\n"
+    return "".join(lines)
+
+
+_dcode = code_only(_dpath)
+check("the stripper removed the docstring that quotes the idiom",
+      ".data[:] =" in _dsrc and "memoryview assignment" not in _dcode,
+      "otherwise this lint fails for the wrong reason")
+# And the lint must be able to FAIL, which the joined-token version could not.
+# Asserted directly rather than trusted: a canary with the bad idiom inside a
+# docstring AND in code must be caught by the code half only.
+_canary = os.path.join(WDIR, "canary.py")
+open(_canary, "w").write(
+    'x = 1\n'
+    'def f():\n'
+    '    """doc mentioning .data[:] = buf, which must be ignored"""\n'
+    '    return x\n')
+check("the stripper ignores the idiom in a DOCSTRING",
+      ".data[:] =" not in code_only(_canary))
+open(_canary, "w").write('def f(v, buf):\n    v.numpy().data[:] = buf\n')
+check("*** ...and CATCHES it in code, so the lint can actually fail ***",
+      ".data[:] =" in code_only(_canary),
+      "a lint that cannot fail reads as coverage")
+check("*** no bare `.numpy().data[:] =` survives in the CODE ***",
+      ".data[:] =" not in _dcode,
+      "that idiom is the live ValueError")
+check("...and _write_row goes through copy_into",
+      "copy_into(self._staging[" in _dsrc)
+
 print("\n== (b13) the manifest must flush on TIME too, or a short session is lost ==")
 
 # *** THE LIVE SHAPE, 2026-10-08. *** A run stored 1,052 new .bin files -- about
