@@ -440,6 +440,34 @@ eq("*** the captured handle is STABLE -- a later caller does not replace it ***"
    diskspec._LIVE_OFFLOAD_SCHED[0] is _right, True)
 eq("...and there is still exactly one", len(diskspec._LIVE_OFFLOAD_SCHED), 1)
 
+# prepare_store is the SECOND capture point, and the one that matters in
+# practice: `lookup` is only reached on an external prefix-cache path and may
+# not run for hours, while prepare_store is called on every request that fills
+# a block -- even with the tier paused, because our pause gate sits INSIDE the
+# call rather than preventing it. Verified with the pause on, which is the
+# state the box actually sits in.
+del diskspec._LIVE_OFFLOAD_SCHED[:]
+flags.set_override("disk_store_paused", True)
+try:
+    class _SchedStore:
+        pass
+    _SchedStore.__name__ = "OffloadingConnectorScheduler"
+
+    def _call_store(sched, mgr):
+        self = sched           # noqa: F841  -- the frame local the walk reads
+        return mgr.prepare_store([k1, k2], ctx)
+
+    _ss = _SchedStore()
+    _out = _call_store(_ss, _m)
+    eq("*** prepare_store captures it even with the store path PAUSED ***",
+       diskspec._LIVE_OFFLOAD_SCHED and diskspec._LIVE_OFFLOAD_SCHED[0] is _ss,
+       True)
+    check("...and the pause still returns an empty output, not None",
+          _out is not None and not _out.keys_to_store)
+finally:
+    flags.clear_override("disk_store_paused")
+    del diskspec._LIVE_OFFLOAD_SCHED[:]
+
 # A frame held after the walk pins a request's locals and builds a cycle on the
 # scheduler's hot path, so the function must not retain one.
 #

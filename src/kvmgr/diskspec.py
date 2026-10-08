@@ -529,6 +529,15 @@ class DiskPresenceManager(OffloadingManager):
         # already has a path for two lines down: no job is created, nothing is
         # written, and nothing is claimed. The pause is therefore invisible to
         # correctness by construction rather than by care.
+        # Capture the connector scheduler here as well as in `lookup`, because
+        # `lookup` is only reached on an external prefix-cache path and may not
+        # run for hours, whereas `prepare_store` is called on every request that
+        # fills a block -- the `paused` counter climbing proves it is called
+        # even with the tier paused, since the gate below is OURS and sits
+        # inside the call rather than preventing it.
+        if not _LIVE_OFFLOAD_SCHED:
+            capture_offload_sched_from_caller()
+
         if flags.peek("disk_store_paused"):
             self._stats["paused"] += len(keys)
             return _nothing_to_store()
