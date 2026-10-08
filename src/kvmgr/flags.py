@@ -76,6 +76,19 @@ DEFAULTS: dict[str, Any] = {
     "disk_enabled": False,
     "disk_budget_gb": 0.0,
     "disk_restore": False,
+    # *** THE OFF SWITCH, AND ITS DEFAULT IS THE POINT. *** False means the
+    # store path RUNS, because that is what every other knob's default means
+    # here: the default is today's behaviour, never a safety position. A knob
+    # that silently disabled a working feature on an empty flags file would be
+    # the "a deploy with an empty file behaves exactly as today" rule broken.
+    #
+    # It exists because a mechanism must get a hot off switch before it gets a
+    # feature, which cost a user-visible outage on 2026-10-08: the store path
+    # could only be disabled by a SIX-MINUTE restart, so the mitigation was
+    # unaffordable and a suspect path stayed on a live engine. Gated in
+    # `prepare_store`, never in the handler -- see the note there for why the
+    # obvious placement poisons the index.
+    "disk_store_paused": False,
     "kvmgr_log_level": 0,
     # 0 means BIND NOTHING, deliberately unlike a route that answers 404
     # because a boolean said so. Same convention as METER_TAP_PORT.

@@ -617,6 +617,70 @@ F.write(disk_restore=0)
 flags.reset_for_tests()
 
 
+print("\n== (b12a) disk_store_paused: the OFF SWITCH, and the trap it avoids ==")
+
+# *** A MECHANISM GETS A HOT OFF SWITCH BEFORE IT GETS A FEATURE. *** Learned
+# the expensive way 2026-10-08: the store path could only be disabled by a
+# SIX-MINUTE restart, so the mitigation was unaffordable and a suspect path
+# stayed running on an engine a real user depended on.
+from kvmgr import flags as _f  # noqa: E402
+
+mdirP = tempfile.mkdtemp(prefix="kvpause-")
+
+
+class FMP:
+    @staticmethod
+    def get_file_name(k):
+        return os.path.join(mdirP, base.get_offload_block_hash(k).hex()[:8] + ".bin")
+
+
+ctxP = base.ReqContext(req_id="rp")
+kp = [K(bytes([71, 0, 0, i]) * 8, 0) for i in range(4)]
+for k in kp:
+    open(FMP.get_file_name(k), "wb").write(b"x")
+
+_f.reset_for_tests()
+mgrP = diskspec.DiskPresenceManager(FMP, num_workers=2,
+                                    manifest_path=os.path.join(mdirP, "p.json"))
+
+# running: a store is prepared
+out = mgrP.prepare_store(kp, ctxP)
+check("with the switch at its default the store path RUNS", out is not None)
+eq("...offering every key", len(out.keys_to_store), 4)
+
+# paused: prepare_store declines, so NO JOB IS CREATED AT ALL
+F.write(kvmgr_enabled=1, disk_store_paused=1)
+eq("*** paused, prepare_store returns None -- no job, nothing written ***",
+   mgrP.prepare_store(kp, ctxP), None)
+eq("...and it is COUNTED, so a quiet pause is visible on /kv",
+   mgrP.snapshot()["paused"], 4)
+check("...and the snapshot says it is paused",
+      mgrP.snapshot()["store_paused"] is True)
+
+# *** THE TRAP: a pause must NOT mark keys present. ***
+# The obvious placement is the handler, which cannot report False (the
+# connector's `assert success` makes that fatal), so it would report SUCCESS
+# with zero bytes -- firing complete_store, marking the keys PRESENT with
+# nothing on disk, so a later lookup claims a hit and the restore dies on a
+# missing file. A pause that poisons the index is worse than no pause.
+eq("*** a paused store claims NOTHING present ***",
+   mgrP.snapshot()["present"], 0)
+F.write(kvmgr_enabled=1, disk_store_paused=0, disk_restore=1)
+eq("...so a lookup after a pause correctly MISSES", mgrP.lookup(kp[0], ctxP), False)
+
+# and it is HOT in both directions, which is the whole point
+F.write(kvmgr_enabled=1, disk_store_paused=1)
+eq("hot off", mgrP.prepare_store(kp, ctxP), None)
+F.write(kvmgr_enabled=1, disk_store_paused=0)
+check("*** hot ON again, with no restart ***", mgrP.prepare_store(kp, ctxP) is not None)
+
+# the default must be TODAY'S BEHAVIOUR, not a safety position: an empty flags
+# file has to behave exactly as the engine does now.
+_f.reset_for_tests()
+F.write(kvmgr_enabled=1)
+eq("an empty-ish flags file leaves the store path RUNNING",
+   bool(_f.peek("disk_store_paused")), False)
+
 print("\n== (b12b) copy_into: the one line that killed the first real restore ==")
 
 # *** REPRODUCED WITH NO TORCH, which is the point. *** The live failure was

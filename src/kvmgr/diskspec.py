@@ -174,7 +174,7 @@ class DiskPresenceManager(OffloadingManager):
         self._events: list[OffloadingEvent] = []
         self._stats = {"lookup": 0, "hit": 0, "stored": 0, "skipped_present": 0,
                        "manifest_loaded": 0, "manifest_pruned": 0,
-                       "manifest_writes": 0}
+                       "manifest_writes": 0, "paused": 0}
         self._manifest = manifest_path
         self._unflushed = 0
         self._last_flush = _now()
@@ -302,6 +302,30 @@ class DiskPresenceManager(OffloadingManager):
     def prepare_store(
         self, keys: "Collection[OffloadKey]", req_context: "ReqContext"
     ) -> PrepareStoreOutput | None:
+        # *** THE HOT OFF SWITCH, AND prepare_store IS THE ONLY SAFE PLACE FOR
+        # IT. *** A mechanism gets a hot off switch before it gets a feature --
+        # a rule this cost a user-visible outage to learn, on 2026-10-08: the
+        # store path had no way to be disabled without a SIX-MINUTE restart, so
+        # the only mitigation was one the box could not afford and a suspect
+        # path was left running on a live engine.
+        #
+        # Pausing in the HANDLER would be a correctness trap, which is worth
+        # stating because it is the obvious place to put it. The handler cannot
+        # report False -- the connector's `assert success` makes that fatal on
+        # every path (the Phase 1c lesson) -- so it would have to report
+        # SUCCESS with zero bytes. That fires `complete_store`, which marks
+        # those keys PRESENT in the index while nothing was written, so a later
+        # `lookup` claims a hit and the restore then dies on a missing file.
+        # A pause that poisons the index is worse than no pause.
+        #
+        # Returning None here means "nothing to store", which `prepare_store`
+        # already has a path for two lines down: no job is created, nothing is
+        # written, and nothing is claimed. The pause is therefore invisible to
+        # correctness by construction rather than by care.
+        if flags.peek("disk_store_paused"):
+            self._stats["paused"] += len(keys)
+            return None
+
         # Skipping keys we already hold is the dedup that made boot 2 write zero
         # new files. Cheap here, and it keeps the writer's exists() check as the
         # second line of defence rather than the only one.
@@ -362,7 +386,8 @@ class DiskPresenceManager(OffloadingManager):
     def snapshot(self) -> dict[str, Any]:
         return dict(self._stats, present=len(self._present),
                     num_workers=self._num_workers,
-                    restore_enabled=bool(flags.peek("disk_restore")))
+                    restore_enabled=bool(flags.peek("disk_restore")),
+                    store_paused=bool(flags.peek("disk_store_paused")))
 
 
 class DSparkDiskOffloadingSpec(OffloadingSpec):
