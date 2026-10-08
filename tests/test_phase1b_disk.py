@@ -616,6 +616,90 @@ eq("...so lookup simply misses", m4.lookup(k_a, ctx2), False)
 F.write(disk_restore=0)
 flags.reset_for_tests()
 
+
+print("\n== (b13) wait(): ONLY our own jobs, or the engine blocks for minutes ==")
+
+# *** THE SHAPE THAT WEDGED THE WORKER LIVE, 2026-10-07. *** The worker stopped
+# consuming shm broadcasts for seven minutes with zero files written, because
+# `OffloadingWorker.wait` fans the whole id set out to EVERY registered handler
+# (worker.py:172) and our wait() did `remaining = set(job_ids)`. An id belonging
+# to the load handler, or one whose completion we already reported and popped,
+# can never appear in a future get_finished() -- so the loop spun its full
+# deadline with the engine stalled behind it. Upstream skips an unknown id in
+# one line (`cpu/gpu_worker.py:373`): `if event is not None`.
+import re as _re
+import time as _time
+
+hw = mkhandler(8)
+t0 = _time.monotonic()
+hw.wait({4242})                      # never ours: the load handler's
+el = _time.monotonic() - t0
+check("*** a FOREIGN job id returns immediately, it does not spin ***",
+      el < 1.0, f"{el:.3f}s")
+
+# The second half of the live shape: an id we DID own and have already
+# reported. get_finished() pops it, so it can never be seen again either.
+hr = mkhandler(64)
+krep = gkeys(1, 4, salt=9)
+gpur = base.GPULoadStoreSpec(list(range(2000, 2004)),
+                             group_sizes=[0, 4, 0, 0, 0], block_indices=[0] * 5)
+check("a small job submits in one round",
+      hr.transfer_async(500, (gpur, diskspec.DiskLoadStoreSpec(krep))) is True)
+seen = []
+for _ in range(50):
+    seen.extend(hr.get_finished())
+    if seen:
+        break
+eq("...and is reported finished once", [r.job_id for r in seen], [500])
+check("...after which it is no longer in _jobs", 500 not in hr._jobs)
+t0 = _time.monotonic()
+hr.wait({500})                       # already done and popped
+el = _time.monotonic() - t0
+check("*** an ALREADY-REPORTED id returns immediately too ***",
+      el < 1.0, f"{el:.3f}s")
+
+# A mixed set must still wait for the one that IS ours and pending.
+hm = mkhandler(8)
+km = gkeys(0, 40, salt=31)
+gpum = base.GPULoadStoreSpec(list(range(3000, 3040)),
+                             group_sizes=[40, 0, 0, 0, 0], block_indices=[0] * 5)
+hm.transfer_async(900, (gpum, diskspec.DiskLoadStoreSpec(km)))
+check("a 40-block job against an 8-block pool is still queued",
+      hm._jobs[900]["batches"] != [])
+t0 = _time.monotonic()
+hm.wait({900, 4242, 777})            # one ours-and-pending, two foreign
+el = _time.monotonic() - t0
+check("*** a MIXED set still waits for the one that is ours ***",
+      900 not in hm._jobs, "it completed rather than being skipped")
+check("...and it finished by pumping, not by timing out", el < 30.0, f"{el:.3f}s")
+eq("...writing every block", hm.stats["files"], 40)
+
+# An empty intersection must not even start the clock.
+he = mkhandler(8)
+t0 = _time.monotonic()
+he.wait(set())
+check("an empty set is a no-op", (_time.monotonic() - t0) < 0.5)
+
+# The LOAD handler has the identical bug and the identical fix. Asserted on the
+# SOURCE because constructing one needs torch; what must never drift is that
+# BOTH filter to their own `_jobs` before looping.
+_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                         "diskio.py")).read()
+_waits = _re.findall(r"def wait\(self, job_ids: set\) -> None:(.*?)(?=\n    def )",
+                     _src, _re.S)
+eq("both handlers define wait()", len(_waits), 2)
+for _i, _body in enumerate(_waits):
+    check(f"wait() #{_i + 1} filters to ids it actually holds",
+          _re.search(r"\{\s*j\s+for\s+j\s+in\s+job_ids\s+if\s+j\s+in\s+self\._jobs\s*\}",
+                     _body) is not None,
+          "a bare set(job_ids) is the hang")
+    check(f"wait() #{_i + 1} returns early on an empty intersection",
+          _re.search(r"if not (remaining|rem):\s*\n\s*return", _body) is not None)
+    check(f"wait() #{_i + 1} is bounded well under the engine's patience",
+          "deadline = time.monotonic() + 120.0" in _body)
+    check(f"wait() #{_i + 1} says WHICH jobs timed out",
+          "sorted(" in _body and "timed out" in _body)
+
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:

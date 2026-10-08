@@ -642,17 +642,57 @@ class DiskStoreHandler:
         return out
 
     def wait(self, job_ids: set) -> None:
+        """Block until OUR jobs among `job_ids` are on disk.
+
+        *** ONLY OURS, AND THAT ONE WORD IS A 600-SECOND ENGINE HANG. ***
+        Measured live 2026-10-07: the worker stopped consuming shm broadcasts
+        for seven minutes with zero files written, and this is why.
+        `OffloadingWorker.wait` fans the whole id set out to EVERY registered
+        handler (worker.py:172), so the store handler is routinely handed ids
+        belonging to the load handler -- and ids whose completion it already
+        reported and popped from `self._jobs`. Neither can ever appear in a
+        future `get_finished()`, so the old `remaining = set(job_ids)` could
+        never empty and spun the full deadline with the engine blocked on it.
+
+        Upstream gets this right and the one line says how
+        (`cpu/gpu_worker.py:373`):
+
+            for job_id in job_ids:
+                event = self._transfer_events.get(job_id)
+                if event is not None:          # <- an unknown id is SKIPPED
+                    event.synchronize()
+
+        So an id we do not hold is not a job to wait for; it is somebody
+        else's, or already done. Both mean "nothing to do here".
+
+        The deadline is 120s rather than 600s for the same reason the bug cost
+        so much: this runs on the engine's critical path with the worker
+        unable to consume broadcasts, so a bounded WRONG answer that says so
+        beats a correct answer nobody can wait for. A real flush of a 700K
+        prefix is rounds of a 32-block pool, which is seconds, not minutes.
+        """
         import time
-        deadline = time.monotonic() + 600.0
-        remaining = set(job_ids)
+
+        # Snapshot our own ids first: get_finished() pops completed jobs, so
+        # testing membership inside the loop would race with our own progress.
+        remaining = {j for j in job_ids if j in self._jobs}
+        if not remaining:
+            return
+        deadline = time.monotonic() + 120.0
         while remaining and time.monotonic() < deadline:
             for r in self.get_finished():
                 remaining.discard(r.job_id)
             if remaining:
                 time.sleep(0.0005)
         if remaining:
-            logger.error("kvmgr: wait() timed out with %d job(s) outstanding",
-                         len(remaining))
+            # Name them: a flush that timed out has left KV unpersisted for a
+            # block the scheduler is about to reuse, and which job it was is
+            # the only thing that makes that traceable afterwards.
+            logger.error(
+                "kvmgr: wait() timed out after 120s with %d of OUR job(s) "
+                "outstanding: %s. staging=%s jobs_open=%d writes_open=%d",
+                len(remaining), sorted(remaining), self._pool.snapshot(),
+                len(self._jobs), len(self._writing))
 
     def shutdown(self) -> None:
         self._writers.shutdown(wait=True)
@@ -843,14 +883,37 @@ class DiskLoadHandler:
         return out
 
     def wait(self, job_ids: set) -> None:
+        """Block until OUR loads among `job_ids` are in GPU memory.
+
+        Same bug, same fix, same reason as DiskStoreHandler.wait -- see the
+        long note there. `OffloadingWorker.wait` hands every id to every
+        handler, so filtering to ids we actually hold is the whole of it; an
+        id we do not hold is the store handler's, or already reported.
+
+        It is written out twice rather than shared because the two handlers
+        own different dicts and a shared helper would have to take the dict as
+        an argument, which is more indirection than four lines deserve. What
+        matters is that they do not DIVERGE, and a test asserts the property
+        for both.
+        """
         import time
-        deadline = time.monotonic() + 600.0
-        rem = set(job_ids)
+
+        rem = {j for j in job_ids if j in self._jobs}
+        if not rem:
+            return
+        deadline = time.monotonic() + 120.0
         while rem and time.monotonic() < deadline:
             for r in self.get_finished():
                 rem.discard(r.job_id)
             if rem:
                 time.sleep(0.0005)
+        if rem:
+            # A load that timed out is worse than a store that did: the
+            # scheduler has already told the engine those tokens are computed.
+            logger.error(
+                "kvmgr: LOAD wait() timed out after 120s with %d of OUR "
+                "job(s) outstanding: %s. jobs_open=%d reads_open=%d",
+                len(rem), sorted(rem), len(self._jobs), len(self._reading))
 
     def shutdown(self) -> None:
         self._readers.shutdown(wait=True)
