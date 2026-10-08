@@ -89,6 +89,13 @@ DEFAULTS: dict[str, Any] = {
     # `prepare_store`, never in the handler -- see the note there for why the
     # obvious placement poisons the index.
     "disk_store_paused": False,
+    # *** THE ONE KNOB THAT GENUINELY CANNOT BE HOT, and it says so. *** A
+    # route either exists in the FastAPI app or it does not, and the app is
+    # built once at boot -- so this is read at ATTACH time and enabling it
+    # needs a restart. Off by default: the plane shares the engine's port,
+    # which Caddy's catch-all proxies, so an unattended engine must not have
+    # it open. Mirrors VLLM_SERVER_DEV_MODE's own gate-at-attach shape.
+    "kvmgr_control_plane": False,
     "kvmgr_log_level": 0,
     # 0 means BIND NOTHING, deliberately unlike a route that answers 404
     # because a boolean said so. Same convention as METER_TAP_PORT.

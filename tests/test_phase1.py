@@ -276,6 +276,14 @@ PROBE = {
     "disk_budget_gb": (0.0, 64.0),
     "disk_restore": (0, 1),
     "disk_store_paused": (0, 1),
+    # *** THE ONE KNOB WHOSE VALUE IS HOT AND WHOSE EFFECT IS NOT, and the
+    # loop below cannot tell the difference. *** It passes here because
+    # `flags.raw()` really does re-read it with no restart -- but it is
+    # consulted at ATTACH time, and a FastAPI route either exists in the app
+    # or it does not. So nobody should read this passing assertion as "the
+    # control plane can be switched on hot": it cannot, and
+    # `attach_router`'s own log line says so when it declines.
+    "kvmgr_control_plane": (0, 1),
     "kvmgr_log_level": (0, 2),
     "kvmgr_stats_port": (0, 9107),
     "offload_allow_hybrid": (0, 1),

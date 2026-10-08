@@ -57,6 +57,7 @@ def register() -> None:
         return
 
     _install_hang_dump()
+    _install_control_plane()
 
     from vllm.v1.core import single_type_kv_cache_manager as stm
     from vllm.v1.kv_cache_interface import MLAAttentionSpec
@@ -132,6 +133,31 @@ def register() -> None:
     _REGISTERED = True
 
 
+
+
+def _install_control_plane() -> None:
+    """Install the HTTP control plane's three hooks, best-effort.
+
+    Three, because three kinds of process read these knobs and each needs a
+    different one: the Worker methods are the RPC targets, the EngineCore wrap
+    is what makes the SCHEDULER apply a knob too (the executor broadcasts only
+    to workers), and the router hook attaches our routes to the app the API
+    server builds. Every one is a no-op in a process that lacks its target, so
+    this runs unconditionally and the misses are silent by design.
+
+    Best-effort throughout: a control plane that can break a boot is worse than
+    no control plane, which is the same rule the geometry snapshot and the hang
+    dump already follow.
+    """
+    try:
+        from . import control
+
+        control.install_worker_methods()
+        control.wrap_engine_core_rpc()
+        control.install_router_hook()
+    except Exception:
+        logger.exception("kvmgr: control plane install failed (continuing; the "
+                         "flags file still governs every knob)")
 
 def _install_hang_dump() -> None:
     """Make a HANG dumpable with no ptrace, because twice now it was not.

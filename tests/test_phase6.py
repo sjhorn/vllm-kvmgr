@@ -184,6 +184,147 @@ eq("...reported as an override", flags.source_of("protected_fraction"), "overrid
 flags.clear_override()
 eq("...and clearing returns the delegation", flags.raw("protected_fraction"), 0.75)
 
+print("\n== (8) apply_knob / clear_knob: the per-process RPC body ==")
+
+from kvmgr import control  # noqa: E402
+
+flags.reset_for_tests()
+F.write()
+a = control.apply_knob("evict_order", "lru_tail_first")
+check("a good set reports ok", a["ok"] is True)
+eq("...the value it set", a["set_to"], "lru_tail_first")
+eq("...what it displaced", a["was"], "fifo")
+eq("...and the winning source", a["source"], "override")
+
+bad = control.apply_knob("not_a_knob", 1)
+check("*** an unknown knob does NOT raise across the RPC boundary ***",
+      bad["ok"] is False, "a raise there is an engine-core traceback")
+check("...it names the knob", "not_a_knob" in bad["error"])
+inv = control.apply_knob("disk_store_paused", "maybe")
+check("a bad boolean is refused the same way, not coerced",
+      inv["ok"] is False and "not a boolean" in inv["error"])
+
+c = control.clear_knob("evict_order")
+check("clear reports ok", c["ok"] is True)
+eq("...naming what it dropped", c["cleared"], ["evict_order"])
+eq("...and what governs now", c["source"], "default")
+check("clearing an unknown knob reports, does not raise",
+      control.clear_knob("nope")["ok"] is False)
+
+print("\n== (9) THE SPLIT VIEW is the dangerous failure, so it is reported ==")
+
+# The engine core applies a kvmgr_* knob inside the wrap and the workers apply
+# it over RPC. If the fan-out fails after the local apply, the knob is set HERE
+# and not THERE -- and a 200 with a local success in it would hide exactly
+# that. Modelled directly, because no offline harness has an executor.
+calls = []
+
+
+class _FakeClient:
+    def __init__(self, fail=False):
+        self.fail = fail
+
+    async def collective_rpc(self, method, args=(), kwargs=None):
+        calls.append((method, kwargs))
+        if self.fail:
+            raise RuntimeError("worker handshake timed out")
+        return [{"ok": True, "rank": 0}, {"ok": True, "rank": 1}]
+
+
+import asyncio  # noqa: E402
+
+
+async def _drive(client, method, kwargs):
+    """The route's fan-out, lifted: apply locally, then fan out, then report."""
+    local = control._apply_locally_reported(method, kwargs)
+    try:
+        ranks = await client.collective_rpc(method=method, args=(), kwargs=kwargs)
+    except Exception as e:
+        return {"ok": False, "api_server": local, "error": str(e)}
+    return {"ok": True, "api_server": local, "ranks": ranks}
+
+
+flags.reset_for_tests()
+ok = asyncio.get_event_loop().run_until_complete(
+    _drive(_FakeClient(), "kvmgr_set_knob",
+           {"name": "protect_alloc", "value": "by_need"}))
+check("a good fan-out is ok", ok["ok"] is True)
+eq("...and reports BOTH ranks", len(ok["ranks"]), 2)
+eq("...having applied locally too", ok["api_server"]["set_to"], "by_need")
+eq("...and the RPC carried the method vLLM resolves on the Worker",
+   calls[-1][0], "kvmgr_set_knob")
+
+flags.reset_for_tests()
+split = asyncio.get_event_loop().run_until_complete(
+    _drive(_FakeClient(fail=True), "kvmgr_set_knob",
+           {"name": "protect_alloc", "value": "by_need"}))
+check("*** a FAILED fan-out reports NOT ok, never a 200 with a local win ***",
+      split["ok"] is False)
+check("...naming the cause", "handshake" in split["error"])
+check("...while still saying what the local apply did, so the split is visible",
+      split["api_server"]["set_to"] == "by_need")
+
+print("\n== (10) _apply_locally accepts both positional and keyword args ==")
+
+# The engine-core wrap sees whatever the caller passed. Upstream's own
+# /collective_rpc route sends args as a LIST and kwargs as a dict, and our
+# route sends kwargs -- so both shapes have to work or the core silently skips
+# its own apply and we get the split view we just tested for.
+for label, args, kwargs in (("kwargs", (), {"name": "kvmgr_log_level", "value": 4}),
+                            ("positional", ("kvmgr_log_level", 4), {})):
+    flags.reset_for_tests()
+    control._apply_locally("kvmgr_set_knob", args, kwargs)
+    eq(f"the core applies a {label} call", flags.raw("kvmgr_log_level"), 4)
+
+print("\n== (11) rebind: __class__ swap moves EVERY method, including new ones ==")
+
+# Per-method rebinding silently misses a method the reload ADDED, which is
+# exactly the edit a reload is usually for. The __class__ swap cannot.
+import types  # noqa: E402
+
+mod = types.ModuleType("fake_live_mod")
+code_v1 = "class Thing:\n    def verdict(self):\n        return 'v1'\n"
+exec(compile(code_v1, "<v1>", "exec"), mod.__dict__)
+sys.modules["fake_live_mod"] = mod
+obj = mod.Thing()
+obj.state = "kept"
+eq("v1 behaviour", obj.verdict(), "v1")
+
+# a reload that CHANGES one method and ADDS another
+code_v2 = ("class Thing:\n    def verdict(self):\n        return 'v2'\n"
+           "    def added_later(self):\n        return 'new'\n")
+exec(compile(code_v2, "<v2>", "exec"), mod.__dict__)
+obj.__class__ = mod.Thing
+eq("*** the changed method moved ***", obj.verdict(), "v2")
+eq("*** and the ADDED one exists, which per-method rebinding would miss ***",
+   obj.added_later(), "new")
+eq("...and the instance kept its state", obj.state, "kept")
+del sys.modules["fake_live_mod"]
+
+print("\n== (12) the attach gate: OFF means ABSENT, not refusing ==")
+
+flags.reset_for_tests()
+F.write()
+
+
+class _App:
+    def __init__(self):
+        self.included = []
+
+    def include_router(self, r):
+        self.included.append(r)
+
+
+app = _App()
+control.attach_router(app)
+eq("*** off by default: nothing is attached, so the routes are ABSENT ***",
+   app.included, [])
+eq("...and the default is off, because the plane shares the engine's port",
+   bool(flags.raw("kvmgr_control_plane")), False)
+
+eq("the gate knob is in DEFAULTS, so the hot-config suite covers it",
+   "kvmgr_control_plane" in flags.DEFAULTS, True)
+
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print("  FAILED:", f)

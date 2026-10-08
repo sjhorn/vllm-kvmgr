@@ -335,6 +335,14 @@ def write_geometry(kv_caches: Any, spec: Any, out_dir: str) -> str | None:
         return None
 
 
+# Live handler instances, for `kvmgr.control.reload_modules()` to re-point.
+# A list the constructors append to, rather than a registry invented for the
+# reload -- a second registry is a second thing to forget to populate, which is
+# how `_LIVE_MANAGER` came to be published only after the counters it holds
+# turned out to be unreachable from the box.
+_LIVE_HANDLERS: list = []
+
+
 def _now() -> float:
     import time
     return time.monotonic()
@@ -530,6 +538,7 @@ class DiskStoreHandler:
             staging_blocks, len(self._staging), pin, self._sizes,
             sum(self._sizes), spec.whole_page_bytes,
         )
+        _LIVE_HANDLERS.append(self)
 
     def transfer_async(self, job_id: int, spec) -> bool:
         """Accept a job of ANY size, and submit it over as many rounds as needed.
@@ -832,6 +841,7 @@ class DiskLoadHandler:
         self.stats = {"submitted": 0, "refused_pairing": 0, "files": 0,
                       "bytes": 0, "errors": 0}
         logger.info("kvmgr: disk LOAD handler installed (restore is live)")
+        _LIVE_HANDLERS.append(self)
 
     def _write_row(self, tensor_idx: int, slot: int, buf) -> None:
         # copy_into, never a bare `[:] = buf`: the staging tensor's view is
