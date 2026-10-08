@@ -824,6 +824,27 @@ for name in ("_LIVE_HANDLERS", "_OVERRIDE", "_LIVE_MANAGER", "_groups"):
     check(f"_PRESERVE covers {name}",
           any(a == name for _, a, _ in control._PRESERVE))
 
+# *** `from kvmgr import <submodule>` IS A TRAP IN THIS PACKAGE. ***
+# __init__.py does `from .register import register`, so the package attribute
+# `register` is the entry-point FUNCTION and shadows the submodule. The reload
+# path used the obvious spelling and raised AttributeError on all three
+# processes live. Any module that re-resolves a kvmgr submodule at runtime must
+# use importlib.import_module, which ignores what the package re-exports.
+_ctl_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                             "control.py")).read()
+_shadowed = {"register"}  # the names __init__.py re-exports
+_bad = []
+for _line in _ctl_src.splitlines():
+    _t = _line.strip()
+    if _t.startswith("#"):
+        continue
+    for _name in _shadowed:
+        if _t.startswith(f"from kvmgr import {_name}"):
+            _bad.append(_t)
+eq("control.py never does `from kvmgr import <a re-exported name>`", _bad, [])
+check("...and it reaches submodules via import_module instead",
+      'import_module("kvmgr.register")' in _ctl_src)
+
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print("  FAILED:", f)

@@ -391,7 +391,18 @@ def reload_modules() -> dict:
     # and _install_hang_dump is best-effort by construction. Reported so a
     # reload that could NOT arm it says so rather than implying it did.
     try:
-        from kvmgr import register as _reg
+        # *** `from kvmgr import register` GIVES THE FUNCTION, NOT THE MODULE. ***
+        # __init__.py does `from .register import register`, so the package
+        # attribute `register` is the entry-point FUNCTION and it shadows the
+        # submodule of the same name. The obvious spelling therefore raised
+        # AttributeError("'function' object has no attribute
+        # '_install_hang_dump'") on all three processes -- found live, and only
+        # because this is a WARNING: the reload still reported ok=True and named
+        # the cause, instead of a green reload that had silently armed nothing.
+        # import_module always resolves the module, whatever the package
+        # re-exports.
+        import importlib as _il2
+        _reg = _il2.import_module("kvmgr.register")
         _reg._install_hang_dump()
         report["hang_dump_rearmed"] = True
         # *** AND START THE WATCHDOG, because a RELOAD NEVER RUNS A
@@ -402,7 +413,7 @@ def reload_modules() -> dict:
         # this repo's signature failure: a mechanism present, correct-looking
         # and producing nothing. Idempotent via _watchdog_started, which is in
         # _PRESERVE, so a reload on an already-watched process is a no-op.
-        from kvmgr import diskio as _dio
+        _dio = _il2.import_module("kvmgr.diskio")
         _dio._start_watchdog()
         report["watchdog_armed"] = bool(_dio._watchdog_started)
     except Exception as exc:
