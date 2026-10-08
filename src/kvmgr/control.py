@@ -436,59 +436,73 @@ def sync_knobs_to_workers(engine_core) -> dict:
 
 
 def wrap_engine_core_init() -> None:
-    """Fan the boot knobs out, ONCE, on the engine core's first step.
+    """Fan the boot knobs out ONCE, on whichever step entry point actually runs.
 
-    *** YOU CANNOT WRAP THE FUNCTION THAT LOADS YOU, and the first version of
-    this tried to. *** `EngineCore.__init__`'s FIRST STATEMENT is
+    *** TWO HOOKS WRONG IN A ROW, AND THE EVIDENCE WAS ALREADY IN HAND BOTH
+    TIMES. ***
 
-        from vllm.plugins import load_general_plugins
-        load_general_plugins()                      # <- this is us
+    Attempt 1 wrapped `EngineCore.__init__`, whose FIRST STATEMENT is
+    `load_general_plugins()` -- us (`v1/engine/core.py:106`). A wrap installed
+    from inside the plugin lands on the class attribute while the only call
+    that matters is already executing the original frame. **You cannot wrap the
+    function that loads you.**
 
-    (`v1/engine/core.py:106`). So a wrap installed from inside the plugin lands
-    on the class attribute while the only call that will ever matter is already
-    executing the original frame. Measured on the box 2026-10-08: the wrap
-    installed, logged nothing, and the sync never fired -- the routes worked,
-    the fan-out worked, and the boot defaults still disagreed between ranks.
-    Same family as this repo's existing note that `AsyncLLM` is built before
-    `init_app_state` imports it, one level deeper.
+    Attempt 2 wrapped `EngineCore.step`, which this engine never calls. The
+    busy loop goes through `self.step_fn()`, a reference CAPTURED at
+    construction and set to `step_with_batch_queue` under async scheduling --
+    which this engine runs. The crash traceback from earlier the same day
+    showed `_process_engine_step()` calling `self.step_fn()` in as many words,
+    so the right name was already on screen and I wrapped the plausible one
+    instead.
 
-    `EngineCore.step` is the fix: defined on the BASE class, called only after
-    `__init__` has returned, and carrying `self` -- so `self.model_executor`
-    exists and the workers are up. A one-shot flag on the instance makes it
-    fire exactly once.
-
-    Calling `collective_rpc` from the top of a step is the same operation an
-    HTTP `POST /kv/knob` performs while the engine is running, so it is not a
-    new risk; and it happens BEFORE delegating, when the broadcast queue is
-    idle between steps.
+    So: wrap EVERY candidate, sharing ONE one-shot flag, and let whichever runs
+    first do the work. Three names rather than one is not belt-and-braces for
+    its own sake -- a scheduling-mode change must not be able to silently
+    disable this, and the symptom when it does is behaviour differing by node
+    with nothing in any log.
     """
+    installed = []
     try:
-        from vllm.v1.engine.core import EngineCore
+        from vllm.v1.engine.core import EngineCore, EngineCoreProc
     except Exception:
-        return
-    original = EngineCore.step
-    if getattr(original, "_kvmgr_sync", False):
+        logger.exception("kvmgr: no EngineCore to hook; the boot knob sync is "
+                         "off and the ranks may start from different files")
         return
 
-    def step(self, *a, **kw):
-        if not getattr(self, "_kvmgr_synced", False):
-            # Set FIRST, so a raising sync cannot turn into a sync attempted on
-            # every step forever -- a retry loop on the hot path is worse than
-            # a missed sync, and the log says which happened.
-            self._kvmgr_synced = True
-            try:
-                sync_knobs_to_workers(self)
-            except Exception:
-                logger.exception(
-                    "kvmgr: the boot knob sync failed, so the two ranks may be "
-                    "starting from DIFFERENT files. Knobs set over HTTP still "
-                    "fan out correctly; only the boot defaults may disagree.")
-        return original(self, *a, **kw)
+    def _oneshot(original):
+        def wrapper(self, *a, **kw):
+            if not getattr(self, "_kvmgr_synced", False):
+                # Set FIRST: a raising sync must not become a retry on every
+                # step forever. A missed sync that says so beats a hot path
+                # that keeps trying.
+                self._kvmgr_synced = True
+                try:
+                    sync_knobs_to_workers(self)
+                except Exception:
+                    logger.exception(
+                        "kvmgr: the boot knob sync failed, so the ranks may be "
+                        "starting from DIFFERENT files. Knobs set over HTTP "
+                        "still fan out; only the boot defaults may disagree.")
+            return original(self, *a, **kw)
 
-    step._kvmgr_sync = True  # type: ignore[attr-defined]
-    EngineCore.step = step  # type: ignore[method-assign]
-    logger.info("kvmgr: EngineCore.step wrapped for the one-shot boot knob "
-                "sync (NOT __init__, which is what loads this plugin)")
+        wrapper._kvmgr_sync = True  # type: ignore[attr-defined]
+        return wrapper
+
+    for cls, name in ((EngineCore, "step"),
+                      (EngineCore, "step_with_batch_queue"),
+                      (EngineCoreProc, "_process_engine_step")):
+        try:
+            original = getattr(cls, name, None)
+            if original is None or getattr(original, "_kvmgr_sync", False):
+                continue
+            setattr(cls, name, _oneshot(original))
+            installed.append(f"{cls.__name__}.{name}")
+        except Exception:
+            logger.exception("kvmgr: could not wrap %s.%s", cls.__name__, name)
+    logger.info(
+        "kvmgr: boot knob sync armed on %s -- one shot, whichever runs first. "
+        "NOT __init__, which is what loads this plugin, and not `step` alone, "
+        "which async scheduling never calls.", installed)
 
 
 def _apply_locally(method: str, args: tuple, kwargs: dict) -> None:

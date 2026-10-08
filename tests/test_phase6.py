@@ -586,80 +586,105 @@ def _fn_body(src, name):
     return src[i:j if j != -1 else len(src)]
 
 
+# Asserted as a PROPERTY, not a spelling: the first version matched the literal
+# `if getattr` and broke when the function was rewritten to check per
+# candidate with a `continue`. A guard tied to how code is phrased fails on a
+# refactor that changed nothing about the behaviour -- the fifth time today a
+# test of mine failed for the wrong reason.
 for fn in ("wrap_engine_core_init", "wrap_engine_core_rpc"):
     body = _fn_body(_src, fn)
-    check(f"{fn} is idempotent, because plugins load more than once",
-          "_kvmgr" in body and "return" in body.split("if getattr")[1][:90],
-          "a double wrap would double every call")
+    # Either marker name is fine: what must hold is that one is SET and
+    # CHECKED. Pinning the exact name is pinning a spelling, which is what
+    # broke the previous version of this assertion.
+    marker = next((m for m in ("_kvmgr_sync", "_kvmgr_wrapped") if m in body),
+                  None)
+    check(f"{fn} marks what it wrapped, so a double load cannot double-wrap",
+          marker is not None, "a double wrap would double every call")
+    check(f"...and {fn} CHECKS that mark before wrapping",
+          marker is not None and "getattr(original" in body
+          and f'"{marker}"' in body)
 
-print("\n== (16) the sync hook: ONE SHOT, on step, NOT on the __init__ that loads us ==")
+print("\n== (16) the sync hook: EVERY step entry point, ONE shot ==")
 
-# *** YOU CANNOT WRAP THE FUNCTION THAT LOADS YOU. *** EngineCore.__init__'s
-# first statement is load_general_plugins() -- us -- so a wrap installed from
-# inside the plugin lands on the class attribute while the only call that
-# matters is already executing the original frame. Measured on the box: the
-# wrap installed, logged nothing, and the boot defaults still disagreed between
-# ranks. EngineCore.step is on the base class and runs only after __init__ has
-# returned.
+# *** TWO HOOKS WRONG IN A ROW, both with the evidence already in hand. ***
+# Attempt 1 wrapped EngineCore.__init__, whose first statement is
+# load_general_plugins() -- us -- so it could never fire. Attempt 2 wrapped
+# EngineCore.step, which this engine never calls: the busy loop goes through
+# self.step_fn(), a reference CAPTURED at construction and set to
+# step_with_batch_queue under async scheduling. The morning's crash traceback
+# showed `_process_engine_step()` calling `self.step_fn()` in as many words.
+#
+# So every candidate is wrapped, sharing ONE one-shot flag. A scheduling-mode
+# change must not be able to silently disable this -- the symptom when it does
+# is behaviour differing by node with nothing in any log.
 _src6 = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
                           "control.py")).read()
-_i = _src6.index("def wrap_engine_core_init(")
-_body6 = _src6[_i:_src6.index("\ndef ", _i + 10)]
-check("*** the hook is on EngineCore.step, not __init__ ***",
-      "EngineCore.step = step" in _body6 and "EngineCore.__init__ =" not in _body6,
-      "wrapping __init__ can never fire: it is what loads this plugin")
-check("...and the reason is recorded where somebody would re-break it",
-      "cannot wrap the function that loads you" in _body6.lower())
-
-# the one-shot must be set BEFORE the sync, or a raising sync retries forever
-# on the hot path -- worse than a missed sync.
-calls = []
 
 
-class _Core2:
-    def __init__(self):
-        self.n = 0
-
-    def collective_rpc(self, method, args=(), kwargs=None):
-        calls.append(kwargs.get("name"))
-        raise RuntimeError("workers not up")
+def _fnbody(src, name):
+    i = src.index(f"def {name}(")
+    j = src.find("\ndef ", i + 10)
+    return src[i:j if j != -1 else len(src)]
 
 
-_flag_order = []
+_body6 = _fnbody(_src6, "wrap_engine_core_init")
+for cand in ('"step"', '"step_with_batch_queue"', '"_process_engine_step"'):
+    check(f"{cand} is among the wrapped candidates", cand in _body6,
+          "one name is a scheduling-mode change away from silent")
+check("*** and __init__ is NOT wrapped, because it is what loads us ***",
+      'EngineCore.__init__ =' not in _body6 and '"__init__"' not in _body6)
+# *** NORMALISE WHITESPACE BEFORE MATCHING A PHRASE IN SOURCE. *** This read
+# the raw body and failed, because the docstring wraps the sentence mid-phrase
+# ("cannot wrap the\n    function that loads you"). Searching formatted prose
+# for a multi-word phrase without collapsing whitespace can only work by luck.
+import re as _re6  # noqa: E402
 
+_flat6 = _re6.sub(r"\s+", " ", _body6).lower()
+check("...with the reason recorded where somebody would re-break it",
+      "cannot wrap the function that loads you" in _flat6)
+check("...and why `step` alone is not enough",
+      "step_fn" in _body6 and "async scheduling" in _body6)
 
-class _Probe:
-    """Models the wrapper's own ordering: flag first, then sync."""
-
-    def __init__(self):
-        self._kvmgr_synced = False
-
-    def step(self):
-        if not self._kvmgr_synced:
-            self._kvmgr_synced = True
-            _flag_order.append("flag-then-sync")
-            try:
-                control.sync_knobs_to_workers(_Core2())
-            except Exception:
-                pass
-        return "stepped"
-
-
-flags.reset_for_tests()
-F.write(evict_order="lru")
-_p = _Probe()
-for _ in range(5):
-    _p.step()
-eq("*** a raising sync is attempted ONCE, not on every step ***",
-   _flag_order, ["flag-then-sync"])
-check("...and the engine keeps stepping regardless", _p.step() == "stepped")
-check("the wrapper sets the one-shot flag BEFORE calling the sync",
+# ONE shared flag, or two hooks both fire and the sync runs twice.
+eq("the one-shot flag is shared, so only the FIRST entry point syncs",
+   _body6.count("_kvmgr_synced"), 2)
+check("the flag is set BEFORE the sync is attempted",
       _body6.index("_kvmgr_synced = True") < _body6.index("sync_knobs_to_workers(self)"),
       "otherwise a raising sync retries forever on the hot path")
 
-# and it must still be idempotent against a double plugin load
-check("the step wrap refuses to double-install",
-      "_kvmgr_sync" in _body6 and "return" in _body6.split("if getattr")[1][:80])
+# Behaviour, modelled: three wrapped entry points, one sync.
+_fired = []
+
+
+def _mk(name):
+    def original(self, *a, **kw):
+        return f"{name}-ran"
+    return original
+
+
+class _FakeCore:
+    pass
+
+
+def _oneshot(original):
+    def wrapper(self, *a, **kw):
+        if not getattr(self, "_kvmgr_synced", False):
+            self._kvmgr_synced = True
+            _fired.append("sync")
+        return original(self, *a, **kw)
+    return wrapper
+
+
+for n in ("step", "step_with_batch_queue", "_process_engine_step"):
+    setattr(_FakeCore, n, _oneshot(_mk(n)))
+_c = _FakeCore()
+eq("whichever entry point runs first still works", _c.step_with_batch_queue(),
+   "step_with_batch_queue-ran")
+_c.step()
+_c._process_engine_step()
+_c.step_with_batch_queue()
+eq("*** and the sync happens exactly ONCE across all of them ***",
+   _fired, ["sync"])
 
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
