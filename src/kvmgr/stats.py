@@ -283,11 +283,33 @@ def snapshot() -> dict[str, Any]:
             "blocked": {k: True for k in flags.BLOCKED},
         },
         "env_pinned": flags.audit_env(),
+        # The disk index's own counters. None when no disk spec is in force,
+        # which is a different answer from a spec reporting zeros -- and the
+        # reason this is here at all is that the first working restore hit
+        # 2,048 of 11,764 tokens and nothing on the box could say why.
+        "disk": _disk_snapshot(),
         "groups": [g.as_dict() for _, g in sorted(_groups.items())],
     }
 
 
 
+
+
+def _disk_snapshot():
+    """DiskPresenceManager's counters, best-effort.
+
+    Best-effort because this is an observability field: it must never be the
+    thing that takes the endpoint down, and a kvmgr without the disk module
+    installed is a legitimate state rather than an error.
+    """
+    try:
+        from kvmgr.diskspec import live_manager_snapshot
+    except Exception:
+        return None
+    try:
+        return live_manager_snapshot()
+    except Exception:
+        return {"error": "snapshot raised"}
 
 def _refuse_blocked() -> list[str]:
     """Validate every BLOCKED knob so a set-but-inert one is refused OUT LOUD.

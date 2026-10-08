@@ -82,6 +82,27 @@ DISK_FORMAT_ROOT = "dspark-kv-v1"
 # literals, because the store path is silently inert if they disagree.
 DSPARK_SPEC_NAME = "DSparkDiskOffloadingSpec"
 
+# The live manager, for the /kv endpoint. None until the connector builds one,
+# which only happens in the process that holds the scheduler -- the same one
+# that serves /kv, which is why this works without IPC.
+_LIVE_MANAGER: "DiskPresenceManager | None" = None
+
+
+def live_manager_snapshot() -> dict | None:
+    """The disk index's own counters, or None if no spec is in force.
+
+    None rather than an empty dict, so "no disk spec configured" and "a disk
+    spec reporting zeros" are different answers on the endpoint -- which is
+    this project's absent-is-not-zero rule applied to its own instrument.
+    """
+    m = _LIVE_MANAGER
+    if m is None:
+        return None
+    try:
+        return m.snapshot()
+    except Exception:
+        return {"error": "snapshot raised"}
+
 
 def _now() -> float:
     """Monotonic seconds. A helper so the manifest's time floor cannot be
@@ -481,6 +502,20 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
 
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
+            # *** AND PUBLISH IT, because its counters were unreachable. ***
+            # Measured 2026-10-08: the first working restore hit 2,048 of
+            # 11,764 tokens and the question "how many keys does the index
+            # actually hold" could not be answered from the box at all --
+            # `DiskPresenceManager.snapshot()` existed and nothing served it,
+            # so /kv's disk section was `{}`. The counters that would say
+            # whether the shortfall is in `stored`, in `lookup` or in the
+            # scheduler's contiguity rule are the whole diagnosis.
+            #
+            # A module global rather than a constructor argument: the spec is
+            # built by the factory from a config string, so there is no call
+            # site of ours to thread a reference through. Same shape as the
+            # manager list the coordinator wrap stashes.
+            global _LIVE_MANAGER
             self._manager = DiskPresenceManager(
                 self.file_mapper(), num_workers=self.world_size,
                 # Beside the KV it describes, so clearing the directory clears
@@ -488,6 +523,7 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
                 # cannot inherit a stale index.
                 manifest_path=os.path.join(self.root_dir, "presence.json"),
             )
+            _LIVE_MANAGER = self._manager
         return self._manager
 
     def get_handlers(

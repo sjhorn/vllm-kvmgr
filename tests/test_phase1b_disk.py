@@ -784,6 +784,78 @@ check("*** no bare `.numpy().data[:] =` survives in the CODE ***",
 check("...and _write_row goes through copy_into",
       "copy_into(self._staging[" in _dsrc)
 
+print("\n== (b12d) the disk index's counters must be REACHABLE from /kv ==")
+
+# *** THE FIRST WORKING RESTORE HIT 2,048 OF 11,764 TOKENS AND NOTHING ON THE
+# BOX COULD SAY WHY. *** `DiskPresenceManager.snapshot()` existed, with the
+# `stored` / `lookup` / `hit` counters that are the whole diagnosis, and no
+# endpoint served it -- /kv's disk section came back `{}`. An instrument that
+# exists and is unreachable is the same defect as a mechanism that runs and
+# reports nothing, which is this project's signature failure.
+from kvmgr import stats as _st  # noqa: E402
+
+_saved_live = diskspec._LIVE_MANAGER
+try:
+    diskspec._LIVE_MANAGER = None
+    eq("*** no disk spec in force reports None, NOT {} ***",
+       diskspec.live_manager_snapshot(), None)
+    eq("...and the endpoint carries that None through",
+       _st._disk_snapshot(), None)
+
+    mdir3 = tempfile.mkdtemp(prefix="kvlive-")
+
+    class FM3:
+        @staticmethod
+        def get_file_name(k):
+            return os.path.join(mdir3,
+                                base.get_offload_block_hash(k).hex()[:8] + ".bin")
+
+    live = diskspec.DiskPresenceManager(
+        FM3, num_workers=2, manifest_path=os.path.join(mdir3, "presence.json"))
+    diskspec._LIVE_MANAGER = live
+    snap = diskspec.live_manager_snapshot()
+    check("a live manager reports a dict", isinstance(snap, dict))
+    for field in ("lookup", "hit", "stored", "present", "restore_enabled"):
+        check(f"...carrying `{field}`, which is what answers the shortfall",
+              field in snap, sorted(snap))
+    eq("a fresh index holds nothing, and says so as a ZERO not an absence",
+       snap["present"], 0)
+
+    # The counters must MOVE, or the field is decoration.
+    kk = []
+    for i in range(3):
+        k = K(bytes([91, 0, 0, i]) * 8, 0)
+        open(FM3.get_file_name(k), "wb").write(b"x")
+        kk.append(k)
+    live.complete_store(kk, base.ReqContext(req_id="rq"))
+    eq("...`present` follows a store",
+       diskspec.live_manager_snapshot()["present"], 3)
+    live.lookup(kk[0], base.ReqContext(req_id="rq"))
+    s2 = diskspec.live_manager_snapshot()
+    check("...and `lookup` counts, so a miss is distinguishable from no call",
+          s2["lookup"] >= 1)
+
+    # And it must never be the thing that breaks the endpoint.
+    class _Boom:
+        def snapshot(self):
+            raise RuntimeError("boom")
+
+    diskspec._LIVE_MANAGER = _Boom()
+    eq("*** a raising snapshot degrades, it does not take /kv down ***",
+       diskspec.live_manager_snapshot(), {"error": "snapshot raised"})
+    # And the stash itself: get_manager needs a whole spec to construct, so the
+    # wiring is asserted on the SOURCE. Without this line the counters above are
+    # all reachable in a test and permanently None on the box -- a guard that
+    # passes offline and fails live is the shape the fixture lesson is about.
+    _sp = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                            "diskspec.py")).read()
+    check("*** get_manager PUBLISHES the instance, or /kv stays None on the box ***",
+          "_LIVE_MANAGER = self._manager" in _sp
+          and "global _LIVE_MANAGER" in _sp,
+          "the global must be declared AND assigned")
+finally:
+    diskspec._LIVE_MANAGER = _saved_live
+
 print("\n== (b13) the manifest must flush on TIME too, or a short session is lost ==")
 
 # *** THE LIVE SHAPE, 2026-10-08. *** A run stored 1,052 new .bin files -- about
