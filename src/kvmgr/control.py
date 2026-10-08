@@ -200,6 +200,58 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
 )
 
 
+# *** AND CLASS ATTRIBUTES ARE A SECOND KIND OF RELOAD CASUALTY. ***
+# `_PRESERVE` above covers module globals. These live on a CLASS, and a reload
+# creates a NEW class object, so they vanish just as silently -- measured live
+# 2026-10-08, when a reload left `all_managers` unset and the next GPU cache
+# drop logged "no manager list stashed, so only THIS group can be released" and
+# released 1 of 5. The drop still said `reset OK` because the pool happened to
+# be empty, so a broken lever reported success.
+#
+# They are stamped by the coordinator wrap in register.py, which runs ONCE at
+# boot -- so nothing re-derives them and a reload is the only way to lose them.
+_PRESERVE_CLASS: tuple[tuple[str, str, str, str], ...] = (
+    ("kvmgr.manager", "DSparkMLAAttentionManager", "all_managers",
+     "every group's manager -- without it the GPU cache drop releases 1 of 5"),
+    ("kvmgr.manager", "DSparkMLAAttentionManager", "group_count",
+     "the real group count from the KVCacheConfig"),
+    ("kvmgr.manager", "DSparkMLAAttentionManager", "group_block_sizes",
+     "per-group block sizes, which by_need sizes caps from"),
+    ("kvmgr.manager", "DSparkMLAAttentionManager", "group_sliding_windows",
+     "which groups are windowed -- the by_need discriminator"),
+)
+
+
+def _snapshot_class_state() -> tuple[dict, list[str]]:
+    """Grab the class attributes in `_PRESERVE_CLASS` before the reload."""
+    import importlib as _il
+    saved, errs = {}, []
+    for mod, cls, attr, _why in _PRESERVE_CLASS:
+        try:
+            k = getattr(_il.import_module(mod), cls, None)
+            if k is not None and hasattr(k, attr):
+                saved[(mod, cls, attr)] = getattr(k, attr)
+        except Exception as exc:
+            errs.append("snapshot %s.%s.%s: %r" % (mod, cls, attr, exc))
+    return saved, errs
+
+
+def _restore_class_state(saved: dict) -> tuple[list[str], list[str]]:
+    import importlib as _il
+    done, errs = [], []
+    for (mod, cls, attr), val in saved.items():
+        try:
+            k = getattr(_il.import_module(mod), cls, None)
+            if k is None:
+                errs.append("restore %s.%s: class is gone" % (mod, cls))
+                continue
+            setattr(k, attr, val)
+            done.append("%s.%s" % (cls, attr))
+        except Exception as exc:
+            errs.append("restore %s.%s.%s: %r" % (mod, cls, attr, exc))
+    return done, errs
+
+
 def _snapshot_state() -> tuple[dict, list[str]]:
     """Grab everything in `_PRESERVE` before the reload wipes it."""
     import importlib as _il
@@ -343,6 +395,8 @@ def reload_modules() -> dict:
     # enumerate them here.
     saved_state, _serrs = _snapshot_state()
     report["errors"].extend(_serrs)
+    saved_cls, _cerrs = _snapshot_class_state()
+    report["errors"].extend(_cerrs)
 
     # Order matters: leaves before the modules that import them, so a reloaded
     # parent picks up the reloaded child rather than the stale one it holds.
@@ -376,6 +430,9 @@ def reload_modules() -> dict:
     _restored, _rerrs = _restore_state(saved_state)
     report["errors"].extend(_rerrs)
     report["state_restored"] = _restored
+    _crestored, _crerrs = _restore_class_state(saved_cls)
+    report["errors"].extend(_crerrs)
+    report["class_state_restored"] = _crestored
     report["overrides_restored"] = sorted(saved_state.get(
         ("kvmgr.flags", "_OVERRIDE"), {}))
     report["found"] = {k: len(v) for k, v in targets.items()}

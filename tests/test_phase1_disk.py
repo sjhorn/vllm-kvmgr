@@ -337,6 +337,65 @@ eq("rank 1's path differs only in the rank segment",
    fm1.get_file_name(k1).replace("_r1", "_rX"), n1.replace("_r0", "_rX"))
 
 print()
+print("== (1z) A REBOUND INSTANCE: a reload never runs __init__ ==")
+# *** THIS EXACT GAP CRASHED THE ENGINE ON 2026-10-08. ***
+#
+#   AttributeError: 'DiskPresenceManager' object has no attribute '_gcounts'
+#       in prepare_store  ->  fatal to the scheduler
+#
+# `POST /kv/reload` re-points LIVE objects with `obj.__class__ = new`. The
+# instance therefore gets every new METHOD and never the new `__init__`, so any
+# attribute introduced alongside a method is absent on exactly the objects that
+# matter -- the ones already serving. Adding per-group counters created
+# `_gcounts` in __init__ and read it in prepare_store, and the live manager had
+# the reader without the attribute.
+#
+# The property, stated so it survives the next instrumentation attribute:
+# EVERY ATTRIBUTE ADDED FOR OBSERVABILITY MUST BE OPTIONAL. The data-path
+# attributes (_present, _mapper) are legitimately required -- a manager without
+# them is broken, not degraded -- so they are not in this set.
+_OPTIONAL_ATTRS = ("_gcounts",)
+
+for _attr in _OPTIONAL_ATTRS:
+    m_rb = diskspec.DiskPresenceManager(sp.file_mapper(), num_workers=WORLD)
+    check(f"{_attr} is created by __init__ (so a FRESH instance has it)",
+          hasattr(m_rb, _attr))
+    delattr(m_rb, _attr)          # <- precisely what a rebind leaves behind
+    _ok, _why = True, ""
+    try:
+        m_rb.prepare_store([k1, k2], ctx)
+        m_rb.complete_store([k1, k2], ctx)
+        m_rb.lookup(k1, ctx)
+        _snap = m_rb.snapshot()
+    except Exception as _exc:
+        _ok, _why = False, repr(_exc)
+    check(f"*** a REBOUND manager missing {_attr} still serves the data path "
+          f"*** {_why}", _ok)
+    check(f"...and snapshot() still answers, with by_group present",
+          _ok and "by_group" in _snap)
+    check(f"...and the counter re-initialises itself rather than staying gone",
+          _ok and hasattr(m_rb, _attr))
+
+# The lint that generalises: every read of an optional attribute must go
+# through getattr, because a direct `self._x` is what fails on a rebind. A
+# test of one attribute would pass again while the next one broke the engine.
+_dsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                          "diskspec.py")).read()
+for _attr in _OPTIONAL_ATTRS:
+    # Exclude the declaration itself. It is an ANNOTATED assignment
+    # (`self._gcounts: dict[...] = {}`), so a plain `self._x =` test misses it
+    # and the lint failed for the wrong reason on its first run -- which is its
+    # own lesson in this repo and worth not repeating silently.
+    def _is_decl(line, attr):
+        t = line.strip()
+        return t.startswith(f"self.{attr} =") or t.startswith(f"self.{attr}:")
+
+    _direct = [ln.strip() for ln in _dsrc.splitlines()
+               if f"self.{_attr}" in ln and "getattr" not in ln
+               and not ln.strip().startswith("#")
+               and not _is_decl(ln, _attr)]
+    eq(f"every read of self.{_attr} outside __init__ uses getattr", _direct, [])
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()
 if FAIL:

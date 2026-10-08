@@ -419,17 +419,42 @@ class DiskPresenceManager(OffloadingManager):
         under -1 and named as such, which is a visible absence rather than a
         silent miscount.
         """
+        # *** THIS CRASHED THE ENGINE, AND THE DOCSTRING ABOVE PROMISED IT
+        # *** COULD NOT. *** Measured live 2026-10-08:
+        #
+        #   AttributeError: 'DiskPresenceManager' object has no attribute
+        #   '_gcounts'   <- in prepare_store, i.e. FATAL to the scheduler
+        #
+        # A RELOAD NEVER RUNS A CONSTRUCTOR. `rebind` re-points a live object
+        # with `obj.__class__ = new`, so the instance gets the new METHODS and
+        # never the new `__init__`. `_gcounts` is created in __init__, so the
+        # live manager had a method that read an attribute it could not have.
+        # I had written that exact lesson one commit earlier -- for a module
+        # global and for the watchdog -- and did not carry it to the instance
+        # attribute my own new code depended on.
+        #
+        # So: lazily initialise on the instance (NOT a class-level dict, which
+        # every instance would then share), and wrap the WHOLE body. The
+        # original guarded the import and the group extraction and left the one
+        # line that actually failed outside -- a partial guard on a path where
+        # the promise was total.
         try:
             from vllm.v1.kv_offload.base import get_offload_group_idx
+
+            gc = getattr(self, "_gcounts", None)
+            if gc is None:
+                gc = {}
+                self._gcounts = gc
+            bucket = gc.setdefault(what, {})
+            for k in keys:
+                try:
+                    g = get_offload_group_idx(k)
+                except Exception:
+                    g = -1
+                bucket[g] = bucket.get(g, 0) + 1
         except Exception:
+            # Never into the caller. A lost count is a lost count.
             return
-        bucket = self._gcounts.setdefault(what, {})
-        for k in keys:
-            try:
-                g = get_offload_group_idx(k)
-            except Exception:
-                g = -1
-            bucket[g] = bucket.get(g, 0) + 1
 
     # -- ours, for the /kv endpoint ---------------------------------------
     def snapshot(self) -> dict[str, Any]:
@@ -439,9 +464,11 @@ class DiskPresenceManager(OffloadingManager):
         # confirmed. offered >> completed means jobs are not finishing;
         # offered small means upstream is rationing; to_store == offered
         # forever means the present filter never matches.
+        # getattr, for the same rebind reason as _count_groups: a reloaded
+        # class on a live instance has no __init__-assigned attributes.
         by_group = {
             what: {str(g): n for g, n in sorted(d.items())}
-            for what, d in sorted(self._gcounts.items())
+            for what, d in sorted(getattr(self, "_gcounts", {}).items())
         }
         return dict(self._stats, present=len(self._present),
                     num_workers=self._num_workers,
