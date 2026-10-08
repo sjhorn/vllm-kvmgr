@@ -132,8 +132,8 @@ def check_pairing(keys: "Sequence[bytes]", block_ids: "Sequence[int]",
 
 
 def check_bounds(block_ids: "Sequence[int]", slots: "Sequence[int]",
-                 gpu_rows: int, staging_rows: int, group_sizes: "Sequence[int]",
-                 direction: str) -> str | None:
+                 gpu_rows: "int | None", staging_rows: "int | None",
+                 group_sizes: "Sequence[int]", direction: str) -> str | None:
     """Refuse a transfer whose indices are out of range. PURE. Returns a reason
     or None.
 
@@ -161,6 +161,18 @@ def check_bounds(block_ids: "Sequence[int]", slots: "Sequence[int]",
     the cause and the Xid is somewhere else -- which is itself worth knowing and
     is why the counter is reported rather than only logged.
     """
+    # *** A BOUND OF None MEANS "CANNOT CHECK", NOT "EVERYTHING IS OUT OF
+    # *** BOUNDS". *** This killed the engine on 2026-10-08. `_bounds()`
+    # returned 0 rows for a rebound load handler, and 0 made every legitimate
+    # block id "outside [0, 0)", so the guard refused a valid restore round,
+    # failed the job and took the worker's exception path with it:
+    #
+    #   REFUSING a restore round -- staging->GPU: GPU block id 21586 is
+    #   outside [0, 0)
+    #
+    # ABSENT IS NOT ZERO, inside the guard written to prevent a crash. The
+    # length and group-sum checks need no bounds at all, so they still run;
+    # only the range checks are skipped, and the caller logs that once.
     if len(block_ids) != len(slots):
         return ("%s: %d block ids against %d staging slots -- the pairing is "
                 "positional, so a length mismatch would silently transfer the "
@@ -170,6 +182,8 @@ def check_bounds(block_ids: "Sequence[int]", slots: "Sequence[int]",
         return ("%s: group_sizes sum to %d but there are %d block ids; the "
                 "inner handler splits one flat array by these counts"
                 % (direction, tot, len(block_ids)))
+    if gpu_rows is None or staging_rows is None:
+        return None          # cannot check the ranges; the shape checks passed
     for b in block_ids:
         if not (0 <= b < gpu_rows):
             return ("%s: GPU block id %d is outside [0, %d) -- a copy kernel "
@@ -1049,16 +1063,38 @@ class DiskStoreHandler:
         got = getattr(self, "_bounds_cache", None)
         if got is not None:
             return got
+
         def _rows(seq):
+            """Row count, or None when it cannot be determined. NEVER 0 -- a 0
+            bound makes every index illegal, which is how this guard crashed
+            the engine instead of preventing a crash."""
             try:
-                return min(int(t.shape[0]) for t in seq)
+                n = min(int(t.shape[0]) for t in seq)
+                return n if n > 0 else None
             except Exception:
-                return 0
+                return None
+
+        # A rebound handler has only what its OLD __init__ set, so try every
+        # route to the tensors before giving up: our own attribute, the inner
+        # handler's, and the store handler we share staging with.
         gt = (getattr(self, "_gpu_tensors", None)
-              or getattr(getattr(self, "_inner", None), "gpu_tensors", None)
-              or [])
-        got = (_rows(gt), _rows(getattr(self, "_staging", None) or []))
-        self._bounds_cache = got
+              or getattr(getattr(self, "_inner", None), "gpu_tensors", None))
+        if not gt:
+            for h in list(_LIVE_HANDLERS):
+                cand = getattr(h, "_gpu_tensors", None)
+                if cand:
+                    gt = cand
+                    break
+        got = (_rows(gt or []), _rows(getattr(self, "_staging", None) or []))
+        if got[0] is None or got[1] is None:
+            logger.warning(
+                "kvmgr: transfer bounds UNKNOWN (gpu_rows=%s staging_rows=%s) "
+                "-- the range check is SKIPPED for this handler, which is the "
+                "safe direction: a bound of 0 would refuse every valid index "
+                "and that is how this guard once killed the engine. Shape and "
+                "pairing checks still run.", got[0], got[1])
+        else:
+            self._bounds_cache = got      # only cache a usable answer
         return got
 
     def _ledger_snapshot(self) -> dict:

@@ -1644,6 +1644,64 @@ check("...and names the direction, because the two are different code paths",
       "GPU->staging" in (cb([100], [0], 100, 8, [1], "GPU->staging") or ""))
 eq("an empty round is not an error", cb([], [], 100, 8, [0], "x"), None)
 
+# *** AND THE GUARD ITSELF CRASHED THE ENGINE, 2026-10-08. *** `_bounds()`
+# returned 0 rows for a REBOUND load handler -- its old __init__ never set
+# `_gpu_tensors`, which only the new one does -- and 0 made every legitimate
+# block id "outside [0, 0)":
+#
+#   REFUSING a restore round -- staging->GPU: GPU block id 21586 is
+#   outside [0, 0)
+#
+# It refused a valid restore, failed the job, and took the worker's exception
+# path with it. ABSENT IS NOT ZERO, inside the guard written to prevent a
+# crash. So an unknown bound is None and SKIPS the range check -- the safe
+# direction -- while the shape checks, which need no bounds, still run.
+# Called through a wrapper: with the None-skip removed these raise TypeError,
+# and an escaping exception aborts the file instead of reporting a named
+# failure. A test that fails for the wrong reason is as unhelpful as one that
+# passes for it -- the same correction this suite needed for the arrival
+# counter.
+def _cb_safe(*a):
+    try:
+        return cb(*a)
+    except Exception as exc:
+        return "RAISED: %r" % (exc,)
+
+eq("*** an unknown GPU bound SKIPS the range check, it does not refuse ***",
+   _cb_safe([21586], [0], None, 8, [1], "staging->GPU"), None)
+eq("...same for an unknown staging bound",
+   _cb_safe([5], [999], 100, None, [1], "x"), None)
+_shape1 = _cb_safe([1, 2], [0], None, None, [2], "x")
+check("*** but a SHAPE error is still caught with bounds unknown -- those "
+      "checks need no bounds at all ***",
+      _shape1 is not None and not str(_shape1).startswith("RAISED"))
+_shape2 = _cb_safe([1, 2, 3], [0, 1, 2], None, None, [2], "x")
+check("...including group_sizes that do not sum",
+      _shape2 is not None and not str(_shape2).startswith("RAISED"))
+
+# and _bounds must never report 0, because 0 is what did the damage
+class _NoTensors:
+    _staging = []
+    _bounds = diskio.DiskStoreHandler._bounds
+
+
+_nb = _NoTensors()._bounds()
+check("*** _bounds reports None, NEVER 0, when it cannot tell ***",
+      _nb[0] is not 0 and _nb[1] is not 0 and 0 not in _nb)
+
+
+class _Tiny:
+    class _T:
+        shape = (7,)
+    _staging = [_T()]
+    _gpu_tensors = [_T()]
+    _bounds = diskio.DiskStoreHandler._bounds
+
+
+eq("...and a real row count is reported as itself", _Tiny()._bounds(), (7, 7))
+check("...and an unusable answer is NOT cached, so a later call can succeed",
+      getattr(_NoTensors(), "_bounds_cache", None) is None)
+
 # *** AND IT MUST REFUSE RATHER THAN SUBMIT. *** A guard that logs and then
 # hands the kernel the same indices is worse than none: it would read as
 # diagnosed while still faulting.
