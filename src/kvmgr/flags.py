@@ -238,6 +238,116 @@ def _validate(name: str, value: Any) -> Any:
     return value
 
 
+# ---------------------------------------------------------------------------
+# The IN-MEMORY override, which is Stage 6's whole point.
+#
+# *** A HOT KNOB MUST NOT DEPEND ON DISK OR CONTAINER INJECTION. *** Everything
+# above reaches a knob through `/var/tmp/vllm-kv-flags/flags.json`, which works
+# and is why every policy knob is hot today -- but as the ONLY way in it has
+# four defects: it is a bind mount, so the control plane depends on the
+# container spec; it is PER NODE, so writing it on the head does not change the
+# worker; it returns no acknowledgement, so "did it take?" is answered by
+# grepping a container log; and it is not atomic, because three processes each
+# re-stat it on their own 1s TTL.
+#
+# So an explicit set lands HERE, in memory, in whichever process was told --
+# and the control plane fans it out to the others over the engine's own RPC.
+# The file survives as the BOOT-TIME DEFAULT, which is a real job: a process
+# restart has to start somewhere.
+_OVERRIDE: dict[str, Any] = {}
+
+
+def _coerce(name: str, value: Any) -> Any:
+    """Coerce an HTTP-supplied value to the knob's declared type.
+
+    HTTP and JSON hand us strings, and `bool("false")` is **True** -- which
+    would make `?on=false` turn a thing ON. That one is not a hypothetical: it
+    is the single most likely way this plane could do the opposite of what it
+    was asked, so booleans are parsed from a word list and anything else is
+    refused by name rather than coerced by truthiness.
+    """
+    want = type(DEFAULTS[name])
+    if want is bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        t = str(value).strip().lower()
+        if t in ("1", "true", "yes", "on"):
+            return True
+        if t in ("0", "false", "no", "off"):
+            return False
+        raise ValueError(
+            f"kvmgr: {name}={value!r} is not a boolean. Use true/false, 1/0, "
+            f"yes/no or on/off -- NOT coerced by truthiness, because "
+            f"bool('false') is True and that would invert the request.")
+    if want is int:
+        return int(value)
+    if want is float:
+        return float(value)
+    return str(value)
+
+
+def set_override(name: str, value: Any) -> dict:
+    """Set a knob in THIS process, above the env and the file. Returns the act."""
+    if name not in DEFAULTS:
+        raise KeyError(
+            f"kvmgr: unknown knob {name!r}. Known: {sorted(DEFAULTS)}")
+    before = raw(name)
+    _OVERRIDE[name] = _coerce(name, value)
+    after = raw(name)
+    logger.info(
+        "kvmgr: knob %s set to %r by the control plane (was %r, now reads %r; "
+        "source=override, which outranks the env pin and the file)",
+        name, _OVERRIDE[name], before, after)
+    return {"name": name, "set_to": _OVERRIDE[name], "was": before,
+            "now": after, "source": "override"}
+
+
+def clear_override(name: str | None = None) -> list[str]:
+    """Drop one override, or all of them, so the file/env governs again."""
+    if name is None:
+        dropped = sorted(_OVERRIDE)
+        _OVERRIDE.clear()
+    else:
+        if name not in DEFAULTS:
+            # The SAME refusal as set_override's. Two spellings of one error is
+            # how a caller learns the knob list from one entry point and not
+            # the other, and a refusal is only useful if it is actionable.
+            raise KeyError(
+                f"kvmgr: unknown knob {name!r}. Known: {sorted(DEFAULTS)}")
+        dropped = [name] if _OVERRIDE.pop(name, None) is not None else []
+    if dropped:
+        logger.info("kvmgr: override(s) cleared, file/env governs again: %s",
+                    dropped)
+    return dropped
+
+
+def source_of(name: str) -> str:
+    """Which source is winning for this knob: override | env | file | default.
+
+    Reported beside every value, because the defect this plane exists to fix is
+    a knob that was set and did nothing -- and the only honest answer to "did
+    it take?" names the source that won rather than echoing the value back.
+    """
+    if name in _OVERRIDE:
+        return "override"
+    env_name = (LEGACY_FRACTION_ENV if name == "protected_fraction"
+                else "VLLM_" + name.upper())
+    if (os.environ.get(env_name) or "").strip():
+        return "env"
+    try:
+        # patch6's own reader, cached on its 1s TTL -- not a second parse of the
+        # same file, which is how two readers of one knob come to disagree.
+        from vllm.v1.core.single_type_kv_cache_manager import _flags
+
+        if name in (_flags() or {}):
+            return "file"
+    except Exception:
+        pass
+    return "default"
+
+
 def raw(name: str) -> Any:
     """The value, with no logging and no validation. Hot-path safe."""
     if name not in DEFAULTS:
@@ -245,6 +355,15 @@ def raw(name: str) -> Any:
             f"kvmgr: unknown knob {name!r}. Add it to DEFAULTS -- a knob that is "
             "not in the table is a knob no hot-config test covers."
         )
+    # *** THE OVERRIDE OUTRANKS EVERYTHING, INCLUDING THE ENV PIN. *** That is
+    # deliberate and it is the reversal Stage 6 is for: an env pin is a decision
+    # taken at boot, and a POST is a decision taken NOW by somebody watching the
+    # engine. The old precedence made `.env.dspark` able to freeze a knob with
+    # no way to thaw it short of a restart, which is the trap `audit_env()`
+    # exists to make visible -- visible, but not fixable. This fixes it, and
+    # `source_of()` keeps it honest by naming the winner.
+    if name in _OVERRIDE:
+        return _OVERRIDE[name]
     if name == "protected_fraction":
         # ONE DEFINITION, patch6's. Re-implementing the precedence here is how
         # two readers of one knob end up disagreeing -- and this knob has three
@@ -354,5 +473,9 @@ def log_env_audit() -> None:
 
 
 def reset_for_tests() -> None:
+    # Overrides are process-global, so a test that sets one and does not
+    # clear it leaks into every later test in the same run -- which is the
+    # quietest way for a suite to start passing for the wrong reason.
+    _OVERRIDE.clear()
     _last_seen.clear()
     _announced.clear()
