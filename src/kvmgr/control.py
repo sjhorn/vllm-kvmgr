@@ -202,6 +202,9 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     # re-derives it. Same shape as all_managers, one layer out.
     ("kvmgr.diskspec", "_LIVE_OFFLOAD_SCHED",
      "upstream's offload scheduler -- the open job set behind the fence"),
+    ("kvmgr.diskspec", "_SCHED_FOUND_BY", "how that handle was obtained"),
+    ("kvmgr.diskio", "_LIVE_CONN_WORKER",
+     "upstream's connector worker -- the unshipped completion queue"),
 )
 
 

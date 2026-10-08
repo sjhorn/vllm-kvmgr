@@ -1340,6 +1340,70 @@ eq("three _start_watchdog calls arm exactly ONE watchdog", len(_made), 1)
 eq("...and it is named, so it is identifiable in a stack dump",
    _made, ["kvmgr-watchdog"])
 
+# -- (b17) the worker's UNSHIPPED completion queue -------------------------
+#
+# The scheduler holds 123 of 133 jobs open with pending_count=2 on 116 -- so
+# neither rank's completion arrived -- while our handlers report jobs_open=0.
+# Upstream marks each completion on the worker and `build_connector_worker_meta`
+# ships them AND RESETS the queue; if that stops being called, the queue climbs
+# forever and the scheduler never learns. This exposes its size, which is the
+# measurement that confirms or kills that hypothesis.
+del diskio._LIVE_CONN_WORKER[:]
+_s = diskio.conn_worker_snapshot()
+eq("*** uncaptured is an ABSENCE, not an empty queue ***",
+   _s.get("available"), False)
+check("...and unshipped_completions is absent, not 0",
+      "unshipped_completions" not in _s)
+
+
+class _Meta:
+    def __init__(self, n):
+        self.completed_jobs = {i: 1 for i in range(n)}
+
+
+class OffloadingConnectorWorker:          # the name is what is matched
+    def __init__(self, n):
+        self._connector_worker_meta = _Meta(n)
+        self._unsubmitted_store_jobs = [1, 2, 3]
+        self._load_jobs = {7: "r1"}
+
+    def call_handler(self, fn):
+        return fn()
+
+
+_cw = OffloadingConnectorWorker(41)
+diskio._LIVE_CONN_WORKER.append(_cw)
+_s = diskio.conn_worker_snapshot()
+eq("the unshipped queue is reported", _s.get("unshipped_completions"), 41)
+eq("so are the deferred store jobs", _s.get("unsubmitted_store_jobs"), 3)
+eq("and open load jobs", _s.get("load_jobs_open"), 1)
+
+# capture off the call stack, the same route as the scheduler handle
+del diskio._LIVE_CONN_WORKER[:]
+_cw2 = OffloadingConnectorWorker(5)
+_cw2.call_handler(lambda: diskio.capture_conn_worker_from_caller())
+eq("*** captured from the call stack ***",
+   diskio._LIVE_CONN_WORKER and diskio._LIVE_CONN_WORKER[0] is _cw2, True)
+_cw3 = OffloadingConnectorWorker(9)
+_cw3.call_handler(lambda: diskio.capture_conn_worker_from_caller())
+eq("...and the handle is STABLE, not replaced by a later caller",
+   diskio._LIVE_CONN_WORKER[0] is _cw2, True)
+
+
+class _Hostile:
+    @property
+    def _connector_worker_meta(self):
+        raise RuntimeError("upstream moved it")
+
+
+del diskio._LIVE_CONN_WORKER[:]
+diskio._LIVE_CONN_WORKER.append(_Hostile())
+_s = diskio.conn_worker_snapshot()
+eq("an upstream change is an absence, never an exception",
+   _s.get("available"), False)
+check("...and still never a zero", "unshipped_completions" not in _s)
+del diskio._LIVE_CONN_WORKER[:]
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
     for f in FAIL:

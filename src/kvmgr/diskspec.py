@@ -101,6 +101,13 @@ _LIVE_MANAGER: "DiskPresenceManager | None" = None
 #   all 2  -> neither arrived
 #   mixed  -> it is per-job, not per-rank
 _LIVE_OFFLOAD_SCHED: list = []
+# How the handle was obtained. *** THE FIRST VERSION OF THIS LIED. *** It
+# reported "hook" vs "gc-scan" by testing whether __init__ was wrapped, which
+# is a different question from how the object was actually found -- a
+# call-stack capture was labelled "gc-scan", and I nearly concluded from that
+# label that gc.freeze() does not hide boot-time objects after all. A field
+# that answers a different question than its name is worse than no field.
+_SCHED_FOUND_BY: list = []
 
 
 SCHED_CLS_NAME = "OffloadingConnectorScheduler"
@@ -118,9 +125,15 @@ def capture_offload_sched_from_caller(depth: int = 5) -> bool:
     is implausibly few for an engine core and is the tell -- those 17,003 are
     only the POST-freeze allocations.
     
-    The general rule, worth more than this function: **in the engine core, a gc
-    scan can only ever see objects created after boot.** Any discovery of a
-    boot-time object has to come from a hook or from the call stack.
+    *** THE SCOPE OF THAT CLAIM, STATED HONESTLY. *** `EngineCore.__init__`
+    does call `freeze_gc_heap()`, and a frozen object is not returned by
+    `gc.get_objects()`. But `core.py:604` UNDOES that freeze later, so whether a
+    boot-time object is visible to a scan depends on when you look -- and a
+    scan did eventually find this one. So the rule is not "a scan can never
+    see it"; it is that **a gc scan is UNRELIABLE for a boot-time object in
+    the engine core, in a way that depends on timing you do not control**.
+    The call-stack capture is exact and needs no such reasoning, which is why
+    it is the primary route rather than the fallback.
     
     So: the connector scheduler is the thing that CALLS us. `prepare_store` and
     `lookup` are invoked from its own methods, so its `self` is sitting in a
@@ -202,6 +215,8 @@ def _discover_offload_sched():
                 if isinstance(obj, cls):
                     del _LIVE_OFFLOAD_SCHED[:]
                     _LIVE_OFFLOAD_SCHED.append(obj)
+                    del _SCHED_FOUND_BY[:]
+                    _SCHED_FOUND_BY.append("gc-scan")
                     return obj, "gc-scan"
             except Exception:
                 continue
@@ -264,8 +279,10 @@ def offload_sched_snapshot() -> dict:
             oldest = jid if oldest is None else min(oldest, jid)
         out = {
             "available": True,
-            "found_by": "hook" if getattr(
-                type(cs).__init__, "_kvmgr_wrapped", False) else "gc-scan",
+            "found_by": (_SCHED_FOUND_BY[-1] if _SCHED_FOUND_BY
+                         else "hook-or-unknown"),
+            "init_wrapped": bool(getattr(
+                type(cs).__init__, "_kvmgr_wrapped", False)),
             "jobs_open": len(jobs),
             "stores_open": stores,
             "loads_open": loads,

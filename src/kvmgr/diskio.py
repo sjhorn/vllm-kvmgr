@@ -381,6 +381,84 @@ def write_geometry(kv_caches: Any, spec: Any, out_dir: str) -> str | None:
 # turned out to be unreachable from the box.
 _LIVE_HANDLERS: list = []
 
+# -- the WORKER-side report queue ----------------------------------------
+#
+# *** THE OTHER HALF OF THE COMPLETION MYSTERY. *** Measured 2026-10-08: the
+# scheduler holds 123 of 133 jobs open with `pending_count: 2` on 116 of them --
+# i.e. NEITHER rank's completion ever arrived -- while our handlers report
+# `jobs_open: 0`, having finished and forgotten all of them. So the loss is
+# between our `get_finished()` returning a TransferResult and the scheduler
+# processing it.
+#
+# Upstream's chain is: our handler -> OffloadingWorker.get_finished() ->
+# OffloadingConnectorWorker.get_finished(), which calls
+# `self._connector_worker_meta.mark_completed(job_id)`; then
+# `build_connector_worker_meta()` ships that meta to the scheduler AND RESETS
+# it. If that build call stops happening, `completed_jobs` accumulates on the
+# worker forever and the scheduler never learns -- which is precisely the
+# pending_count=2 signature.
+#
+# So expose the size of that queue. A number that climbs and never falls is the
+# proof; one that stays near zero means the loss is further along and this
+# hypothesis is dead. Captured off the call stack for the same reason as the
+# scheduler-side handle: a hook needs a boot and this needs to work now.
+_LIVE_CONN_WORKER: list = []
+CONN_WORKER_CLS_NAME = "OffloadingConnectorWorker"
+
+
+def capture_conn_worker_from_caller(depth: int = 6) -> bool:
+    """Grab the OffloadingConnectorWorker off the call stack. One-shot."""
+    if _LIVE_CONN_WORKER:
+        return True
+    f = None
+    try:
+        import inspect
+        f = inspect.currentframe()
+        for _ in range(depth):
+            if f is None:
+                break
+            f = f.f_back
+            if f is None:
+                break
+            cand = f.f_locals.get("self")
+            if cand is not None and type(cand).__name__ == CONN_WORKER_CLS_NAME:
+                del _LIVE_CONN_WORKER[:]
+                _LIVE_CONN_WORKER.append(cand)
+                return True
+    except Exception:
+        return False
+    finally:
+        del f
+    return False
+
+
+def conn_worker_snapshot() -> dict:
+    """Size of the worker's unshipped completion queue. Absent is not zero."""
+    cw = _LIVE_CONN_WORKER[-1] if _LIVE_CONN_WORKER else None
+    if cw is None:
+        return {"available": False,
+                "why": "OffloadingConnectorWorker not captured yet -- an "
+                       "ABSENCE, not an empty report queue"}
+    try:
+        meta = getattr(cw, "_connector_worker_meta", None)
+        jobs = getattr(meta, "completed_jobs", None)
+        if jobs is None:
+            return {"available": False,
+                    "why": "upstream has no _connector_worker_meta."
+                           "completed_jobs"}
+        return {
+            "available": True,
+            # THE number: completions marked on this worker and not yet
+            # shipped to the scheduler. Climbing without falling == never
+            # shipped.
+            "unshipped_completions": len(jobs),
+            "unsubmitted_store_jobs": len(
+                getattr(cw, "_unsubmitted_store_jobs", ()) or ()),
+            "load_jobs_open": len(getattr(cw, "_load_jobs", {}) or {}),
+        }
+    except Exception as exc:
+        return {"available": False, "why": "reading upstream raised: %r" % (exc,)}
+
 # -- the stall watchdog ---------------------------------------------------
 #
 # *** WHY THIS EXISTS, AND IT IS A SPECIFIC TEN MINUTES WE WASTED. ***
@@ -861,6 +939,9 @@ class DiskStoreHandler:
     def get_finished(self) -> list:
         from vllm.v1.kv_offload.worker.worker import TransferResult
 
+        if not _LIVE_CONN_WORKER:
+            capture_conn_worker_from_caller()
+
         # 1. GPU -> staging completions become file writes.
         for res in self._inner.get_finished():
             ent = self._inner_to_job.pop(res.job_id, None)
@@ -1000,7 +1081,8 @@ class DiskStoreHandler:
     def snapshot(self) -> dict:
         return dict(self.stats, staging=self._pool.snapshot(),
                     group_file_sizes=self._sizes,
-                    jobs_open=len(self._jobs), writes_open=len(self._writing))
+                    jobs_open=len(self._jobs), writes_open=len(self._writing),
+                    conn_worker=conn_worker_snapshot())
 
 
 class DiskLoadHandler:
@@ -1124,6 +1206,9 @@ class DiskLoadHandler:
         from vllm.v1.kv_offload.base import GPULoadStoreSpec
         from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
         from vllm.v1.kv_offload.worker.worker import TransferResult
+
+        if not _LIVE_CONN_WORKER:
+            capture_conn_worker_from_caller()
 
         ngroups = len(self._refs)
         still = []
