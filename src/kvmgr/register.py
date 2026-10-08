@@ -88,6 +88,7 @@ def register() -> None:
     )
 
     _install_group_geometry_hook(DSparkMLAAttentionManager)
+    _install_offload_scheduler_hook()
 
     # Opt-in, and it logs nothing unless offload_allow_hybrid is set. Installed
     # from register() so it lands in every process that loads the plugin --
@@ -246,6 +247,63 @@ def _install_hang_dump() -> None:
         )
     except Exception:
         logger.exception("kvmgr: could not arm the hang dump (continuing)")
+
+def _install_offload_scheduler_hook() -> None:
+    """Publish upstream's OffloadingConnectorScheduler so /kv can read its jobs.
+
+    *** THE ONE NUMBER THAT WAS MISSING. *** The worker reports `jobs_open: 0`
+    while the scheduler can still be holding a hundred jobs, and the
+    scheduler's `self._jobs` is exactly what `jobs_to_flush` names -- so the
+    fence waits on jobs the worker has already finished and forgotten. Nothing
+    could see that: `jobs_to_flush` appeared only in a crash's dump_input, which
+    is a terrible place to learn it.
+
+    `complete_store` fires only when `pending_count` hits 0 and it starts at
+    `num_workers`, so BOTH ranks must report. A histogram of pending_count over
+    the residual jobs distinguishes "one rank's completion is lost" from
+    "neither arrived" in a single reading, which is why it is worth a hook.
+
+    Wrapping __init__ rather than hunting the object: same pattern as the
+    coordinator wrap below, and it is the only place guaranteed to run before
+    any job exists. Best-effort throughout -- an instrument that can break a
+    boot is worse than no instrument, and this one reaches into another
+    project's private state.
+    """
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+            scheduler as _osched,
+        )
+    except Exception:
+        logger.info("kvmgr: no OffloadingConnectorScheduler to hook "
+                    "(upstream layout differs); /kv will report sched "
+                    "unavailable rather than zero")
+        return
+    try:
+        cls = _osched.OffloadingConnectorScheduler
+        if getattr(cls.__init__, "_kvmgr_wrapped", False):
+            return
+        original = cls.__init__
+
+        def __init__(self, *a, **kw):
+            original(self, *a, **kw)
+            try:
+                from kvmgr import diskspec as _ds
+                # Mutate in place: a reload may already have handed the new
+                # module's list to somebody else.
+                del _ds._LIVE_OFFLOAD_SCHED[:]
+                _ds._LIVE_OFFLOAD_SCHED.append(self)
+                logger.info(
+                    "kvmgr: offload scheduler published -- /kv now reports its "
+                    "open job set and the pending_count histogram, which is "
+                    "what says whether a store completion never arrived")
+            except Exception:
+                logger.exception("kvmgr: could not publish the offload scheduler")
+
+        __init__._kvmgr_wrapped = True
+        cls.__init__ = __init__
+    except Exception:
+        logger.exception("kvmgr: could not hook the offload scheduler (continuing)")
+
 
 def _install_group_geometry_hook(manager_cls) -> None:
     """Stamp the real group count / block sizes from the KVCacheConfig."""

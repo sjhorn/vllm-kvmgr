@@ -197,6 +197,11 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     # instance of the reload-destroys-module-state family, and the first one
     # caught by remembering the table exists rather than by a live failure.
     ("kvmgr.diskio", "_watchdog_started", "the stall watchdog's one-shot flag"),
+    # Published by the __init__ wrap in register.py, which runs ONCE when the
+    # connector is built -- so a reload is the only way to lose it and nothing
+    # re-derives it. Same shape as all_managers, one layer out.
+    ("kvmgr.diskspec", "_LIVE_OFFLOAD_SCHED",
+     "upstream's offload scheduler -- the open job set behind the fence"),
 )
 
 

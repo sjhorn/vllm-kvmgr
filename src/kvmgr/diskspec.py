@@ -87,6 +87,116 @@ DSPARK_SPEC_NAME = "DSparkDiskOffloadingSpec"
 # that serves /kv, which is why this works without IPC.
 _LIVE_MANAGER: "DiskPresenceManager | None" = None
 
+# *** THE SCHEDULER-SIDE JOB SET, WHICH NOTHING COULD SEE. ***
+# The worker's own counters said `jobs_open: 0` while the scheduler was still
+# holding ~127 jobs -- and the scheduler's `self._jobs` is EXACTLY what
+# `jobs_to_flush` names, so the fence was waiting on jobs the worker had
+# already finished and forgotten. That asymmetry was invisible: the only time
+# `jobs_to_flush` ever appeared was in a crash's dump_input.
+#
+# `complete_store` fires only when `pending_count` reaches 0, and it starts at
+# `num_workers`, so BOTH ranks must report. The histogram of pending_count over
+# the residual jobs is therefore the whole diagnosis in one field:
+#   all 1  -> exactly one rank's completion never arrived
+#   all 2  -> neither arrived
+#   mixed  -> it is per-job, not per-rank
+_LIVE_OFFLOAD_SCHED: list = []
+
+
+def _discover_offload_sched():
+    """Find a live OffloadingConnectorScheduler by scanning gc. On demand only."""
+    try:
+        import gc
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+            scheduler as _osched,
+        )
+        cls = _osched.OffloadingConnectorScheduler
+    except Exception:
+        return None
+    try:
+        for obj in gc.get_objects():
+            try:
+                if isinstance(obj, cls):
+                    del _LIVE_OFFLOAD_SCHED[:]
+                    _LIVE_OFFLOAD_SCHED.append(obj)
+                    return obj
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def offload_sched_snapshot() -> dict:
+    """Read-only view of upstream's scheduler-side job bookkeeping.
+
+    Best-effort and defensive to the point of paranoia: this reaches into
+    another project's private attributes, so every one of them is read with
+    getattr and a default. An upstream rename must show up here as an absent
+    field, never as an exception on the scheduler's hot path -- and never as a
+    0, which would read as "no pending jobs" and is the one wrong answer.
+    """
+    out: dict = {}
+    try:
+        cs = _LIVE_OFFLOAD_SCHED[-1] if _LIVE_OFFLOAD_SCHED else None
+    except Exception:
+        cs = None
+    if cs is None:
+        # *** DISCOVER IT ON DEMAND, so this works on an engine that was
+        # *** ALREADY RUNNING. The hook wraps __init__, which runs when the
+        # connector is built -- i.e. at BOOT -- so a hot reload can never arm
+        # it and the diagnostic would cost a 4-minute restart plus a cold
+        # prefill to use once. That is exactly the cold-path habit Stage 6
+        # exists to remove.
+        #
+        # A gc scan is expensive, which is fine HERE and nowhere else: this is
+        # an on-demand endpoint, never the store path. The result is cached in
+        # the same list the hook uses, so the scan happens at most once per
+        # process. `found_by` says which route supplied it, because "the hook
+        # fired" and "we went looking" are different facts about the build.
+        cs = _discover_offload_sched()
+    if cs is None:
+        return {"available": False,
+                "why": "the OffloadingConnectorScheduler hook did not fire; "
+                       "this is an ABSENCE, not zero pending jobs"}
+    try:
+        jobs = getattr(cs, "_jobs", None)
+        if jobs is None:
+            return {"available": False, "why": "upstream has no _jobs attribute"}
+        hist: dict[str, int] = {}
+        stores = loads = 0
+        oldest = None
+        for jid, st in list(jobs.items()):
+            pc = getattr(st, "pending_count", None)
+            hist[str(pc)] = hist.get(str(pc), 0) + 1
+            if getattr(st, "is_store", False):
+                stores += 1
+            else:
+                loads += 1
+            oldest = jid if oldest is None else min(oldest, jid)
+        out = {
+            "available": True,
+            "found_by": "hook" if getattr(
+                type(cs).__init__, "_kvmgr_wrapped", False) else "gc-scan",
+            "jobs_open": len(jobs),
+            "stores_open": stores,
+            "loads_open": loads,
+            "oldest_job_id": oldest,
+            "pending_count_hist": hist,
+            "job_counter": getattr(cs, "_job_counter", None),
+            "stale_job_threshold": getattr(cs, "_stale_job_threshold", None),
+            "blocks_with_pending_jobs": len(
+                getattr(cs, "_block_id_to_pending_jobs", {}) or {}),
+            "batch_jobs_to_flush": len(
+                getattr(cs, "_current_batch_jobs_to_flush", ()) or ()),
+            "num_workers": getattr(getattr(cs, "config", None),
+                                   "num_workers", None),
+        }
+    except Exception as exc:
+        return {"available": False, "why": "reading upstream state raised: %r" % (exc,)}
+    return out
+
+
 
 def live_manager_snapshot() -> dict | None:
     """The disk index's own counters, or None if no spec is in force.
@@ -473,6 +583,7 @@ class DiskPresenceManager(OffloadingManager):
         return dict(self._stats, present=len(self._present),
                     num_workers=self._num_workers,
                     by_group=by_group,
+                    sched=offload_sched_snapshot(),
                     restore_enabled=bool(flags.peek("disk_restore")),
                     store_paused=bool(flags.peek("disk_store_paused")))
 

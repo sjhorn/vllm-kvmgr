@@ -396,6 +396,85 @@ for _attr in _OPTIONAL_ATTRS:
                and not _is_decl(ln, _attr)]
     eq(f"every read of self.{_attr} outside __init__ uses getattr", _direct, [])
 
+print("== (1y) the scheduler-side job set: ABSENT IS NOT ZERO ==")
+# The worker reports jobs_open: 0 while the scheduler can hold a hundred jobs,
+# and the scheduler's _jobs is what `jobs_to_flush` names -- so this field is
+# the fence, made visible. The dangerous failure is reporting jobs_open: 0 when
+# the hook never fired, because that reads as "the fence is clear" and is the
+# one wrong answer.
+del diskspec._LIVE_OFFLOAD_SCHED[:]
+_s = diskspec.offload_sched_snapshot()
+eq("*** with no hook fired, available is False ***", _s.get("available"), False)
+check("...and jobs_open is ABSENT, not 0", "jobs_open" not in _s)
+check("...and it says why", bool(_s.get("why")))
+
+
+class _FakeJob:
+    def __init__(self, pc, store=True):
+        self.pending_count = pc
+        self.is_store = store
+
+
+class _FakeSchedCfg:
+    num_workers = 2
+
+
+class _FakeSched:
+    def __init__(self):
+        # two jobs with ONE rank still outstanding, one with both -- the exact
+        # shape that distinguishes "a rank's completion was lost" from
+        # "neither arrived"
+        self._jobs = {7: _FakeJob(1), 9: _FakeJob(1), 11: _FakeJob(2, False)}
+        self._job_counter = 40
+        self._stale_job_threshold = 0
+        self._block_id_to_pending_jobs = {3: (7,), 4: (9,)}
+        self._current_batch_jobs_to_flush = {7, 9}
+        self.config = _FakeSchedCfg()
+
+
+diskspec._LIVE_OFFLOAD_SCHED.append(_FakeSched())
+_s = diskspec.offload_sched_snapshot()
+eq("available with the hook fired", _s.get("available"), True)
+eq("jobs_open counts them", _s.get("jobs_open"), 3)
+eq("stores and loads are split", (_s.get("stores_open"), _s.get("loads_open")), (2, 1))
+eq("the oldest job id is the LOWEST, which is the one wedging the fence",
+   _s.get("oldest_job_id"), 7)
+eq("*** the pending_count histogram is the diagnosis ***",
+   _s.get("pending_count_hist"), {"1": 2, "2": 1})
+eq("num_workers is carried, so the histogram can be read",
+   _s.get("num_workers"), 2)
+eq("blocks still fenced", _s.get("blocks_with_pending_jobs"), 2)
+eq("and this batch's flush set", _s.get("batch_jobs_to_flush"), 2)
+
+
+class _HostileSched:
+    """Upstream renamed something, or an attribute raises on access."""
+
+    @property
+    def _jobs(self):
+        raise RuntimeError("upstream changed shape")
+
+
+del diskspec._LIVE_OFFLOAD_SCHED[:]
+diskspec._LIVE_OFFLOAD_SCHED.append(_HostileSched())
+_s = diskspec.offload_sched_snapshot()
+eq("*** an upstream change is an ABSENCE, never an exception ***",
+   _s.get("available"), False)
+check("...and never a zero that reads as a clear fence",
+      "jobs_open" not in _s)
+check("...and it names what went wrong", "raised" in (_s.get("why") or ""))
+
+
+class _NoJobs:
+    pass
+
+
+del diskspec._LIVE_OFFLOAD_SCHED[:]
+diskspec._LIVE_OFFLOAD_SCHED.append(_NoJobs())
+eq("a renamed _jobs is absent, not empty",
+   diskspec.offload_sched_snapshot().get("available"), False)
+del diskspec._LIVE_OFFLOAD_SCHED[:]
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()
 if FAIL:
