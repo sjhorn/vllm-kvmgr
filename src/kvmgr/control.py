@@ -213,8 +213,17 @@ def rebind(obj) -> str:
     radius rather than infer it.
     """
     cls = type(obj)
-    mod = importlib.import_module(cls.__module__)
-    importlib.reload(mod)
+    # *** ONE UNRELOADABLE CLASS MUST NOT FAIL THE WHOLE RELOAD. *** A class
+    # defined somewhere `importlib` cannot re-import -- `__main__`, an exec'd
+    # namespace, a C extension -- raises here, and raising made `ok: False` for
+    # the entire operation even though every other instance re-pointed fine.
+    # That is a refusal with the wrong scope: the useful answer is "these
+    # moved, this one could not, and here is why".
+    try:
+        mod = importlib.import_module(cls.__module__)
+        importlib.reload(mod)
+    except Exception as e:
+        return f"{cls.__name__}: NOT reloadable ({cls.__module__}: {e})"
     new = getattr(mod, cls.__name__, None)
     if new is None or new is cls:
         return f"{cls.__name__}: unchanged"
@@ -225,6 +234,20 @@ def rebind(obj) -> str:
 def reload_modules() -> dict:
     """Re-import our modules and re-point every live instance. 6d."""
     report: dict[str, Any] = {"reloaded": [], "rebound": [], "errors": []}
+
+    # *** SNAPSHOT THE LIVE INSTANCES BEFORE RELOADING ANYTHING, because the
+    # reload ERASES THE REGISTRY IT IS ABOUT TO READ. *** Measured on the box
+    # 2026-10-08: the first live `/kv/reload` reported `instances: []` on both
+    # ranks while a store handler was demonstrably running. `importlib.reload`
+    # re-executes the module, so `_LIVE_HANDLERS: list = []` runs again and the
+    # list is empty by the time `live_instances()` looks -- the handler objects
+    # are still alive and serving, and nothing can find them to re-point.
+    #
+    # Same class as the dashboard's priming code being a destructive overwrite:
+    # a step that rebuilds the thing it then consumes. Gathering first costs
+    # one dict and makes the ordering impossible to get wrong by accident.
+    targets = live_instances()
+
     # Order matters: leaves before the modules that import them, so a reloaded
     # parent picks up the reloaded child rather than the stale one it holds.
     for name in ("kvmgr.flags", "kvmgr.policy", "kvmgr.diskio",
@@ -238,12 +261,22 @@ def reload_modules() -> dict:
                 report["reloaded"].append(name)
         except Exception as e:
             report["errors"].append(f"{name}: {e}")
-    for role, objs in live_instances().items():
+    for role, objs in targets.items():
         for obj in objs:
             try:
                 report["rebound"].append(f"{role}/{rebind(obj)}")
             except Exception as e:
                 report["errors"].append(f"{role}: {e}")
+    # Put the handlers back, because the reload emptied the list they register
+    # themselves into and nothing else ever will -- they register in their own
+    # constructors, and these objects are already constructed.
+    try:
+        from . import diskio
+
+        diskio._LIVE_HANDLERS[:] = targets.get("handlers", [])
+    except Exception as e:
+        report["errors"].append(f"re-registering handlers: {e}")
+    report["found"] = {k: len(v) for k, v in targets.items()}
     report["ok"] = not report["errors"]
     logger.info("kvmgr: reload -- %d module(s), %d instance(s), %d error(s)",
                 len(report["reloaded"]), len(report["rebound"]),

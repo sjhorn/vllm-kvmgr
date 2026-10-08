@@ -425,6 +425,91 @@ for node in _ast.walk(_canary):
 check("*** ...and the lint CATCHES a locally-imported annotation ***",
       _cbad == ["raw"], f"{_cbad} -- a lint that cannot fail is theatre")
 
+print("\n== (14) the reload must not ERASE THE REGISTRY IT READS ==")
+
+# *** MEASURED ON THE BOX 2026-10-08: the first live /kv/reload reported
+# `instances: []` on both ranks while a store handler was demonstrably
+# running. *** `importlib.reload` RE-EXECUTES the module, so diskio's
+# `_LIVE_HANDLERS: list = []` runs again and the list is empty by the time
+# live_instances() looks -- the handler objects are still alive and serving,
+# and nothing can find them to re-point. Same class as the dashboard's priming
+# code being a destructive overwrite: a step that rebuilds what it then
+# consumes.
+from kvmgr import diskio as _dio  # noqa: E402
+
+_saved_h = list(getattr(_dio, "_LIVE_HANDLERS", []))
+try:
+    # A REAL module on disk, so the reload path is the real one. A class
+    # defined in this test file lives in `__main__`, which importlib cannot
+    # re-import -- and that case is asserted separately below, because it is a
+    # legitimate one that must DEGRADE rather than fail the whole reload.
+    _tmpdir = tempfile.mkdtemp(prefix="kvreload-")
+    sys.path.insert(0, _tmpdir)
+    open(os.path.join(_tmpdir, "fake_handler_mod.py"), "w").write(
+        "class H:\n    def verdict(self):\n        return 'v1'\n")
+    import fake_handler_mod  # noqa: E402
+
+    h1, h2 = fake_handler_mod.H(), fake_handler_mod.H()
+
+    class _Unreloadable:  # lives in __main__
+        pass
+
+    _dio._LIVE_HANDLERS[:] = [h1, h2, _Unreloadable()]
+    eq("three handlers registered before the reload, one unreloadable",
+       len(_dio._LIVE_HANDLERS), 3)
+
+    # Change the module on disk, so the rebind has something to move to.
+    # *** THE NEW SOURCE MUST DIFFER IN LENGTH, and that cost a confusing
+    # failure. *** Python validates its bytecode cache on (mtime, SIZE), and
+    # `return 'v1'` and `return 'v2'` are the same number of bytes -- written
+    # in the same second, the cache was reused, reload re-executed the OLD
+    # bytecode, and the test read `rebound` with v1 behaviour. A test artefact
+    # rather than a code bug, but an instructive one: a reload is only as fresh
+    # as the import system thinks the file is.
+    #
+    # The replacement also ADDS a method, so this exercises on the real import
+    # path the thing section (11) proves on a synthetic one.
+    open(os.path.join(_tmpdir, "fake_handler_mod.py"), "w").write(
+        "class H:\n"
+        "    def verdict(self):\n"
+        "        return 'v2-and-longer-so-the-bytecode-cache-is-invalidated'\n"
+        "    def added_later(self):\n"
+        "        return 'new'\n")
+
+    rep = control.reload_modules()
+    eq("*** it FOUND them all, because it snapshots before reloading ***",
+       rep.get("found", {}).get("handlers"), 3)
+    eq("...re-pointing all three", len([r for r in rep["rebound"]
+                                       if r.startswith("handlers/")]), 3)
+    check("*** and the reloadable ones really moved ***",
+          h1.verdict().startswith("v2"), h1.verdict())
+    eq("...including a method the reload ADDED, on the real import path",
+       h1.added_later(), "new")
+    check("*** while the unreloadable one DEGRADES and is NAMED ***",
+          any("NOT reloadable" in r for r in rep["rebound"]),
+          [r for r in rep["rebound"] if "handlers/" in r])
+    check("...without failing the whole reload, which is the wrong scope",
+          rep.get("ok") is True, str(rep.get("errors"))[:90])
+    sys.path.remove(_tmpdir)
+    # and the registry must still hold them afterwards, or the NEXT reload
+    # finds nothing -- the bug one step along.
+    from kvmgr import diskio as _dio2  # re-imported after the reload
+
+    eq("*** and the registry is restored, so a SECOND reload still finds them ***",
+       len(_dio2._LIVE_HANDLERS), 3)
+    rep2 = control.reload_modules()
+    eq("...proved by doing it twice", rep2.get("found", {}).get("handlers"), 3)
+finally:
+    from kvmgr import diskio as _dio3
+
+    _dio3._LIVE_HANDLERS[:] = _saved_h
+
+# `found` must be in the response at all: `instances: []` was indistinguishable
+# from "there was nothing to rebind", which is why the live bug read as normal.
+rep3 = control.reload_modules()
+check("the response always says what it FOUND, so empty is not ambiguous",
+      "found" in rep3 and isinstance(rep3["found"], dict), str(rep3)[:90])
+
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print("  FAILED:", f)
