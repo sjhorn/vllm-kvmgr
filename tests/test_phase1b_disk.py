@@ -659,8 +659,19 @@ eq("...offering every key", len(out.keys_to_store), 4)
 
 # paused: prepare_store declines, so NO JOB IS CREATED AT ALL
 F.write(kvmgr_enabled=1, disk_store_paused=1)
-eq("*** paused, prepare_store returns None -- no job, nothing written ***",
-   mgrP.prepare_store(kp, ctxP), None)
+# *** NOT None, AND THE DIFFERENCE IS A FOREVER-RETRY LOOP. *** This asserted
+# `None` and that was the bug: scheduler.py treats None as "I cannot" and does
+# NOT advance the stored index, so the same blocks are attempted every step
+# indefinitely -- measured 2026-10-08 as 3,309 warnings at ~20/second. An empty
+# output means "nothing new here" and lets the request progress. So the
+# property to assert is "no keys to store", never the sentinel.
+_paused_out = mgrP.prepare_store(kp, ctxP)
+check("*** paused yields an EMPTY output, not None ***",
+      _paused_out is not None and list(_paused_out.keys_to_store) == [],
+      repr(_paused_out)[:80])
+check("...so the scheduler can advance instead of retrying forever",
+      _paused_out is not None,
+      "None leaves the stored index put and the blocks are re-attempted")
 eq("...and it is COUNTED, so a quiet pause is visible on /kv",
    mgrP.snapshot()["paused"], 4)
 check("...and the snapshot says it is paused",
@@ -679,7 +690,8 @@ eq("...so a lookup after a pause correctly MISSES", mgrP.lookup(kp[0], ctxP), Fa
 
 # and it is HOT in both directions, which is the whole point
 F.write(kvmgr_enabled=1, disk_store_paused=1)
-eq("hot off", mgrP.prepare_store(kp, ctxP), None)
+_off = mgrP.prepare_store(kp, ctxP)
+check("hot off", _off is not None and list(_off.keys_to_store) == [])
 F.write(kvmgr_enabled=1, disk_store_paused=0)
 check("*** hot ON again, with no restart ***", mgrP.prepare_store(kp, ctxP) is not None)
 
@@ -689,6 +701,25 @@ _f.reset_for_tests()
 F.write(kvmgr_enabled=1)
 eq("an empty-ish flags file leaves the store path RUNNING",
    bool(_f.peek("disk_store_paused")), False)
+# And the OTHER nothing-to-store case: every key already on disk. Same
+# requirement -- the scheduler must be able to advance.
+F.write(kvmgr_enabled=1, disk_store_paused=0)
+mgrP.complete_store(kp, ctxP)
+_allpresent = mgrP.prepare_store(kp, ctxP)
+check("*** every key already present also yields an EMPTY output, not None ***",
+      _allpresent is not None and list(_allpresent.keys_to_store) == [],
+      repr(_allpresent)[:80])
+eq("...and the keys really are held", mgrP.snapshot()["present"], 4)
+_out2 = mgrP.prepare_store([K(bytes([72, 0, 0, 9]) * 8, 0)], ctxP)
+check("...while a NEW key still produces a real store job",
+      _out2 is not None and len(_out2.keys_to_store) == 1)
+
+# the shape the scheduler needs: an empty output must still carry a usable
+# store_spec and evicted_keys, or the caller's own field access raises.
+for name, out in (("paused", _paused_out), ("all-present", _allpresent)):
+    check(f"the {name} output carries a store_spec", out.store_spec is not None)
+    eq(f"...and an empty evicted_keys for {name}", list(out.evicted_keys), [])
+
 
 print("\n== (b12b) copy_into: the one line that killed the first real restore ==")
 

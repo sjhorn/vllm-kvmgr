@@ -177,8 +177,17 @@ m2.complete_store([k1], ctx)
 out2 = m2.prepare_store([k1, k2], ctx)
 eq("*** a key already held is SKIPPED ***", out2.keys_to_store, [k2])
 m2.complete_store([k2], ctx)
-check("and when everything is held, prepare_store returns None rather than an "
-      "empty job", m2.prepare_store([k1, k2], ctx) is None)
+# *** THIS ASSERTED None AND THAT WAS THE BUG. *** scheduler.py treats None as
+# "I cannot store" and does NOT advance the request's stored index, so the very
+# same blocks are attempted again every step, indefinitely -- measured on the
+# box 2026-10-08 as 3,309 "cannot store blocks" warnings at ~20/second. An
+# EMPTY output means "nothing new here" and lets the request progress. The two
+# are six lines apart in upstream's own code and are not interchangeable.
+_held = m2.prepare_store([k1, k2], ctx)
+check("*** when everything is held, prepare_store returns an EMPTY OUTPUT, "
+      "never None -- None makes the scheduler retry forever ***",
+      _held is not None and list(_held.keys_to_store) == [],
+      repr(_held)[:70])
 
 print()
 print("== (1g) complete_store is the ALL-RANKS edge, and it is free ==")

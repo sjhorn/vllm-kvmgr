@@ -324,7 +324,7 @@ class DiskPresenceManager(OffloadingManager):
         # correctness by construction rather than by care.
         if flags.peek("disk_store_paused"):
             self._stats["paused"] += len(keys)
-            return None
+            return _nothing_to_store()
 
         # Skipping keys we already hold is the dedup that made boot 2 write zero
         # new files. Cheap here, and it keeps the writer's exists() check as the
@@ -332,7 +332,7 @@ class DiskPresenceManager(OffloadingManager):
         todo = [k for k in keys if bytes(k) not in self._present]
         self._stats["skipped_present"] += len(keys) - len(todo)
         if not todo:
-            return None
+            return _nothing_to_store()
         return PrepareStoreOutput(
             keys_to_store=todo,
             store_spec=DiskLoadStoreSpec(todo),
@@ -388,6 +388,43 @@ class DiskPresenceManager(OffloadingManager):
                     num_workers=self._num_workers,
                     restore_enabled=bool(flags.peek("disk_restore")),
                     store_paused=bool(flags.peek("disk_store_paused")))
+
+
+def _nothing_to_store() -> PrepareStoreOutput:
+    """"Nothing to store" -- which is NOT the same answer as `None`.
+
+    *** RETURNING None HERE MADE THE SCHEDULER RETRY FOREVER, and the streamed
+    log is the only reason we know. *** `kv_connector_offloading/scheduler.py`
+    distinguishes the two in six lines:
+
+        store_output = self.manager.prepare_store(...)
+        if store_output is None:
+            logger.warning("Request %s: cannot store blocks", req_id)
+            continue                                   # does NOT advance
+        if not store_output.keys_to_store:
+            req_status.advance_stored_idx(num_offloadable_tokens)
+            continue                                   # DOES advance
+
+    So `None` means *"I cannot"* and leaves the stored index where it was, so
+    the very same blocks are attempted again on the next step, and the next,
+    indefinitely. An empty output means *"there is nothing new here"* and lets
+    the request make progress.
+
+    We were returning `None` for BOTH of our nothing-to-store cases -- paused,
+    and every key already on disk. Measured 2026-10-08: **3,309 warnings at
+    ~20/second**, sustained, with the scheduler re-attempting the same blocks
+    every step. The log noise is the symptom; the absent progress is the
+    defect.
+
+    *** THE TRADE, STATED: advancing while PAUSED means those blocks are not
+    stored later if the cache is unpaused. *** That is deliberate. "Paused"
+    means we declined, and the alternative is an unbounded retry loop, which
+    is strictly worse -- and it matches how the GPU cache behaves, where you
+    do not get back what you did not cache.
+    """
+    return PrepareStoreOutput(keys_to_store=[],
+                              store_spec=DiskLoadStoreSpec([]),
+                              evicted_keys=[])
 
 
 class DSparkDiskOffloadingSpec(OffloadingSpec):
