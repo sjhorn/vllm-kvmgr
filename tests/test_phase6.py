@@ -737,10 +737,61 @@ _f17.clear_override()
 # restored by reload_modules or provably not state.
 _csrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
                           "control.py")).read()
-for name in ("_LIVE_HANDLERS", "_OVERRIDE"):
-    check(f"reload_modules restores {name}",
-          name in _csrc.split("def reload_modules")[1].split("\ndef ")[0],
-          "a reload that re-initialises state must put it back")
+# *** AUDIT THE MODULES AGAINST THE TABLE, DO NOT NAME THE FIELDS. *** The
+# first version listed two names by hand and passed while three more stateful
+# globals were silently not restored -- `diskspec._LIVE_MANAGER`,
+# `stats._groups` (every observability counter) and `offload._real_odirect`.
+# A hand-written list of things to remember is the thing that needs
+# remembering, so control._PRESERVE is the table and this parses the kvmgr
+# package to check nothing is missing from it.
+import ast as _ast6  # noqa: E402
+
+_preserved = {f"{m.split('.')[-1]}.{a}" for m, a, _ in control._PRESERVE}
+
+# Constants and caches are NOT state: re-executing them restores the same
+# value, or losing them costs at most one log line. Named so the exemption is
+# a decision rather than an omission.
+_EXEMPT = {
+    "flags._VALID": "a validation table -- re-executing yields the same table",
+    "flags._IMPLEMENTED": "a capability table, empty by design since Phase 3",
+    "flags._last_seen": "flag-change edge cache; losing it costs one edge",
+    "flags._announced": "log de-duplication; losing it costs a repeated line",
+    "__init__.__all__": "an export list, not state",
+}
+
+_kvdir = os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr")
+_missing = []
+for _f in sorted(os.listdir(_kvdir)):
+    if not _f.endswith(".py"):
+        continue
+    _mod = _f[:-3]
+    for _node in _ast6.parse(open(os.path.join(_kvdir, _f)).read()).body:
+        if isinstance(_node, _ast6.Assign):
+            _names = [t.id for t in _node.targets if isinstance(t, _ast6.Name)]
+            _val = _node.value
+        elif isinstance(_node, _ast6.AnnAssign) and isinstance(_node.target, _ast6.Name):
+            _names, _val = [_node.target.id], _node.value
+        else:
+            continue
+        _is_state = isinstance(_val, (_ast6.Dict, _ast6.List, _ast6.Set)) or (
+            isinstance(_val, _ast6.Constant) and _val.value is None)
+        for _n in _names:
+            if not _n.startswith("_") or not _is_state:
+                continue
+            _key = f"{_mod}.{_n}"
+            if _key in _EXEMPT or _key in _preserved:
+                continue
+            _missing.append(_key)
+
+eq("*** every stateful module global is in _PRESERVE or explicitly exempt ***",
+   sorted(set(_missing)), [])
+eq("...and _PRESERVE names six, each with a reason",
+   len(control._PRESERVE), 6)
+check("...every entry carrying one",
+      all(isinstance(w, str) and w for _, _, w in control._PRESERVE))
+for name in ("_LIVE_HANDLERS", "_OVERRIDE", "_LIVE_MANAGER", "_groups"):
+    check(f"_PRESERVE covers {name}",
+          any(a == name for _, a, _ in control._PRESERVE))
 
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:

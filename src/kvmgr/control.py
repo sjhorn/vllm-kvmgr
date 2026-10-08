@@ -167,6 +167,80 @@ def _derived(name: str) -> dict:
 # --- rebinding live instances, which is what makes a reload possible --------
 
 
+# *** EVERY MODULE-LEVEL PIECE OF STATE A RELOAD WOULD DESTROY, AS A TABLE. ***
+# `importlib.reload` re-executes the module, so anything initialised at module
+# level is reset and whatever it held is gone. This bug has now appeared FOUR
+# times -- `diskio._LIVE_HANDLERS` and `flags._OVERRIDE` found live within
+# minutes of each other, `diskspec._LIVE_MANAGER` found by reading, and
+# `stats._groups` / `offload._real_odirect` / `serve._server` found by the
+# audit that replaced the hand-written list.
+#
+# A table rather than three more try/excepts, because the thing that kept
+# failing was *remembering*, and `test_phase6` audits the kvmgr modules against
+# this table: a new stateful global is an assertion failure, not something
+# somebody notices afterwards.
+#
+# `stats._groups` is the one worth naming: it holds every per-group hit/miss/
+# evict counter, so a reload without it silently zeroes all observability --
+# the instrument resetting itself, which is the failure this project keeps
+# paying for in other costumes.
+_PRESERVE: tuple[tuple[str, str, str], ...] = (
+    ("kvmgr.diskio", "_LIVE_HANDLERS", "the live store/load handler objects"),
+    ("kvmgr.flags", "_OVERRIDE", "every knob the control plane has set"),
+    ("kvmgr.diskspec", "_LIVE_MANAGER", "the disk index, for GET /kv"),
+    ("kvmgr.stats", "_groups", "all per-group counters -- the observability"),
+    ("kvmgr.offload", "_real_odirect", "the saved platform O_DIRECT value"),
+    ("kvmgr.serve", "_server", "the stats HTTP server handle"),
+)
+
+
+def _snapshot_state() -> tuple[dict, list[str]]:
+    """Grab everything in `_PRESERVE` before the reload wipes it."""
+    import importlib as _il
+
+    saved, errs = {}, []
+    for mod, attr, _why in _PRESERVE:
+        try:
+            m = _il.import_module(mod)
+        except Exception:
+            # Not importable in this process (or in the offline harness) is
+            # not an error: there is simply nothing to save. Reporting it
+            # would make a healthy reload read as failed.
+            continue
+        try:
+            saved[(mod, attr)] = getattr(m, attr)
+        except Exception as e:
+            errs.append(f"snapshot {mod}.{attr}: {e}")
+    return saved, errs
+
+
+def _restore_state(saved: dict) -> tuple[list[str], list[str]]:
+    """Put it all back, in place where the object identity matters."""
+    import importlib as _il
+
+    done, errs = [], []
+    for mod, attr, _why in _PRESERVE:
+        if (mod, attr) not in saved:
+            continue
+        try:
+            m = _il.import_module(mod)
+            old = saved[(mod, attr)]
+            cur = getattr(m, attr, None)
+            # A list or dict is mutated IN PLACE, because other modules may
+            # already hold a reference to the new (empty) container --
+            # rebinding the name would leave them looking at the empty one.
+            if isinstance(old, list) and isinstance(cur, list):
+                cur[:] = old
+            elif isinstance(old, dict) and isinstance(cur, dict):
+                cur.update(old)
+            else:
+                setattr(m, attr, old)
+            done.append(f"{mod.split('.')[-1]}.{attr}")
+        except Exception as e:
+            errs.append(f"restore {mod}.{attr}: {e}")
+    return done, errs
+
+
 def live_instances() -> dict[str, list]:
     """Every object a reload must re-point, by role.
 
@@ -261,13 +335,8 @@ def reload_modules() -> dict:
     # general rule for this module: a reload must restore every module-level
     # piece of STATE it re-initialises, and the only safe way to know is to
     # enumerate them here.
-    saved_overrides: dict = {}
-    try:
-        from . import flags as _f
-
-        saved_overrides = dict(_f._OVERRIDE)
-    except Exception as e:
-        report["errors"].append(f"snapshotting overrides: {e}")
+    saved_state, _serrs = _snapshot_state()
+    report["errors"].extend(_serrs)
 
     # Order matters: leaves before the modules that import them, so a reloaded
     # parent picks up the reloaded child rather than the stale one it holds.
@@ -297,16 +366,12 @@ def reload_modules() -> dict:
         diskio._LIVE_HANDLERS[:] = targets.get("handlers", [])
     except Exception as e:
         report["errors"].append(f"re-registering handlers: {e}")
-    # Put the overrides back, or a reload quietly reverts every knob to the
-    # file -- which on this cluster means reverting the WORKER to a stale file
-    # and re-splitting the ranks.
-    try:
-        from . import flags as _f2
-
-        _f2._OVERRIDE.update(saved_overrides)
-        report["overrides_restored"] = sorted(saved_overrides)
-    except Exception as e:
-        report["errors"].append(f"restoring overrides: {e}")
+    # Put it all back. See _PRESERVE for why this is a table.
+    _restored, _rerrs = _restore_state(saved_state)
+    report["errors"].extend(_rerrs)
+    report["state_restored"] = _restored
+    report["overrides_restored"] = sorted(saved_state.get(
+        ("kvmgr.flags", "_OVERRIDE"), {}))
     report["found"] = {k: len(v) for k, v in targets.items()}
     report["ok"] = not report["errors"]
     logger.info("kvmgr: reload -- %d module(s), %d instance(s), %d error(s)",
