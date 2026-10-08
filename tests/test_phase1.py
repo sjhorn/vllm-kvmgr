@@ -275,6 +275,7 @@ PROBE = {
     "disk_enabled": (0, 1),
     "disk_budget_gb": (0.0, 64.0),
     "disk_restore": (0, 1),
+    "disk_store_paused": (0, 1),
     "kvmgr_log_level": (0, 2),
     "kvmgr_stats_port": (0, 9107),
     "offload_allow_hybrid": (0, 1),
@@ -287,6 +288,11 @@ PROBE = {
     "pin_static_head": (0, 1),
     "head_pin_fraction": (0.05, 0.25),
 }
+# *** THIS ASSERTION IS WHY A NEW KNOB CANNOT SHIP UNPROVEN, and it caught one
+# on 2026-10-08. *** `disk_store_paused` was added to DEFAULTS and not here, and
+# the loop below raised `KeyError: 'disk_store_paused'` -- so the suite went RED
+# rather than silently skipping the one knob nobody had proved hot. The eq()
+# below would have named it; the loop got there first, which is louder.
 eq("the probe covers every knob in the table",
    sorted(PROBE), sorted(flags.DEFAULTS))
 
