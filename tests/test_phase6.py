@@ -325,6 +325,106 @@ eq("...and the default is off, because the plane shares the engine's port",
 eq("the gate knob is in DEFAULTS, so the hot-config suite covers it",
    "kvmgr_control_plane" in flags.DEFAULTS, True)
 
+print("\n== (13) every ROUTE ANNOTATION must resolve from MODULE globals ==")
+
+# *** THE BUG THIS CATCHES COST A WHOLE DEPLOY, and nothing else could see it:
+# all five routes registered and every one answered 400. ***
+#
+#   {'loc': ('query', 'raw_request'), 'msg': 'Field required'}
+#
+# `from __future__ import annotations` turns every annotation into a STRING,
+# and FastAPI resolves it with get_type_hints() against the function's MODULE
+# GLOBALS -- not its closure. `Request` was imported inside `_router()`, so
+# `raw_request: Request` read as an unresolvable name and FastAPI fell back to
+# treating it as a query parameter. Routes that exist and cannot be called: a
+# mechanism present, correct-looking, producing nothing.
+#
+# So: for every annotated parameter of every nested route handler, the
+# annotation's root name must be bound at MODULE level. Checked with ast, so it
+# needs no fastapi and no box.
+import ast as _ast  # noqa: E402
+
+_cpath = os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr", "control.py")
+_tree = _ast.parse(open(_cpath).read())
+
+_module_names = set()
+for node in _tree.body:
+    if isinstance(node, (_ast.Import, _ast.ImportFrom)):
+        for a in node.names:
+            _module_names.add((a.asname or a.name).split(".")[0])
+    elif isinstance(node, _ast.Assign):
+        for t in node.targets:
+            if isinstance(t, _ast.Name):
+                _module_names.add(t.id)
+    elif isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+        _module_names.add(node.name)
+    elif isinstance(node, _ast.Try):
+        # the guarded fastapi import lives in a try/except at module level,
+        # and both branches bind the names -- which is the whole point of it
+        for sub in list(node.body) + [x for h in node.handlers for x in h.body]:
+            if isinstance(sub, (_ast.Import, _ast.ImportFrom)):
+                for a in sub.names:
+                    _module_names.add((a.asname or a.name).split(".")[0])
+            elif isinstance(sub, _ast.Assign):
+                for t in sub.targets:
+                    if isinstance(t, _ast.Name):
+                        _module_names.add(t.id)
+
+check("the guarded fastapi import binds Request at MODULE level",
+      "Request" in _module_names,
+      "if this fails, every route 400s on a missing query param")
+for n in ("APIRouter", "JSONResponse"):
+    check(f"...and {n}", n in _module_names)
+
+
+def _root(ann):
+    while isinstance(ann, _ast.Subscript):
+        ann = ann.value
+    while isinstance(ann, _ast.Attribute):
+        ann = ann.value
+    return ann.id if isinstance(ann, _ast.Name) else None
+
+
+_handlers, _bad = [], []
+for node in _ast.walk(_tree):
+    if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+        continue
+    if not any(isinstance(d, _ast.Attribute) and d.attr in ("get", "post")
+               or (isinstance(d, _ast.Call) and isinstance(d.func, _ast.Attribute)
+                   and d.func.attr in ("get", "post"))
+               for d in node.decorator_list):
+        continue
+    _handlers.append(node.name)
+    for arg in node.args.args + node.args.kwonlyargs:
+        if arg.annotation is None:
+            continue
+        r = _root(arg.annotation)
+        if r and r not in _module_names:
+            _bad.append(f"{node.name}({arg.arg}: {r})")
+
+check("the lint actually found the route handlers", len(_handlers) >= 5,
+      f"{len(_handlers)}: {_handlers}")
+eq("*** every route annotation resolves from module globals ***", _bad, [])
+
+# And prove the lint can FAIL, because a lint that cannot is coverage theatre.
+_canary = _ast.parse(
+    "from __future__ import annotations\n"
+    "def _r():\n"
+    "    from fastapi import Request\n"
+    "    @router.get('/x')\n"
+    "    async def h(raw: Request):\n"
+    "        return 1\n")
+_cnames = {n.name for n in _canary.body
+           if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))}
+_cbad = []
+for node in _ast.walk(_canary):
+    if isinstance(node, _ast.AsyncFunctionDef) and node.decorator_list:
+        for arg in node.args.args:
+            if arg.annotation is not None and _root(arg.annotation) not in _cnames:
+                _cbad.append(arg.arg)
+check("*** ...and the lint CATCHES a locally-imported annotation ***",
+      _cbad == ["raw"], f"{_cbad} -- a lint that cannot fail is theatre")
+
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print("  FAILED:", f)

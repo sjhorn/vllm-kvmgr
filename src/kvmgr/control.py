@@ -66,6 +66,34 @@ logger = init_logger("vllm." + __name__)
 
 _RPC_PREFIX = "kvmgr_"
 
+# *** THESE IMPORTS MUST BE MODULE-LEVEL, AND IT IS `from __future__ import
+# annotations` THAT MAKES IT SO. *** Measured on the box 2026-10-08: with
+# `Request` imported inside `_router()`, all five routes registered and every
+# one answered
+#
+#   400  1 validation error: {'loc': ('query', 'raw_request'),
+#                             'msg': 'Field required'}
+#
+# because the future import turns every annotation into a STRING, and FastAPI
+# resolves it with `get_type_hints()` against the function's MODULE GLOBALS --
+# not its closure. So `raw_request: Request` read as an unresolvable name and
+# FastAPI fell back to treating it as a query parameter. The routes existed and
+# could not be called: a mechanism present, correct-looking and producing
+# nothing, which is this repo's signature failure in a new costume.
+#
+# Guarded because the offline harness has no fastapi, and the whole value of
+# the pure functions above is that they are testable without it. `_router()`
+# is never reached when this fails, so a missing fastapi costs the routes and
+# nothing else.
+try:
+    from fastapi import APIRouter, Request
+    from fastapi.responses import JSONResponse
+
+    _HAVE_FASTAPI = True
+except Exception:  # pragma: no cover - the laptop harness
+    APIRouter = Request = JSONResponse = None  # type: ignore[assignment]
+    _HAVE_FASTAPI = False
+
 
 # --- the per-process primitive, called in the workers over RPC --------------
 
@@ -335,11 +363,13 @@ def _apply_locally(method: str, args: tuple, kwargs: dict) -> None:
 
 
 def _router():
-    """Built lazily: fastapi is not importable in the harness, and the whole
-    point of the pure functions above is that they are testable without it."""
-    from fastapi import APIRouter, Request
-    from fastapi.responses import JSONResponse
-
+    """The router. Uses the MODULE-LEVEL fastapi names, deliberately -- see the
+    note at those imports for the 400 that teaches why a local import here
+    cannot work under `from __future__ import annotations`."""
+    if not _HAVE_FASTAPI:
+        raise RuntimeError(
+            "kvmgr: fastapi is not importable, so the control plane has no "
+            "router. Nothing else is affected.")
     router = APIRouter()
 
     def engine_client(request: Request):
@@ -371,11 +401,9 @@ def _router():
 
     @router.get("/kv")
     async def kv_state(raw_request: Request):
-        from . import stats
+        from . import flags, stats
 
         snap = stats.snapshot()
-        from . import flags
-
         snap["sources"] = {n: flags.source_of(n) for n in flags.DEFAULTS}
         return JSONResponse(content=snap)
 
