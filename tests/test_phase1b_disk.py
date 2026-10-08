@@ -1759,6 +1759,50 @@ except Exception:
     _ok = False
 check("*** the ledger can never raise into the transfer path ***", _ok)
 
+# -- (b21) EVERYTHING HANDED TO A FRAMEWORK TO SERIALISE MUST BE A BUILTIN ---
+#
+# *** THIS KILLED THE ENGINE'S OUTPUT THREAD AND LOOKED LIKE A MEMORY WEDGE
+# *** FOR AN HOUR. *** `page_size_bytes` comes from the engine's own tensor
+# metadata, so it can be a numpy integer. It flows:
+#
+#   Chunk.nbytes -> plan_nbytes -> st["bytes"] -> TransferResult.transfer_size
+#     -> KVConnectorStats -> the engine core's OUTPUT SOCKET (msgpack)
+#
+# and msgpack refuses it:
+#
+#   TypeError: Object of type <class 'numpy.int64'> is not serializable
+#     vllm/v1/engine/core.py:1561 in process_output_sockets
+#
+# The consequence is the nastiest shape available: that THREAD dies, so results
+# never reach the API server. Requests complete, the core goes idle, clients
+# hang for ever, and the main loop logs NOTHING -- which is why an hour went on
+# memory and concurrency theories. The fixture could not express it, because its
+# refs used plain ints.
+class _NpLike(int):
+    """Stands in for numpy.int64: an int subclass that is NOT `int` exactly,
+    which is the distinction msgpack's enc_hook actually makes."""
+    __module__ = "numpy"
+    def __repr__(self):
+        return "numpy.int64(%d)" % int(self)
+
+
+_npref = type("R", (), {})()
+_npref.tensor_idx = _NpLike(0)
+_npref.page_size_bytes = _NpLike(4096)
+_npplan = diskio.file_plan([[_npref]], 0, slot=_NpLike(3))
+check("*** file_plan coerces a numpy-typed page size to a builtin int ***",
+      type(_npplan[0].nbytes) is int)
+check("...and the tensor index", type(_npplan[0].tensor_idx) is int)
+check("...and the slot", type(_npplan[0].slot) is int)
+check("*** so plan_nbytes is a builtin, which is what gets serialised ***",
+      type(diskio.plan_nbytes(_npplan)) is int)
+check("...and group_file_sizes too",
+      all(type(x) is int for x in diskio.group_file_sizes([[_npref]])))
+
+# the type distinction is real: an int SUBCLASS is not caught by `== int`
+check("...and the test's own stand-in would have slipped past a loose check",
+      isinstance(_NpLike(1), int) and type(_NpLike(1)) is not int)
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
     for f in FAIL:

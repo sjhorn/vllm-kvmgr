@@ -76,7 +76,21 @@ def file_plan(group_data_refs: "Sequence[Sequence[Any]]", group_idx: int,
             f"{len(group_data_refs)} KV cache groups -- a key carrying a group "
             f"this engine does not have means the layout changed under us"
         )
-    return [Chunk(r.tensor_idx, slot, r.page_size_bytes)
+    # *** int(), AND IT IS NOT COSMETIC: IT KILLED THE ENGINE'S OUTPUT THREAD.
+    # *** `page_size_bytes` comes from the engine's own tensor metadata, so it
+    # can be a numpy/torch integer. That flows Chunk.nbytes -> plan_nbytes ->
+    # st["bytes"] -> TransferResult.transfer_size -> KVConnectorStats -> the
+    # engine core's OUTPUT SOCKET, which serialises with msgpack and refuses:
+    #
+    #   TypeError: Object of type <class 'numpy.int64'> is not serializable
+    #     vllm/v1/engine/core.py:1561 in process_output_sockets
+    #
+    # And the consequence is the nastiest shape available: that thread dies, so
+    # RESULTS NEVER REACH THE API SERVER. Requests complete, the core goes
+    # idle, clients hang for ever, and the main loop logs no error at all --
+    # which is exactly the "wedge" that looked like a memory problem for an
+    # hour. Coerced at the source so the whole byte chain is builtin.
+    return [Chunk(int(r.tensor_idx), int(slot), int(r.page_size_bytes))
             for r in group_data_refs[group_idx]]
 
 
@@ -1388,7 +1402,11 @@ class DiskStoreHandler:
         # missed". A handler that omits the time makes its own path
         # unobservable, and this one did.
                 out.append(TransferResult(
-                    job_id=job_id, success=True, transfer_size=st["bytes"],
+                    # int(): ANYTHING HANDED TO A FRAMEWORK TO SERIALISE MUST
+                    # BE A BUILTIN. A numpy int here kills the engine core's
+                    # output socket thread and the clients hang for ever.
+                    job_id=int(job_id), success=True,
+                    transfer_size=int(st["bytes"]),
                     transfer_time=_elapsed(st.get("t0")),
                     transfer_type=("GPU", self._spec.disk_medium)))
         return None
@@ -1798,8 +1816,9 @@ class DiskLoadHandler:
             # DiskStoreHandler.get_finished. A restore with no series is a
             # restore nobody can prove happened.
             out.append(TransferResult(
-                job_id=job_id, success=not st["failed"],
-                transfer_size=st["bytes"] if not st["failed"] else None,
+                job_id=int(job_id), success=not st["failed"],
+                # int() for the same reason as the store side.
+                transfer_size=(int(st["bytes"]) if not st["failed"] else None),
                 transfer_time=_elapsed(st.get("t0")),
                 transfer_type=(self._spec.disk_medium, "GPU")))
         return None
