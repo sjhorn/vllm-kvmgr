@@ -624,15 +624,51 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
         # and cannot appear later, so a hot read would promise something the
         # framework cannot deliver. This is the one knob that needs a restart,
         # and saying so is better than a flag that silently does nothing.
-        if flags.peek("disk_restore"):
-            self._load_handler = DiskLoadHandler(
-                spec=self, kv_caches=kv_caches,
-                staging_blocks=self.staging_blocks,
-                read_threads=self.write_threads, store=handler,
-            )
-            yield (DiskLoadStoreSpec, GPULoadStoreSpec, self._load_handler)
-        else:
-            logger.info(
-                "kvmgr: restore is OFF, so no (DISK -> GPU) handler is "
-                "registered at all. Set disk_restore AND restart to enable it; "
-                "a hot flip cannot work, because handlers are registered once.")
+        # *** REGISTERED UNCONDITIONALLY, AND THE OLD GATE KILLED THE ENGINE
+        # TWICE OVER. *** This used to register the load handler only when
+        # `disk_restore` was set, on the stated reasoning that withholding it
+        # was a second gate -- "done twice so a later optimistic lookup() still
+        # cannot restore". That reasoning was wrong about the FAILURE MODE, and
+        # the box said so on 2026-10-08:
+        #
+        #   worker.py:133 in transfer_async
+        #       assert handler is not None
+        #   AssertionError
+        #   RuntimeError: Worker failed with error ''
+        #
+        # The SCHEDULER reads `disk_restore` hot, so flipping it on a running
+        # engine makes `lookup()` claim keys and `prepare_load` issue load jobs
+        # -- while the WORKER still has no DISK->GPU handler, because handlers
+        # register at construction. `OffloadingWorker.transfer_async` looks the
+        # handler up by medium pair, finds None, and dies on a BARE assert,
+        # taking the worker and then the engine core with it.
+        #
+        # So the second gate does not fail safe; it fails fatal. A gate whose
+        # failure mode is a bare assert in a worker is not a safety feature,
+        # and `lookup()` returning False is already structural: the scheduler
+        # only ever calls `prepare_load` for keys lookup claimed, so with
+        # restore off no file can reach a GPU tensor whether the handler exists
+        # or not.
+        #
+        # *** AND IT FIXES A SECOND BUG FOR FREE: THE RANKS NO LONGER DISAGREE
+        # ABOUT THEIR HANDLER SETS. *** Measured the same day, rank 1 built a
+        # DiskLoadHandler and rank 0 did not, because each node read its own
+        # (differently stale) flags file at boot. Registering unconditionally
+        # makes the handler sets identical by construction, which no amount of
+        # knob-syncing could guarantee -- the boot sync lands after
+        # construction.
+        #
+        # The cost is one object per worker that may never be used. That is the
+        # right price for a knob that is now genuinely hot on both sides.
+        self._load_handler = DiskLoadHandler(
+            spec=self, kv_caches=kv_caches,
+            staging_blocks=self.staging_blocks,
+            read_threads=self.write_threads, store=handler,
+        )
+        yield (DiskLoadStoreSpec, GPULoadStoreSpec, self._load_handler)
+        logger.info(
+            "kvmgr: DISK -> GPU handler registered unconditionally; "
+            "`disk_restore` is now genuinely HOT because lookup() is the only "
+            "gate. Currently %s. Withholding the handler used to be a second "
+            "gate and it killed the engine instead -- see the note here.",
+            "ON" if flags.peek("disk_restore") else "OFF")

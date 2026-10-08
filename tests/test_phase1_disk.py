@@ -223,9 +223,9 @@ m3.complete_store([k1], ctx)
 eq("a re-store of a held key emits nothing", list(m3.take_events()), [])
 
 print()
-print("== (1i) get_handlers registers the STORE direction ONLY ==")
-# The handler needs a GPU, but get_handlers imports it INSIDE the function, so
-# patching the module attribute gives a real test of the registration itself --
+print("== (1i) get_handlers registers BOTH directions, ALWAYS ==")
+# The handlers need a GPU, but get_handlers imports them INSIDE the function, so
+# patching the module attributes gives a real test of the registration itself --
 # which is the part that decides whether a restore is even routable.
 from kvmgr import diskio  # noqa: E402
 
@@ -237,25 +237,55 @@ class _FakeHandler:
         _built.update(kw)
 
 
-_real = diskio.DiskStoreHandler
-diskio.DiskStoreHandler = _FakeHandler
-try:
-    triples = list(sp.get_handlers(kv_caches=object()))
-finally:
-    diskio.DiskStoreHandler = _real
+_realS, _realL = diskio.DiskStoreHandler, diskio.DiskLoadHandler
 
-eq("exactly one handler is registered", len(triples), 1)
-src_cls, dst_cls, _h = triples[0]
-eq("...src is GPU", src_cls.medium(), "GPU")
-eq("...dst is our disk medium", dst_cls.medium(), "DSPARK_DISK")
-# *** THE LOAD DIRECTION MUST NOT EXIST. *** This is the same refusal lookup()
-# makes, done a second time on purpose: with no (DISK -> GPU) handler
-# registered, OffloadingWorker has nothing to route a load to, so a restore
-# cannot happen even if a later edit made lookup() optimistic.
-check("*** with disk_restore OFF, no (DISK -> GPU) handler exists at all, so "
-      "a restore is not even routable ***",
-      not any(s.medium() == "DSPARK_DISK" and d.medium() == "GPU"
-              for s, d, _ in triples))
+
+def _triples():
+    diskio.DiskStoreHandler = diskio.DiskLoadHandler = _FakeHandler
+    try:
+        return list(sp.get_handlers(kv_caches=object()))
+    finally:
+        diskio.DiskStoreHandler, diskio.DiskLoadHandler = _realS, _realL
+
+
+# *** THIS ASSERTED "STORE ONLY" AND THAT DESIGN KILLED THE ENGINE. ***
+# Withholding the DISK->GPU handler when disk_restore was off was written up as
+# a second gate -- "done twice so a later optimistic lookup() still cannot
+# restore". It was wrong about the FAILURE MODE. The scheduler reads
+# disk_restore HOT, so flipping it on a running engine makes lookup() claim keys
+# and prepare_load issue load jobs while the worker still has no handler:
+#     worker.py:133  assert handler is not None   -> AssertionError
+#     RuntimeError: Worker failed with error ''
+# A bare assert in a worker, which took the engine core with it. Measured
+# 2026-10-08 at 205K tokens.
+#
+# So the property to assert is the opposite: the HANDLER SET MUST NOT DEPEND ON
+# THE FLAG. lookup() is the only gate, and it is structural -- the scheduler
+# only calls prepare_load for keys lookup claimed.
+for _flag in (0, 1):
+    F.write(kvmgr_enabled=1, disk_restore=_flag)
+    flags.reset_for_tests()
+    _t = _triples()
+    eq(f"with disk_restore={_flag}: BOTH directions registered", len(_t), 2)
+    _pairs = sorted((a.medium(), b.medium()) for a, b, _ in _t)
+    eq(f"...the pairs, disk_restore={_flag}", _pairs,
+       [("DSPARK_DISK", "GPU"), ("GPU", "DSPARK_DISK")])
+
+F.write(kvmgr_enabled=1, disk_restore=0)
+flags.reset_for_tests()
+_off = sorted((a.medium(), b.medium()) for a, b, _ in _triples())
+F.write(kvmgr_enabled=1, disk_restore=1)
+flags.reset_for_tests()
+_on = sorted((a.medium(), b.medium()) for a, b, _ in _triples())
+eq("*** the handler set is IDENTICAL either way -- which is also why the two "
+   "ranks can no longer disagree about it ***", _off, _on)
+
+# and the gate that remains must still refuse
+F.write(kvmgr_enabled=1, disk_restore=0)
+flags.reset_for_tests()
+_m = sp.get_manager()
+check("*** with restore off, lookup() still refuses -- the ONE gate, and it is "
+      "structural ***", _m.lookup(k1, ctx) is False)
 
 eq("the handler is built with our staging size", _built.get("staging_blocks"), 32)
 check("...and gets the spec, so it can reach file_mapper()", _built.get("spec") is sp)
@@ -280,7 +310,7 @@ try:
     both = list(mkspec().get_handlers(kv_caches=object()))
 finally:
     diskio.DiskLoadHandler = _rl
-    diskio.DiskStoreHandler = _real
+    diskio.DiskStoreHandler = _realS
     F.write(disk_restore=0)
     flags.reset_for_tests()
 
