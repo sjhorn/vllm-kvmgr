@@ -1162,6 +1162,93 @@ hf2.wait({9999})
 eq("a foreign id counts the CALL but blocks on nothing",
    (hf2.stats["wait_calls"], hf2.stats["wait_ours"]), (1, 0))
 
+print("\n== (b15) CONCURRENT writes of the SAME key -- the crash, reproduced ==")
+
+# *** THIS IS THE BUG THAT TOOK THE ENGINE DOWN THREE TIMES. *** write_chunks
+# used a FIXED `<path>.part`, four writer threads run, and the same block hash
+# can be in two IN-FLIGHT jobs at once -- `_write_batch`'s exists() check only
+# skips files already COMPLETED. The live traceback:
+#     FileNotFoundError: [Errno 2] ... in write_chunks: os.replace(tmp, path)
+# raised in a writer thread and re-raised by fut.result() on the worker's
+# critical path. The other outcome is worse: two writers interleaving into one
+# temp file produce a file of exactly the right LENGTH holding bytes from two
+# blocks, which passes read_chunks' size check and restores as wrong KV.
+import threading as _th14
+
+WDIR15 = tempfile.mkdtemp(prefix="kvrace-")
+# one group, one 4096-byte page -- the shape REFS already uses
+REFS15 = [[Ref(0, 4096)]]
+
+
+def _writer(path, byte, out, barrier):
+    def read_row(t, s_, n):
+        return bytes([byte]) * n
+    try:
+        barrier.wait(timeout=5)
+        out.append(("ok", diskio.write_chunks(
+            path, diskio.file_plan(REFS15, 0, 0), read_row)))
+    except Exception as e:
+        out.append(("err", f"{type(e).__name__}: {e}"))
+
+
+def race(n=6):
+    """n threads writing the SAME path at once, each with its own byte."""
+    path = os.path.join(WDIR15, f"race{next(_ctr)}.bin")
+    out, barrier = [], _th14.Barrier(n)
+    ts = [_th14.Thread(target=_writer, args=(path, 0xA0 + i, out, barrier))
+          for i in range(n)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=10)
+    return path, out
+
+
+import itertools as _it14
+_ctr = _it14.count()
+
+path15, out15 = race(6)
+_errs = [o for o in out15 if o[0] == "err"]
+eq("*** six concurrent writers of one key: NO exceptions ***", _errs, [])
+eq("...all six reported a full write", len([o for o in out15 if o[0] == "ok"]), 6)
+check("the file exists and is exactly one page", os.path.getsize(path15) == 4096,
+      os.path.getsize(path15))
+
+# *** THE CORRECTNESS HALF: the surviving file must be ONE writer's bytes,
+# never a blend. A blend is the same length and so passes every size check.
+_data = open(path15, "rb").read()
+eq("*** and it is ONE writer's bytes, not a blend of several ***",
+   len(set(_data)), 1,)
+check("...and that byte is one a writer actually used",
+      _data[0] in range(0xA0, 0xA6), hex(_data[0]))
+
+# no temp files left behind, or they accumulate forever
+_leftover = [f for f in os.listdir(WDIR15) if ".part" in f]
+eq("no .part files survive a clean race", _leftover, [])
+
+# And the lint: a FIXED temp suffix is the bug, so assert the name varies.
+_p1 = os.path.join(WDIR15, "u1.bin")
+_seen = set()
+_orig_replace = os.replace
+
+
+def _spy(src, dst):
+    _seen.add(os.path.basename(src))
+    return _orig_replace(src, dst)
+
+
+os.replace = _spy
+try:
+    for _ in range(4):
+        diskio.write_chunks(_p1, diskio.file_plan(REFS15, 0, 0),
+                            lambda t, s_, n: b"\x11" * n)
+finally:
+    os.replace = _orig_replace
+check("*** the temp name is UNIQUE per write, which is the whole fix ***",
+      len(_seen) == 4, sorted(_seen))
+check("...and carries pid and thread, so two PROCESSES cannot collide either",
+      all(str(os.getpid()) in n for n in _seen), sorted(_seen)[:1])
+
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:

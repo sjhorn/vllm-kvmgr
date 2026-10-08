@@ -36,7 +36,9 @@ REFUSE rather than write on any mismatch.
 
 from __future__ import annotations
 
+import itertools
 import os
+import threading
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from vllm.logger import init_logger
@@ -199,6 +201,9 @@ class SlotPool:
                 "high_water": self.high_water}
 
 
+_tmp_seq = itertools.count()
+
+
 def write_chunks(path: str, plan: "Sequence[Chunk]", read_row: Any,
                  tmp_suffix: str = ".part") -> int:
     """Write one file ATOMICALLY: temp file, then rename.
@@ -207,14 +212,48 @@ def write_chunks(path: str, plan: "Sequence[Chunk]", read_row: Any,
     decides a block is on disk with os.path.exists(). A crash or a full disk
     midway through a plain write leaves a SHORT file at the real path, which
     exists() reports as a hit and which would then restore as truncated KV --
-    plausible tensors, nothing crashing. Writing to `<path>.part` and renaming
+    plausible tensors, nothing crashing. Writing to a temp file and renaming
     means a path either does not exist or is complete.
+
+    *** AND THE TEMP NAME MUST BE UNIQUE PER WRITER, WHICH IT WAS NOT. ***
+    This used a FIXED `<path>.part`, and that is the bug that took the engine
+    down three times on 2026-10-08:
+
+        FileNotFoundError: [Errno 2] No such file or directory:
+          '..._r0/ba6/63_g4/ba66347598f1a42....bin'
+          File "kvmgr/diskio.py", line 230, in write_chunks
+            os.replace(tmp, path)
+
+    Four writer threads, and the same block hash can legitimately be in two
+    IN-FLIGHT jobs at once -- `_write_batch`'s `os.path.exists(path)` check
+    only skips files that have already COMPLETED, never one being written. So
+    two writers took the same `path`, derived the same `<path>.part`, and:
+
+      - one renamed first and the temp vanished, so the other's
+        `os.replace(tmp, path)` raised ENOENT -- in a WRITER THREAD, re-raised
+        by `fut.result()` inside `get_finished()`, which runs on the worker's
+        critical path. That is the crash, and it explains why it looked like
+        load: a fresh prompt generates block hashes never seen before, so the
+        duplicate-key window is widest exactly when the prompt is big.
+
+      - or they INTERLEAVED into one temp file and produced a file of exactly
+        the right LENGTH holding bytes from two different blocks. That is
+        worse than the crash: it passes `read_chunks`' size check and restores
+        as silently wrong KV -- the `F8_E8M0` hazard class, plausible tensors
+        and nothing crashing.
+
+    A unique temp per writer fixes both. Two writers then produce two complete,
+    byte-identical files and race only on the rename, where the last one wins
+    and either outcome is correct.
 
     `read_row(tensor_idx, slot, nbytes) -> bytes-like` is injected so this is
     testable with no torch.
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + tmp_suffix
+    # pid + thread + counter: distinct across processes (both ranks share a
+    # filesystem path layout), across the writer pool, and across retries.
+    tmp = "%s%s.%d.%d.%d" % (path, tmp_suffix, os.getpid(),
+                             threading.get_ident(), next(_tmp_seq))
     written = 0
     try:
         with open(tmp, "wb") as f:
