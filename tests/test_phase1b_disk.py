@@ -329,8 +329,17 @@ def mkhandler(pool_size, nrefs=REFS):
     h._writers = SyncWriters()
     h._jobs, h._inner_to_job, h._writing = {}, {}, []
     h._next_inner, h._saturated = 1, False
+    # *** THE FIXTURE MUST CARRY EVERY COUNTER THE REAL CONSTRUCTOR SETS. ***
+    # Hand-building `stats` means a new counter breaks the suite with a
+    # KeyError rather than being covered -- which is a loud failure and so
+    # tolerable, but it is the second time today a hand-built fixture needed
+    # updating for a field the real object gained. Mirrored from
+    # DiskStoreHandler.__init__; the fence counters are the ones that measure
+    # whether a synchronous flush is what costs the ~2x prefill slowdown.
     h.stats = {"submitted": 0, "refused_pairing": 0, "files": 0, "bytes": 0,
-               "errors": 0}
+               "errors": 0, "wait_calls": 0, "wait_ours": 0,
+               "wait_blocked_ms": 0, "wait_max_pending": 0, "wait_rounds": 0,
+               "saturations": 0}
     h._read_row = lambda t, s, n: b"\xab" * n
     return h
 
@@ -1082,6 +1091,45 @@ for _i, _body in enumerate(_waits):
           "deadline = time.monotonic() + 120.0" in _body)
     check(f"wait() #{_i + 1} says WHICH jobs timed out",
           "sorted(" in _body and "timed out" in _body)
+
+print("\n== (b14) the fence counters, and the fixture that must keep up ==")
+
+# The fixture hand-builds `stats`, so a counter the real constructor gains
+# breaks the suite with a KeyError. Loud, but an assertion naming the missing
+# key is better than a traceback -- so the two are compared directly.
+import re as _re14
+
+_src14 = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                           "diskio.py")).read()
+_i14 = _src14.index("self.stats = {")
+_j14 = _src14.index("}", _src14.index('"saturations"', _i14))
+_real_keys = set(_re14.findall(r'"(\w+)":', _src14[_i14:_j14]))
+_fix_keys = set(mkhandler(4).stats)
+eq("*** the fixture carries every counter the real constructor sets ***",
+   sorted(_real_keys - _fix_keys), [])
+
+# and the fence counters must actually MOVE, or they measure nothing
+hf = mkhandler(8)
+kf = gkeys(0, 40, salt=66)
+gf = base.GPULoadStoreSpec(list(range(7000, 7040)),
+                           group_sizes=[40, 0, 0, 0, 0], block_indices=[0] * 5)
+hf.transfer_async(4242, (gf, diskspec.DiskLoadStoreSpec(kf)))
+check("a 40-block job against an 8-block pool is queued in rounds",
+      hf._jobs[4242]["batches"] != [])
+eq("...and the saturation is counted", hf.stats["saturations"], 1)
+hf.wait({4242})
+eq("*** wait() counts the fence firing ***", hf.stats["wait_calls"], 1)
+eq("...and how many of OUR jobs it blocked on", hf.stats["wait_ours"], 1)
+check("...and how long it blocked, which is the 2x question",
+      hf.stats["wait_blocked_ms"] >= 0, hf.stats["wait_blocked_ms"])
+check("...and how many pump rounds it took", hf.stats["wait_rounds"] >= 1,
+      hf.stats["wait_rounds"])
+check("...and the job really completed", 4242 not in hf._jobs)
+
+hf2 = mkhandler(8)
+hf2.wait({9999})
+eq("a foreign id counts the CALL but blocks on nothing",
+   (hf2.stats["wait_calls"], hf2.stats["wait_ours"]), (1, 0))
 
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")

@@ -354,9 +354,26 @@ def install_worker_methods() -> None:
     def kvmgr_snapshot(self) -> dict:
         from . import flags
 
-        return {"rank": getattr(self, "rank", None),
-                "knobs": {n: flags.raw(n) for n in flags.DEFAULTS},
-                "sources": {n: flags.source_of(n) for n in flags.DEFAULTS}}
+        out = {"rank": getattr(self, "rank", None),
+               "knobs": {n: flags.raw(n) for n in flags.DEFAULTS},
+               "sources": {n: flags.source_of(n) for n in flags.DEFAULTS}}
+        # *** THE HANDLER STATS LIVE HERE AND NOWHERE ELSE. *** The store and
+        # load handlers are constructed in the WORKER; `/kv` runs in the API
+        # server, so its disk section can only ever report the API server's
+        # (empty) view. The fence counters -- wait_calls, wait_blocked_ms,
+        # wait_max_pending -- are the numbers that say whether moving the fence
+        # from disk to staging is worth the design change, and this RPC is the
+        # only way they reach a caller.
+        try:
+            from . import diskio
+
+            out["handlers"] = [
+                dict(h.snapshot(), cls=type(h).__name__)
+                for h in getattr(diskio, "_LIVE_HANDLERS", ())
+            ]
+        except Exception as e:
+            out["handlers_error"] = str(e)
+        return out
 
     Worker.kvmgr_set_knob = kvmgr_set_knob
     Worker.kvmgr_clear_knob = kvmgr_clear_knob
@@ -616,6 +633,22 @@ def _router():
         out = await _fanout(raw_request, "kvmgr_clear_knob", {"name": name})
         return JSONResponse(status_code=200 if out.get("ok") else 409,
                             content=out)
+
+    @router.get("/kv/workers")
+    async def kv_workers(raw_request: Request):
+        """Per-rank knobs, sources and HANDLER stats, straight off the workers.
+
+        `GET /kv` can only report the API server's view, and the handlers --
+        with the fence counters on them -- live in the workers. This is the
+        only route that can see them.
+        """
+        try:
+            ranks = await engine_client(raw_request).collective_rpc(
+                method="kvmgr_snapshot", args=(), kwargs={})
+        except Exception as e:
+            return JSONResponse(status_code=409,
+                                content={"ok": False, "error": str(e)})
+        return JSONResponse(content={"ok": True, "ranks": ranks})
 
     @router.post("/kv/reload")
     async def kv_reload(raw_request: Request):

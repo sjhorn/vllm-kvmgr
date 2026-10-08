@@ -530,7 +530,21 @@ class DiskStoreHandler:
         self._next_inner = 1
         self._saturated = False
         self.stats = {"submitted": 0, "refused_pairing": 0,
-                      "files": 0, "bytes": 0, "errors": 0}
+                      "files": 0, "bytes": 0, "errors": 0,
+                      # *** THE FENCE, MEASURED. *** `handle_preemptions`
+                      # calls `worker.wait(jobs_to_flush)` SYNCHRONOUSLY on the
+                      # worker's critical path, and our wait() blocks until the
+                      # bytes are ON DISK. The scheduler's reason for asking is
+                      # a fence -- "I am about to reuse GPU block B and a store
+                      # for B is still pending" (scheduler.py ~615, ~670, ~847)
+                      # -- and that is satisfied once the bytes are in pinned
+                      # STAGING, not once they are on disk. These counters are
+                      # what say whether moving the fence to staging is worth
+                      # the design change; the ~2x prefill slowdown measured
+                      # 2026-10-08 is what they have to account for.
+                      "wait_calls": 0, "wait_ours": 0,
+                      "wait_blocked_ms": 0, "wait_max_pending": 0,
+                      "wait_rounds": 0, "saturations": 0}
         logger.info(
             "kvmgr: disk store handler -- staging %d blocks x %d tensors "
             "(pinned=%s), per-group file sizes %s, sum %d B (the per-rank page; "
@@ -605,6 +619,7 @@ class DiskStoreHandler:
                         # not an error -- but silence here is what made the
                         # original failure diagnosable only by elimination.
                         self._saturated = True
+                        self.stats["saturations"] += 1
                         logger.info(
                             "kvmgr: staging pool saturated (%d blocks); store "
                             "jobs are proceeding in rounds. Raise "
@@ -759,17 +774,24 @@ class DiskStoreHandler:
         """
         import time
 
+        self.stats["wait_calls"] += 1
         # Snapshot our own ids first: get_finished() pops completed jobs, so
         # testing membership inside the loop would race with our own progress.
         remaining = {j for j in job_ids if j in self._jobs}
         if not remaining:
             return
+        self.stats["wait_ours"] += len(remaining)
+        self.stats["wait_max_pending"] = max(
+            self.stats["wait_max_pending"], len(remaining))
+        _t0 = time.monotonic()
         deadline = time.monotonic() + 120.0
         while remaining and time.monotonic() < deadline:
+            self.stats["wait_rounds"] += 1
             for r in self.get_finished():
                 remaining.discard(r.job_id)
             if remaining:
                 time.sleep(0.0005)
+        self.stats["wait_blocked_ms"] += int((time.monotonic() - _t0) * 1000)
         if remaining:
             # Name them: a flush that timed out has left KV unpersisted for a
             # block the scheduler is about to reuse, and which job it was is
@@ -838,8 +860,14 @@ class DiskLoadHandler:
         self._reading: list[tuple[int, Any, list[int], list, int]] = []
         self._inner_to_job: dict[int, tuple] = {}
         self._next_inner = 1_000_000          # disjoint from the store's ids
+        # The LOAD handler shares wait()'s shape, so it shares the counters --
+        # a missing key here is a KeyError in the fence, which is exactly the
+        # bug the offline fixture-parity assertion caught before it shipped.
         self.stats = {"submitted": 0, "refused_pairing": 0, "files": 0,
-                      "bytes": 0, "errors": 0}
+                      "bytes": 0, "errors": 0,
+                      "wait_calls": 0, "wait_ours": 0, "wait_blocked_ms": 0,
+                      "wait_max_pending": 0, "wait_rounds": 0,
+                      "saturations": 0}
         logger.info("kvmgr: disk LOAD handler installed (restore is live)")
         _LIVE_HANDLERS.append(self)
 
@@ -993,15 +1021,22 @@ class DiskLoadHandler:
         """
         import time
 
+        self.stats["wait_calls"] += 1
         rem = {j for j in job_ids if j in self._jobs}
         if not rem:
             return
+        self.stats["wait_ours"] += len(rem)
+        self.stats["wait_max_pending"] = max(
+            self.stats["wait_max_pending"], len(rem))
+        _t0 = time.monotonic()
         deadline = time.monotonic() + 120.0
         while rem and time.monotonic() < deadline:
+            self.stats["wait_rounds"] += 1
             for r in self.get_finished():
                 rem.discard(r.job_id)
             if rem:
                 time.sleep(0.0005)
+        self.stats["wait_blocked_ms"] += int((time.monotonic() - _t0) * 1000)
         if rem:
             # A load that timed out is worse than a store that did: the
             # scheduler has already told the engine those tokens are computed.
