@@ -361,7 +361,16 @@ gpu = base.GPULoadStoreSpec(list(range(1000, 1100)), group_sizes=[100, 0, 0, 0, 
 check("*** a 100-block job against an 8-block pool is ACCEPTED, not refused ***",
       h.transfer_async(77, (gpu, diskspec.DiskLoadStoreSpec(ks))) is True)
 eq("...and only a pool's worth is submitted at first", len(h._inner.subs), 1)
-eq("...of exactly the pool size", len(h._inner.subs[0][1]), 8)
+# *** THE FLOOR CHANGES THIS NUMBER ON PURPOSE, so the expectation is derived
+# rather than hardcoded. *** The store and load handlers share one pool, and
+# that sharing made the same restore take 574.9s with stores live against 3.3s
+# with them paused. A quarter of the pool is now reserved for the other
+# direction, so a store round gets `size - read_floor`, not `size`. Writing the
+# arithmetic out keeps the test honest about WHY the number moved.
+_sz, _wf, _rf = diskio.staging_plan(8, 0, 0, 0)
+eq("the derived read floor for an 8-slot pool", _rf, 2)
+eq("...so a store round takes size - read_floor", len(h._inner.subs[0][1]),
+   _sz - _rf)
 check("...with the job still queued", h._jobs[77]["batches"] != [])
 check("...and the saturation note said ONCE", h._saturated is True)
 
@@ -372,7 +381,14 @@ while not done and rounds < 100:
 eq("the job completes after pumping", len(done), 1)
 eq("...reporting OUR job id, not an inner one", done[0].job_id, 77)
 check("...as a success", done[0].success is True)
-eq("...over ceil(100/8) rounds", len(h._inner.subs), 13)
+# Derived too, for the same reason: with a floor the per-round batch is
+# size - read_floor, so the round count is ceil(100 / (size - floor)).
+import math as _math  # noqa: E402
+eq("...over ceil(100 / (size - read_floor)) rounds", len(h._inner.subs),
+   _math.ceil(100 / (_sz - _rf)))
+check("*** and every block still moves exactly once -- the floor must not "
+      "drop or duplicate work ***",
+      sorted(b for sub in h._inner.subs for b in sub[1]) == list(range(1000, 1100)))
 eq("...covering every block exactly once",
    sorted(b for s in h._inner.subs for b in s[1]), list(range(1000, 1100)))
 eq("...and every key got a file", h.stats["files"], 100)
@@ -1464,6 +1480,84 @@ _calls_gf_in_wait = [ln.strip() for ln in
                      _src[_src.index("def wait("):].splitlines()[:40]
                      if "self.get_finished()" in ln]
 eq("*** wait() must never call get_finished ***", _calls_gf_in_wait, [])
+
+# -- (b19) the staging pool: a HOT size and a floor per direction ----------
+#
+# Two things the 574.9s-against-3.3s result asked for. The store and load
+# handlers SHARE one pool, and the pump advances once per SCHEDULER STEP, so
+# fewer slots per round means fewer blocks per step: the cold pass had the whole
+# pool for writes and ran at 177 MB/s, the restore pass shared it and managed
+# 17.7 MB/s on the same disk.
+#
+# The ALLOCATION cannot be hot -- the pinned staging is 63 tensors held by both
+# handlers and two inner handlers -- so it is a boot ceiling and the LIVE SIZE
+# moves within it. A slot is an index into rows that already exist, so raising
+# and lowering it allocates nothing.
+sp = diskio.SlotPool(16)
+eq("capacity is the allocation", sp.capacity, 16)
+eq("...and the live size starts at it", sp.size, 16)
+eq("shrinking is instant", sp.set_limit(4), 4)
+eq("...and only the live size moves, never the allocation",
+   (sp.size, sp.capacity), (4, 16))
+eq("*** a shrunk pool hands out only slots BELOW the limit ***",
+   all(x < 4 for x in sp.take_upto(99)), True)
+eq("...and exactly that many", len(sp._free), 12)
+eq("available reports ELIGIBLE free slots, not every free row",
+   sp.snapshot()["available"], 0)
+eq("...while rows_free shows the allocation that is idle",
+   sp.snapshot()["rows_free"], 12)
+check("*** reporting the ineligible rows as available would read as headroom "
+      "that is not there ***",
+      sp.snapshot()["available"] != sp.snapshot()["rows_free"])
+eq("growing back within the allocation is instant too", sp.set_limit(16), 16)
+eq("...and is clamped to the allocation, never above", sp.set_limit(999), 16)
+eq("...and never to zero, which would wedge both directions", sp.set_limit(0), 1)
+
+# shrinking must not claw back slots that are IN USE
+sp2 = diskio.SlotPool(8)
+held = sp2.take_upto(8)
+eq("all eight taken", len(held), 8)
+sp2.set_limit(2)
+sp2.give(held)
+eq("*** a shrink drains rather than snatching: returned slots above the new "
+   "limit are simply not re-offered ***", len(sp2.take_upto(99)), 2)
+
+# the floors
+sp3 = diskio.SlotPool(10)
+eq("a reserve leaves that many free", len(sp3.take_upto(99, reserve=3)), 7)
+eq("...and the other direction can then take them",
+   len(sp3.take_upto(99, reserve=0)), 3)
+sp4 = diskio.SlotPool(10)
+eq("all-or-nothing honours the reserve too", sp4.take(8, reserve=3), None)
+eq("...while a fitting request succeeds", len(sp4.take(7, reserve=3) or []), 7)
+
+# *** THE DEADLOCK THE TWO FLOORS COULD BUILD. *** If each direction reserved
+# half, both would see zero available and both would stall for ever -- a hang
+# assembled out of two anti-starvation measures. Each floor is clamped so the
+# other side can always take one.
+for _cap in (1, 2, 3, 4, 8, 32, 256):
+    _sz, _wf, _rf = diskio.staging_plan(_cap, 0, 0, 0)
+    check(f"cap {_cap}: a write can always take at least one slot",
+          _sz - _rf >= 1)
+    check(f"cap {_cap}: a read can always take at least one slot",
+          _sz - _wf >= 1)
+_sz, _wf, _rf = diskio.staging_plan(32, 0, 99, 99)
+check("*** absurd floors cannot starve either direction ***",
+      _sz - _wf >= 1 and _sz - _rf >= 1)
+
+eq("0 means the whole allocation, not a silent constant",
+   diskio.staging_plan(256, 0, 0, 0)[0], 256)
+eq("...and the floors scale with the size rather than staying at 8",
+   diskio.staging_plan(256, 0, 0, 0)[1:], (64, 64))
+eq("an explicit size overrides the allocation",
+   diskio.staging_plan(256, 64, 0, 0)[0], 64)
+eq("...and the derived floors follow the LIVE size, not the allocation",
+   diskio.staging_plan(256, 64, 0, 0)[1:], (16, 16))
+eq("explicit floors are honoured", diskio.staging_plan(32, 0, 5, 7)[1:], (5, 7))
+
+# and the knob reader must never stop a transfer
+eq("an unreadable knob falls back to the documented default, it does not raise",
+   diskio.staging_knobs(64)[0], 64)
 
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:

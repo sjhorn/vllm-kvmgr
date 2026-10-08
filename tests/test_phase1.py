@@ -276,6 +276,16 @@ PROBE = {
     "disk_budget_gb": (0.0, 64.0),
     "disk_restore": (0, 1),
     "disk_store_paused": (0, 1),
+    # The staging knobs. These ARE genuinely hot in both value and effect: the
+    # live pool size is re-read from the flags on every transfer round and
+    # `set_limit` only moves which already-allocated rows are handed out, so
+    # nothing is reallocated. The ALLOCATION (`staging_blocks` in
+    # KV_TRANSFER_CONFIG) is the boot ceiling and is deliberately NOT a flag --
+    # a knob that silently needed a restart is what the control plane exists to
+    # stop, so it is not offered as one.
+    "staging_slots": (0, 64),
+    "staging_write_floor": (0, 8),
+    "staging_read_floor": (0, 8),
     # *** THE ONE KNOB WHOSE VALUE IS HOT AND WHOSE EFFECT IS NOT, and the
     # loop below cannot tell the difference. *** It passes here because
     # `flags.raw()` really does re-read it with no restart -- but it is

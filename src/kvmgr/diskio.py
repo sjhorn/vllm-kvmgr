@@ -131,6 +131,45 @@ def check_pairing(keys: "Sequence[bytes]", block_ids: "Sequence[int]",
     return None
 
 
+def staging_plan(pool_capacity: int, slots_knob: int, write_floor_knob: int,
+                 read_floor_knob: int) -> tuple[int, int, int]:
+    """Resolve the three staging knobs. PURE, so the arithmetic is testable.
+
+    Returns `(live_size, write_floor, read_floor)`.
+
+    *** THE FLOORS MUST NEVER ADD UP TO THE WHOLE POOL. *** If each direction
+    reserved half, both would see zero available and both would stall for ever
+    -- a deadlock built out of two anti-starvation measures, presenting as a
+    hang with no cause. Each floor is therefore clamped to `size - 1`, so the
+    other direction can always take at least one slot.
+
+    0 means "derive it": the whole allocation for the size, a quarter of the
+    live size for each floor. So an unset knob is not a silent constant, and
+    raising the size scales the floors with it.
+    """
+    size = max(1, int(slots_knob) if int(slots_knob) > 0 else int(pool_capacity))
+
+    def _floor(k: int) -> int:
+        f = int(k) if int(k) > 0 else size // 4
+        return max(0, min(f, size - 1))
+
+    return size, _floor(write_floor_knob), _floor(read_floor_knob)
+
+
+def staging_knobs(pool_capacity: int) -> tuple[int, int, int]:
+    """`staging_plan` against the live flags. Imported locally, matching this
+    file's style and keeping `flags` out of the module's import graph."""
+    try:
+        from kvmgr import flags as _f
+        return staging_plan(pool_capacity, _f.peek("staging_slots"),
+                            _f.peek("staging_write_floor"),
+                            _f.peek("staging_read_floor"))
+    except Exception:
+        # An unreadable knob must not stop a transfer: fall back to the whole
+        # allocation with derived floors, which is the documented default.
+        return staging_plan(pool_capacity, 0, 0, 0)
+
+
 class SlotPool:
     """Staging slots, handed out and returned. Pure, so the leak is testable.
 
@@ -152,36 +191,101 @@ class SlotPool:
     rather than `take` is the interface that makes that possible: the handler
     chunks a job across as many staging rounds as it needs. Staging stays small
     AND a job of any size is accepted.
+
+
+    *** HOT SIZE, WITHIN A FIXED ALLOCATION. *** The pinned staging is 63
+    tensors held by both handlers and by two SingleDirectionOffloadingHandler
+    instances, so REALLOCATING it on a live store path is not a tuning knob, it
+    is a corruption risk -- on a box with ~3GB available and no OOM net. So the
+    allocation is a CEILING chosen at boot (`capacity`), and the hot knob moves
+    only how many of those rows the pool hands out (`limit`). A slot is an index
+    into rows that already exist, so raising and lowering the limit is instant
+    and cannot allocate anything.
+
+    Shrinking does not claw back slots that are in use: they are simply not
+    re-offered once returned, so the pool drains to the new limit.
+
+    *** AND A FLOOR PER DIRECTION, NOT A SPLIT. *** The store and load handlers
+    SHARE this pool (`self._pool = store._pool`), and that sharing is what made
+    the same restore take 574.9s with stores live and 3.3s with them paused --
+    a 174x spread. `take_upto` hands out whatever is free and the pump advances
+    once per SCHEDULER STEP, so fewer slots per round means fewer blocks moved
+    per step: the cold pass had the whole pool for writes and ran at 177 MB/s,
+    the restore pass shared it and managed 17.7 MB/s on the same disk.
+    
+    A hard split would waste half the pool whenever only one direction is busy.
+    A `reserve` floor keeps full utilisation when one side is idle while
+    guaranteeing the other can always make progress -- which matters because a
+    starved WRITE is not merely slow: its blocks stay in `jobs_to_flush`,
+    fencing GPU blocks, and that is the path that deferred a request until
+    NCCL's watchdog killed a worker.
     """
 
     def __init__(self, size: int):
-        if size <= 0:
-            raise ValueError("kvmgr: staging pool must hold at least one block")
+        # A zero-capacity pool cannot ever hand out a slot, so every transfer
+        # would refuse forever -- a mechanism present and producing nothing.
+        # Refused at construction rather than discovered on the first request.
+        if int(size) < 1:
+            raise ValueError(
+                "kvmgr: staging pool capacity must be >= 1 (got %r); a "
+                "zero-slot pool refuses every transfer forever" % (size,))
+        size = int(size)
         self._free: list[int] = list(range(size))
-        self.size = size
+        self.capacity = size      # allocated rows -- fixed for the process
+        self._limit = size        # how many we hand out -- hot
         self.high_water = 0
 
-    def take(self, n: int) -> list[int] | None:
+    @property
+    def size(self) -> int:
+        """The LIVE size. Named `size` because callers and the snapshot already
+        used it, and it is the number that matters operationally."""
+        return self._limit
+
+    def set_limit(self, k: int) -> int:
+        """Move the live size. Clamped to [1, capacity]; returns what it became.
+
+        Clamped rather than refused: a knob that silently does nothing is this
+        repo's signature failure, and a knob that takes the pool to zero would
+        wedge both directions. The caller logs the change.
+        """
+        k = max(1, min(int(k), self.capacity))
+        self._limit = k
+        return k
+
+    def _eligible(self) -> list[int]:
+        return [s for s in self._free if s < self._limit]
+
+    def take(self, n: int, reserve: int = 0) -> list[int] | None:
         """All-or-nothing. Kept for the tests that pin the boundary; the handler
         uses take_upto, because an all-or-nothing pool cannot serve a job larger
         than the pool."""
-        if n > len(self._free):
+        elig = self._eligible()
+        if n > max(0, len(elig) - max(0, reserve)):
             return None
-        out = [self._free.pop() for _ in range(n)]
-        self.high_water = max(self.high_water, self.size - len(self._free))
-        return out
+        return self._hand_out(elig[:n])
 
-    def take_upto(self, n: int) -> list[int]:
-        """As many as are free, up to n. May return fewer, never None.
+    def take_upto(self, n: int, reserve: int = 0) -> list[int]:
+        """As many as are free, up to n, never dropping free below `reserve`.
 
         The handler needs a PARTIAL answer: a store job can be hundreds of
         blocks (a 48K prompt is ~190 blocks in group 0 alone) against a pool of
         32, and refusing it is fatal. Returning what is available lets the job
         proceed in rounds.
+
+        `reserve` is the floor left for the OTHER direction. It is advisory in
+        the only way that matters: it can never stop a caller taking a slot when
+        the pool is otherwise empty of competitors, because the floor is counted
+        against FREE slots, and the other side releases as it finishes.
         """
-        k = min(n, len(self._free))
-        out = [self._free.pop() for _ in range(k)]
-        self.high_water = max(self.high_water, self.size - len(self._free))
+        elig = self._eligible()
+        k = min(max(0, n), max(0, len(elig) - max(0, reserve)))
+        return self._hand_out(elig[:k])
+
+    def _hand_out(self, out: list[int]) -> list[int]:
+        for sl in out:
+            self._free.remove(sl)
+        in_use = self._limit - len(self._eligible())
+        self.high_water = max(self.high_water, in_use)
         return out
 
     def give(self, slots: "Sequence[int]") -> None:
@@ -197,7 +301,12 @@ class SlotPool:
         return len(self._free)
 
     def snapshot(self) -> dict[str, int]:
-        return {"size": self.size, "available": len(self._free),
+        # `available` counts ELIGIBLE free slots, not every free row: with the
+        # limit below capacity the others exist but are not handed out, and
+        # reporting them as available would read as headroom that is not there.
+        return {"size": self.size, "capacity": self.capacity,
+                "available": len(self._eligible()),
+                "rows_free": len(self._free),
                 "high_water": self.high_water}
 
 
@@ -790,6 +899,23 @@ class DiskStoreHandler:
         # my own instrumentation broke a test.
         write_geometry(kv_caches, spec,
                        os.environ.get("KVMGR_SNAPSHOT_DIR", spec.root_dir))
+        # *** SAY WHAT THE ALLOCATION COSTS, because it is PINNED and this box
+        # *** has no OOM net. Pinned pages cannot be swapped, and swap is the
+        # gate that matters here -- earlyoom is absent under spark-os, so the
+        # failure mode is a thrash livelock needing a hard reset, not a kill.
+        # Measured geometry: 63 tensors summing to 1,039,680 B a block, so 32
+        # blocks is 33 MB and 256 is 266 MB per rank. One log line beats
+        # anybody doing that arithmetic from a shape dump again.
+        _per_block = sum(t.page_size_bytes * spec.block_size_factor
+                         for t in kv_caches.tensors)
+        logger.info(
+            "kvmgr: staging allocation -- %d blocks x %d tensors = %.1f MB "
+            "PINNED per rank (%d B a block). This is the CEILING: the live pool "
+            "size is hot via the staging_slots knob, because reallocating a "
+            "buffer held by two handlers and two inner handlers on a live store "
+            "path is a corruption risk, not a tuning knob.",
+            staging_blocks, len(kv_caches.tensors),
+            staging_blocks * _per_block / 1e6, _per_block)
         self._pool = SlotPool(staging_blocks)
         self._writers = ThreadPoolExecutor(max_workers=write_threads,
                                            thread_name_prefix="kvmgr_disk")
@@ -903,7 +1029,16 @@ class DiskStoreHandler:
         for job_id, st in self._jobs.items():
             while st["batches"] and not st["failed"]:
                 g, bkeys, bids = st["batches"][0]
-                slots = self._pool.take_upto(len(bids))
+                _sz, _wf, _rf = staging_knobs(self._pool.capacity)
+                if _sz != self._pool.size:
+                    logger.info(
+                        "kvmgr: staging pool live size %d -> %d of %d allocated "
+                        "(hot; the allocation itself is a boot ceiling)",
+                        self._pool.size, _sz, self._pool.capacity)
+                    self._pool.set_limit(_sz)
+                # Leave the READ floor free: a load starved of slots makes the
+                # RESTORE the slow half, which is the 574.9s-against-3.3s case.
+                slots = self._pool.take_upto(len(bids), reserve=_rf)
                 if not slots:
                     if not self._saturated:
                         # Said ONCE: a saturated pool is now a throughput note,
@@ -1248,7 +1383,12 @@ class DiskLoadHandler:
         for job_id, st in self._jobs.items():
             while st["batches"] and not st["failed"]:
                 g, bkeys, bids = st["batches"][0]
-                slots = self._pool.take_upto(len(bids))
+                _sz, _wf, _rf = staging_knobs(self._pool.capacity)
+                # Leave the WRITE floor free. A starved write is not merely
+                # slow: its blocks stay in jobs_to_flush fencing GPU blocks,
+                # which is the path that deferred a request until NCCL's
+                # watchdog killed a worker.
+                slots = self._pool.take_upto(len(bids), reserve=_wf)
                 if not slots:
                     return
                 n = len(slots)

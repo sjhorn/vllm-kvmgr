@@ -89,6 +89,29 @@ DEFAULTS: dict[str, Any] = {
     # `prepare_store`, never in the handler -- see the note there for why the
     # obvious placement poisons the index.
     "disk_store_paused": False,
+    # -- the staging pool, hot ------------------------------------------------
+    # *** THE ALLOCATION IS A BOOT CEILING; THESE MOVE WITHIN IT. *** The
+    # pinned staging is 63 tensors shared by both handlers and two
+    # SingleDirectionOffloadingHandler instances, so reallocating it live is a
+    # corruption risk rather than a tuning knob -- on a box with ~3GB available
+    # and no OOM net. `staging_blocks` in KV_TRANSFER_CONFIG sizes the
+    # allocation once; these decide how much of it is used, instantly.
+    #
+    # 0 means "the whole allocation", so an unset knob is not a silent 32.
+    "staging_slots": 0,
+    # Slots each direction must leave free for the other. The store and load
+    # handlers SHARE one pool, and that sharing made the same restore take
+    # 574.9s with stores live against 3.3s with them paused -- a 174x spread,
+    # because the pump advances once per scheduler step and fewer slots per
+    # round means fewer blocks per step (177 MB/s cold, 17.7 MB/s shared).
+    #
+    # A floor, not a split: a split wastes half the pool whenever one direction
+    # is idle. 0 means "a quarter of the live size", which scales when the size
+    # is raised. A starved WRITE is not just slow -- its blocks stay in
+    # jobs_to_flush fencing GPU blocks, which is the path that deferred a
+    # request until NCCL's watchdog killed a worker.
+    "staging_write_floor": 0,
+    "staging_read_floor": 0,
     # *** THE ONE KNOB THAT GENUINELY CANNOT BE HOT, and it says so. *** A
     # route either exists in the FastAPI app or it does not, and the app is
     # built once at boot -- so this is read at ATTACH time and enabling it
