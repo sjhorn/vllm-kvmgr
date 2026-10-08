@@ -394,6 +394,17 @@ def reload_modules() -> dict:
         from kvmgr import register as _reg
         _reg._install_hang_dump()
         report["hang_dump_rearmed"] = True
+        # *** AND START THE WATCHDOG, because a RELOAD NEVER RUNS A
+        # *** CONSTRUCTOR. `_start_watchdog()` is called from the store/load
+        # handler __init__, and rebind() re-points a live object with
+        # `obj.__class__ = new` -- no __init__ anywhere. So a hot deploy of the
+        # watchdog would have installed the code and armed nothing, which is
+        # this repo's signature failure: a mechanism present, correct-looking
+        # and producing nothing. Idempotent via _watchdog_started, which is in
+        # _PRESERVE, so a reload on an already-watched process is a no-op.
+        from kvmgr import diskio as _dio
+        _dio._start_watchdog()
+        report["watchdog_armed"] = bool(_dio._watchdog_started)
     except Exception as exc:
         # A WARNING, NOT AN ERROR, and the distinction is the point: the
         # reload itself succeeded, and failing to arm a diagnostic must never
