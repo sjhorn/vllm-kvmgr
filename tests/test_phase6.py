@@ -574,12 +574,92 @@ check("*** a failed sync REPORTS rather than raising, so a boot survives it ***"
 # the wrap must be idempotent -- plugins load more than once per process
 _src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
                          "control.py")).read()
+# *** SLICE TO THE REAL FUNCTION BOUNDARY, not a fixed character window. ***
+# This read `_src[i:i+1400]` and passed until the function grew a longer
+# docstring, at which point it failed for being too short rather than for
+# anything being wrong -- a test that fails for the wrong reason is as
+# unhelpful as one that passes for it, which this repo has now paid for four
+# times today.
+def _fn_body(src, name):
+    i = src.index(f"def {name}(")
+    j = src.find("\ndef ", i + 10)
+    return src[i:j if j != -1 else len(src)]
+
+
 for fn in ("wrap_engine_core_init", "wrap_engine_core_rpc"):
-    i = _src.index(f"def {fn}(")
-    body = _src[i:i + 1400]
+    body = _fn_body(_src, fn)
     check(f"{fn} is idempotent, because plugins load more than once",
           "_kvmgr" in body and "return" in body.split("if getattr")[1][:90],
           "a double wrap would double every call")
+
+print("\n== (16) the sync hook: ONE SHOT, on step, NOT on the __init__ that loads us ==")
+
+# *** YOU CANNOT WRAP THE FUNCTION THAT LOADS YOU. *** EngineCore.__init__'s
+# first statement is load_general_plugins() -- us -- so a wrap installed from
+# inside the plugin lands on the class attribute while the only call that
+# matters is already executing the original frame. Measured on the box: the
+# wrap installed, logged nothing, and the boot defaults still disagreed between
+# ranks. EngineCore.step is on the base class and runs only after __init__ has
+# returned.
+_src6 = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                          "control.py")).read()
+_i = _src6.index("def wrap_engine_core_init(")
+_body6 = _src6[_i:_src6.index("\ndef ", _i + 10)]
+check("*** the hook is on EngineCore.step, not __init__ ***",
+      "EngineCore.step = step" in _body6 and "EngineCore.__init__ =" not in _body6,
+      "wrapping __init__ can never fire: it is what loads this plugin")
+check("...and the reason is recorded where somebody would re-break it",
+      "cannot wrap the function that loads you" in _body6.lower())
+
+# the one-shot must be set BEFORE the sync, or a raising sync retries forever
+# on the hot path -- worse than a missed sync.
+calls = []
+
+
+class _Core2:
+    def __init__(self):
+        self.n = 0
+
+    def collective_rpc(self, method, args=(), kwargs=None):
+        calls.append(kwargs.get("name"))
+        raise RuntimeError("workers not up")
+
+
+_flag_order = []
+
+
+class _Probe:
+    """Models the wrapper's own ordering: flag first, then sync."""
+
+    def __init__(self):
+        self._kvmgr_synced = False
+
+    def step(self):
+        if not self._kvmgr_synced:
+            self._kvmgr_synced = True
+            _flag_order.append("flag-then-sync")
+            try:
+                control.sync_knobs_to_workers(_Core2())
+            except Exception:
+                pass
+        return "stepped"
+
+
+flags.reset_for_tests()
+F.write(evict_order="lru")
+_p = _Probe()
+for _ in range(5):
+    _p.step()
+eq("*** a raising sync is attempted ONCE, not on every step ***",
+   _flag_order, ["flag-then-sync"])
+check("...and the engine keeps stepping regardless", _p.step() == "stepped")
+check("the wrapper sets the one-shot flag BEFORE calling the sync",
+      _body6.index("_kvmgr_synced = True") < _body6.index("sync_knobs_to_workers(self)"),
+      "otherwise a raising sync retries forever on the hot path")
+
+# and it must still be idempotent against a double plugin load
+check("the step wrap refuses to double-install",
+      "_kvmgr_sync" in _body6 and "return" in _body6.split("if getattr")[1][:80])
 
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
