@@ -248,6 +248,27 @@ def reload_modules() -> dict:
     # one dict and makes the ordering impossible to get wrong by accident.
     targets = live_instances()
 
+    # *** AND SNAPSHOT THE OVERRIDES, FOR THE SAME REASON ONE LINE UP. ***
+    # `importlib.reload` re-executes the module, so `flags._OVERRIDE: dict = {}`
+    # runs again and EVERY knob set through the control plane is silently
+    # discarded. Measured on the box 2026-10-08: the boot sync pushed 12 knobs
+    # to both workers, `POST /kv/reload` ran, and the ranks were split again --
+    # rank 1 back on its stale file, because the reload had thrown away the
+    # override that fixed it.
+    #
+    # The same destructive-re-execution bug as `_LIVE_HANDLERS`, in the same
+    # function, which I fixed for the handlers and did not carry across. The
+    # general rule for this module: a reload must restore every module-level
+    # piece of STATE it re-initialises, and the only safe way to know is to
+    # enumerate them here.
+    saved_overrides: dict = {}
+    try:
+        from . import flags as _f
+
+        saved_overrides = dict(_f._OVERRIDE)
+    except Exception as e:
+        report["errors"].append(f"snapshotting overrides: {e}")
+
     # Order matters: leaves before the modules that import them, so a reloaded
     # parent picks up the reloaded child rather than the stale one it holds.
     for name in ("kvmgr.flags", "kvmgr.policy", "kvmgr.diskio",
@@ -276,6 +297,16 @@ def reload_modules() -> dict:
         diskio._LIVE_HANDLERS[:] = targets.get("handlers", [])
     except Exception as e:
         report["errors"].append(f"re-registering handlers: {e}")
+    # Put the overrides back, or a reload quietly reverts every knob to the
+    # file -- which on this cluster means reverting the WORKER to a stale file
+    # and re-splitting the ranks.
+    try:
+        from . import flags as _f2
+
+        _f2._OVERRIDE.update(saved_overrides)
+        report["overrides_restored"] = sorted(saved_overrides)
+    except Exception as e:
+        report["errors"].append(f"restoring overrides: {e}")
     report["found"] = {k: len(v) for k, v in targets.items()}
     report["ok"] = not report["errors"]
     logger.info("kvmgr: reload -- %d module(s), %d instance(s), %d error(s)",

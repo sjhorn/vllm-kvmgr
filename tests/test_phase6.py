@@ -686,6 +686,62 @@ _c.step_with_batch_queue()
 eq("*** and the sync happens exactly ONCE across all of them ***",
    _fired, ["sync"])
 
+print("\n== (17) A RELOAD MUST NOT DISCARD THE KNOBS IT WAS ASKED TO KEEP ==")
+
+# *** MEASURED ON THE BOX 2026-10-08, and it is the same bug twice in one
+# function. *** The boot sync pushed 12 knobs to both workers; `POST
+# /kv/reload` ran; and the ranks were SPLIT again -- rank 1 back on its stale
+# file, because `importlib.reload` re-executes `flags._OVERRIDE: dict = {}` and
+# threw away the override that had fixed it. I had fixed exactly this for
+# `_LIVE_HANDLERS` one line earlier and not carried it across.
+#
+# The rule for this module: a reload must restore every module-level piece of
+# STATE it re-initialises.
+flags.reset_for_tests()
+# TWO knobs in the file and only ONE overridden, so the "restoring must not
+# invent overrides for everything" check below has something real to test.
+# The first version wrote one key and then asserted another was file-governed,
+# which was simply false -- my assertion, not the code.
+F.write(evict_order="lru", protect_alloc="by_need")
+flags.set_override("evict_order", "lru_tail_first")
+flags.set_override("kvmgr_log_level", 4)
+eq("two overrides set before the reload", sorted(flags._OVERRIDE),
+   ["evict_order", "kvmgr_log_level"])
+eq("...and winning", flags.raw("evict_order"), "lru_tail_first")
+
+rep17 = control.reload_modules()
+check("the reload reports ok", rep17.get("ok") is True, str(rep17.get("errors"))[:80])
+
+# re-import, because the reload replaced the module object's contents
+from kvmgr import flags as _f17  # noqa: E402
+
+eq("*** the overrides SURVIVE the reload ***", sorted(_f17._OVERRIDE),
+   ["evict_order", "kvmgr_log_level"])
+eq("...and still win over the file", _f17.raw("evict_order"), "lru_tail_first")
+eq("...reported as an override", _f17.source_of("evict_order"), "override")
+eq("...and the response NAMES what it restored",
+   sorted(rep17.get("overrides_restored") or []),
+   ["evict_order", "kvmgr_log_level"])
+
+# the file must still govern a knob nobody overrode -- restoring must not
+# invent overrides for everything
+eq("a knob in the FILE that nobody overrode is still file-governed",
+   _f17.source_of("protect_alloc"), "file")
+eq("...with the file's value", _f17.raw("protect_alloc"), "by_need")
+eq("a knob in NEITHER is still default", _f17.source_of("swa_recycle"), "default")
+
+_f17.clear_override()
+
+# And the general property, asserted so the NEXT module-level state is not
+# forgotten: every mutable module-level container in kvmgr must be either
+# restored by reload_modules or provably not state.
+_csrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                          "control.py")).read()
+for name in ("_LIVE_HANDLERS", "_OVERRIDE"):
+    check(f"reload_modules restores {name}",
+          name in _csrc.split("def reload_modules")[1].split("\ndef ")[0],
+          "a reload that re-initialises state must put it back")
+
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print("  FAILED:", f)
