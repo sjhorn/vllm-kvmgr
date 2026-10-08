@@ -83,6 +83,14 @@ DISK_FORMAT_ROOT = "dspark-kv-v1"
 DSPARK_SPEC_NAME = "DSparkDiskOffloadingSpec"
 
 
+def _now() -> float:
+    """Monotonic seconds. A helper so the manifest's time floor cannot be
+    accidentally written against the wall clock, which a clock step would
+    then make either permanently stale or never stale."""
+    import time
+    return time.monotonic()
+
+
 class DiskLoadStoreSpec(LoadStoreSpec):
     """Addresses blocks by their OffloadKey, NOT by a block id.
 
@@ -133,6 +141,9 @@ class DiskPresenceManager(OffloadingManager):
     # per block; batching costs at most this many keys of a crash's worth of
     # forgotten (not wrong) presence, which only ever means a needless recompute.
     MANIFEST_FLUSH_KEYS = 512
+    # And a time floor, because a session adding fewer than 512 keys would
+    # otherwise never flush at all. See flush_manifest for the measurement.
+    MANIFEST_FLUSH_S = 30.0
 
     def __init__(self, file_mapper: FileMapper, num_workers: int,
                  manifest_path: str | None = None):
@@ -145,6 +156,7 @@ class DiskPresenceManager(OffloadingManager):
                        "manifest_writes": 0}
         self._manifest = manifest_path
         self._unflushed = 0
+        self._last_flush = _now()
         if manifest_path:
             self._load_manifest()
 
@@ -207,8 +219,25 @@ class DiskPresenceManager(OffloadingManager):
 
         if not self._manifest:
             return
-        if not force and self._unflushed < self.MANIFEST_FLUSH_KEYS:
-            return
+        # *** A COUNT THRESHOLD ALONE LOSES EVERY SHORT SESSION. *** Measured
+        # 2026-10-08: a run stored 1,052 new files (~210 keys) and
+        # presence.json kept the PREVIOUS day's mtime -- under the 512-key
+        # threshold, so it never flushed, so those keys existed only in memory
+        # and a restart forgot them. The files were on disk and the index could
+        # not name them: the restore-after-restart case, broken by construction,
+        # with nothing saying so.
+        #
+        # So EITHER enough keys OR enough time. The time floor is also what
+        # covers an UNCLEAN kill, which no shutdown hook can -- and being killed
+        # mid-session is the normal way this process ends. The manifest is tens
+        # of KB on an NVMe, so a bounded periodic write costs nothing worth
+        # counting; this is not the Pi's SD card.
+        if not force:
+            if not self._unflushed:
+                return
+            stale = (_now() - self._last_flush) >= self.MANIFEST_FLUSH_S
+            if self._unflushed < self.MANIFEST_FLUSH_KEYS and not stale:
+                return
         try:
             _os.makedirs(_os.path.dirname(self._manifest), exist_ok=True)
             tmp = self._manifest + ".part"
@@ -216,6 +245,7 @@ class DiskPresenceManager(OffloadingManager):
                 json.dump({"keys": sorted(k.hex() for k in self._present)}, f)
             _os.replace(tmp, self._manifest)
             self._unflushed = 0
+            self._last_flush = _now()
             self._stats["manifest_writes"] += 1
         except Exception:
             logger.exception("kvmgr: manifest flush failed (presence kept in "
@@ -293,6 +323,15 @@ class DiskPresenceManager(OffloadingManager):
     def take_events(self) -> "Iterable[OffloadingEvent]":
         events, self._events = self._events, []
         return events
+
+    def shutdown(self) -> None:
+        """Flush on the way out, so a CLEAN restart keeps what it stored.
+
+        The time floor above bounds the loss on an unclean kill; this makes it
+        ZERO in the ordinary case. `shutdown` is concrete on the base class, so
+        overriding it is in-contract rather than a hook of our own.
+        """
+        self.flush_manifest(force=True)
 
     def reset_cache(self) -> None:
         self._present.clear()

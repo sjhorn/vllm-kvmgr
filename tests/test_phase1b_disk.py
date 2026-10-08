@@ -617,6 +617,86 @@ F.write(disk_restore=0)
 flags.reset_for_tests()
 
 
+print("\n== (b13) the manifest must flush on TIME too, or a short session is lost ==")
+
+# *** THE LIVE SHAPE, 2026-10-08. *** A run stored 1,052 new .bin files -- about
+# 210 keys -- and presence.json kept the PREVIOUS day's mtime. 210 is under
+# MANIFEST_FLUSH_KEYS (512), and the only other force=True was reset_cache,
+# which CLEARS the index first. So the keys existed in memory only, the files
+# sat on disk, and a restart could not name them: restore-after-restart broken
+# by construction, with nothing saying so. Three flush triggers now -- enough
+# keys, enough time, or shutdown.
+mdir2 = tempfile.mkdtemp(prefix="kvman2-")
+mpath2 = os.path.join(mdir2, "presence.json")
+
+
+class FakeMapper2:
+    @staticmethod
+    def get_file_name(k):
+        return os.path.join(mdir2, base.get_offload_block_hash(k).hex()[:8] + ".bin")
+
+
+def mkkeys(n, g=0, salt=77):
+    out = []
+    for i in range(n):
+        k = K(bytes([salt, g, i // 256, i % 256]) * 8, g)
+        open(FakeMapper2.get_file_name(k), "wb").write(b"x")
+        out.append(k)
+    return out
+
+
+ctx3 = base.ReqContext(req_id="rt")
+mt = diskspec.DiskPresenceManager(FakeMapper2, num_workers=2,
+                                  manifest_path=mpath2)
+mt.complete_store(mkkeys(3), ctx3)          # far below 512
+check("*** a handful of keys does NOT flush immediately -- that is the design,"
+      " not the bug ***", not os.path.exists(mpath2),
+      "the bug was that NOTHING ELSE ever did")
+
+# Now make it stale rather than numerous. The floor is monotonic, so the test
+# moves the recorded time rather than sleeping 30 seconds.
+mt._last_flush -= diskspec.DiskPresenceManager.MANIFEST_FLUSH_S + 1
+mt.flush_manifest()
+check("*** ...but ENOUGH TIME does, with the same three keys ***",
+      os.path.exists(mpath2))
+eq("...writing all of them", len(json.loads(open(mpath2).read())["keys"]), 3)
+eq("...and counted as a write", mt._stats["manifest_writes"], 1)
+
+# A stale clock with NOTHING new must not rewrite the file: a periodic write
+# that says nothing is pure cost, and this is a real filesystem.
+before_w = mt._stats["manifest_writes"]
+mt._last_flush -= diskspec.DiskPresenceManager.MANIFEST_FLUSH_S + 1
+mt.flush_manifest()
+eq("a stale clock with no new keys writes NOTHING",
+   mt._stats["manifest_writes"], before_w)
+
+# The count trigger must still work on its own, with a fresh clock.
+mt2 = diskspec.DiskPresenceManager(FakeMapper2, num_workers=2,
+                                   manifest_path=mpath2)
+w0 = mt2._stats["manifest_writes"]
+mt2.complete_store(mkkeys(diskspec.DiskPresenceManager.MANIFEST_FLUSH_KEYS + 1,
+                          g=1, salt=78), ctx3)
+check("*** enough KEYS still flushes on its own, clock untouched ***",
+      mt2._stats["manifest_writes"] > w0)
+
+# And shutdown, which is what makes the loss window ZERO on a clean restart.
+mt3 = diskspec.DiskPresenceManager(FakeMapper2, num_workers=2,
+                                   manifest_path=mpath2)
+n_before = len(json.loads(open(mpath2).read())["keys"])
+mt3.complete_store(mkkeys(2, g=2, salt=79), ctx3)
+eq("...two more keys, still unflushed", mt3._unflushed, 2)
+mt3.shutdown()
+n_after = len(json.loads(open(mpath2).read())["keys"])
+check("*** shutdown() flushes, so a CLEAN restart keeps what it stored ***",
+      n_after == n_before + 2, f"{n_before} -> {n_after}")
+
+# reset_cache still clears and persists the clearance -- it must not be
+# confused with the new triggers, which only ever ADD.
+mt3.complete_store(mkkeys(1, g=3, salt=80), ctx3)
+mt3.reset_cache()
+eq("reset_cache still clears the manifest",
+   len(json.loads(open(mpath2).read())["keys"]), 0)
+
 print("\n== (b13) wait(): ONLY our own jobs, or the engine blocks for minutes ==")
 
 # *** THE SHAPE THAT WEDGED THE WORKER LIVE, 2026-10-07. *** The worker stopped
