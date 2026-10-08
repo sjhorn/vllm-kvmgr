@@ -1030,12 +1030,6 @@ class DiskStoreHandler:
             while st["batches"] and not st["failed"]:
                 g, bkeys, bids = st["batches"][0]
                 _sz, _wf, _rf = staging_knobs(self._pool.capacity)
-                if _sz != self._pool.size:
-                    logger.info(
-                        "kvmgr: staging pool live size %d -> %d of %d allocated "
-                        "(hot; the allocation itself is a boot ceiling)",
-                        self._pool.size, _sz, self._pool.capacity)
-                    self._pool.set_limit(_sz)
                 # Leave the READ floor free: a load starved of slots makes the
                 # RESTORE the slow half, which is the 574.9s-against-3.3s case.
                 slots = self._pool.take_upto(len(bids), reserve=_rf)
@@ -1092,7 +1086,36 @@ class DiskStoreHandler:
             files += 1
         return total, files
 
+    def reconcile_pool(self) -> None:
+        """Apply the hot `staging_slots` knob. Called every scheduler step.
+
+        *** NOT FROM THE TAKE PATH, and the difference is user-visible. ***
+        It was there first, and a resize then only happened when a transfer
+        round actually ran -- so setting the knob on an engine with nothing to
+        store changed nothing, and the pool read its old size. Measured live:
+        256 -> 32 -> 128 applied fine while a third change to 256 did not,
+        because by then every key was already present and no round ran. That is
+        this repo's documented "a hot knob read on an IDLE engine shows the OLD
+        derived figure", reappearing in a new place.
+
+        `_collect()` is called once per step through `get_finished()`, which is
+        the same edge `gpu_cache_epoch` uses, so the knob now lands on the next
+        step rather than the next transfer.
+        """
+        try:
+            want, _wf, _rf = staging_knobs(self._pool.capacity)
+            if want != self._pool.size:
+                logger.info(
+                    "kvmgr: staging pool live size %d -> %d of %d allocated "
+                    "(hot; the allocation itself is a boot ceiling)",
+                    self._pool.size, want, self._pool.capacity)
+                self._pool.set_limit(want)
+        except Exception:
+            # A resize that cannot be computed must never stop a transfer.
+            pass
+
     def _collect(self) -> None:
+        self.reconcile_pool()
         from vllm.v1.kv_offload.worker.worker import TransferResult
 
         if not _LIVE_CONN_WORKER:

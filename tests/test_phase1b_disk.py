@@ -1559,6 +1559,47 @@ eq("explicit floors are honoured", diskio.staging_plan(32, 0, 5, 7)[1:], (5, 7))
 eq("an unreadable knob falls back to the documented default, it does not raise",
    diskio.staging_knobs(64)[0], 64)
 
+# *** THE RESIZE MUST BE DRIVEN BY THE PER-STEP EDGE, NOT THE TAKE PATH. ***
+# It was in the take path first, so a resize only happened when a transfer round
+# actually ran -- and setting the knob on an engine with nothing to store
+# changed nothing. Measured live: 256 -> 32 -> 128 applied, while a third change
+# to 256 did not, because by then every key was present and no round ran. That
+# is the documented "a hot knob read on an IDLE engine shows the OLD derived
+# figure" in a new costume, and the structural guard is that `_collect` (called
+# once per step via get_finished) is what reconciles it.
+_dsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                          "diskio.py")).read()
+_collect_body = _dsrc[_dsrc.index("def _collect(self) -> None:"):]
+_collect_body = _collect_body[:_collect_body.index("\n    def ")]
+check("*** _collect reconciles the pool, so the knob lands on the next STEP ***",
+      "self.reconcile_pool()" in _collect_body)
+check("...and the take path no longer resizes (that was the idle-engine bug)",
+      "set_limit" not in _dsrc[_dsrc.index("reserve=_rf)") - 400:
+                               _dsrc.index("reserve=_rf)")])
+
+# and reconcile_pool must never raise into the step loop
+class _P:
+    capacity = 8
+    size = 8
+    def set_limit(self, k):
+        raise RuntimeError("boom")
+
+
+class _H:
+    _pool = _P()
+    reconcile_pool = diskio.DiskStoreHandler.reconcile_pool
+
+
+_ok = True
+try:
+    flags.set_override("staging_slots", 4)
+    _H().reconcile_pool()
+except Exception:
+    _ok = False
+finally:
+    flags.clear_override("staging_slots")
+check("*** a failing resize cannot raise into the scheduler step ***", _ok)
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
     for f in FAIL:
