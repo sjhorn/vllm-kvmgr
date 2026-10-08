@@ -550,10 +550,39 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
                 return None
 
         before = _free()
-        try:
-            self.release_protected_prompt_blocks()
-        except Exception:
-            logger.exception("kvmgr: releasing protected blocks failed")
+
+        # *** RELEASE EVERY GROUP, NOT JUST OURS, AND THAT WAS A REAL REFUSAL.
+        # *** Measured 2026-10-08: the drop fired, released group 0 and was
+        # REFUSED -- and the log named the cause in one number, "pool free
+        # blocks 22536 -> 22581". +45 is exactly group 0's share of an
+        # 11,764-token prompt (11764/256 = 46), so the other ~1,700 blocks
+        # belonged to the four windowed groups, which run upstream's
+        # SlidingWindowMLAManager because we register for MLAAttentionSpec
+        # only. patch7 gates on `num_used_blocks != 1` across the WHOLE pool,
+        # so releasing one group of five could never be enough.
+        #
+        # `release_protected_prompt_blocks` is on SingleTypeKVCacheManager, so
+        # it exists on the managers we did not replace. The tuple comes from
+        # the coordinator wrap, which is the only place that holds it.
+        # `self` is in that tuple, so it is not released separately -- and the
+        # fallback covers the case where the stash failed, because releasing
+        # one group is still better than releasing none.
+        targets = tuple(getattr(type(self), "all_managers", ()) or ())
+        if not targets:
+            logger.warning(
+                "kvmgr: no manager list stashed, so only THIS group can be "
+                "released -- patch7 gates on the whole pool, so expect the "
+                "reset to be refused")
+            targets = (self,)
+        released = 0
+        for m in targets:
+            try:
+                m.release_protected_prompt_blocks()
+                released += 1
+            except Exception:
+                logger.exception(
+                    "kvmgr: releasing protected blocks failed for %s",
+                    type(m).__name__)
         after = _free()
         try:
             ok = bool(pool.reset_prefix_cache())
@@ -561,11 +590,12 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
             logger.exception("kvmgr: block_pool.reset_prefix_cache() raised")
             ok = False
         logger.info(
-            "kvmgr: GPU prefix cache drop -- pool free blocks %s -> %s, "
+            "kvmgr: GPU prefix cache drop -- released %d/%d manager(s), "
+            "pool free blocks %s -> %s, "
             "reset %s. The DISK index is untouched by design (this is the "
             "pool's reset, not the connector's), so the next identical prompt "
             "must come back off disk or not at all.%s",
-            before, after, "OK" if ok else "REFUSED",
+            released, len(targets), before, after, "OK" if ok else "REFUSED",
             "" if ok else " Refused means blocks are still referenced -- let the"
                           " engine go idle and bump gpu_cache_epoch again.",
         )

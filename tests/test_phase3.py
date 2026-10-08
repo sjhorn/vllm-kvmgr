@@ -528,6 +528,88 @@ check("...logging the free-block movement, which is what patch7 gates on",
 check("...and stating that the disk index is untouched BY DESIGN",
       "DISK index is untouched" in txt)
 
+# *** THE DROP MUST RELEASE EVERY GROUP, AND A LIVE REFUSAL IS WHY. ***
+# Measured 2026-10-08: the drop fired, released group 0 and was REFUSED, with
+# the log naming the cause in one number -- "pool free blocks 22536 -> 22581".
+# +45 is exactly group 0's share of an 11,764-token prompt (11764/256 = 46), so
+# the other ~1,700 belonged to the four WINDOWED groups, which run upstream's
+# SlidingWindowMLAManager because we register for MLAAttentionSpec only. patch7
+# gates on `num_used_blocks != 1` across the WHOLE pool, so releasing one group
+# of five could never be enough -- the reset was unreachable by construction.
+class _Foreign:
+    """Stands in for an upstream manager we did NOT replace.
+
+    `release_protected_prompt_blocks` is defined on SingleTypeKVCacheManager,
+    so it exists on every manager -- which is what makes the pool-wide release
+    possible without owning all five classes.
+    """
+
+    def __init__(self, log):
+        self._log = log
+
+    def release_protected_prompt_blocks(self):
+        self._log.append(type(self).__name__)
+
+
+flags.reset_for_tests()
+poolA = _Pool(free=22000)
+seen = []
+mine = _mgr_with_pool(poolA, release=lambda *a, **k: seen.append("ours"))
+foreigners = tuple(_Foreign(seen) for _ in range(4))
+_saved_all = getattr(DSparkMLAAttentionManager, "all_managers", None)
+DSparkMLAAttentionManager.all_managers = (mine,) + foreigners
+harness.clear_log()
+check("the drop still resets", mine.kvmgr_drop_gpu_cache() is True)
+eq("*** it releases ALL FIVE groups, not only the one we own ***",
+   len(seen), 5)
+eq("...ours among them, exactly once", seen.count("ours"), 1)
+eq("...and each foreign manager once", seen.count("_Foreign"), 4)
+txtA = harness.log_text()
+check("...and the log says how many it released, so a partial is visible",
+      "released 5/5" in txtA, txtA.strip().splitlines()[-1][:120])
+
+# One group raising must not stop the others: a release that fails is bad, a
+# release that silently skips four groups is the refusal we just spent a boot on.
+flags.reset_for_tests()
+poolB = _Pool(free=22000)
+seenB = []
+
+
+class _Angry(_Foreign):
+    def release_protected_prompt_blocks(self):
+        raise RuntimeError("boom")
+
+
+mineB = _mgr_with_pool(poolB, release=lambda *a, **k: seenB.append("ours"))
+DSparkMLAAttentionManager.all_managers = (
+    mineB, _Angry(seenB), _Foreign(seenB), _Foreign(seenB))
+harness.clear_log()
+check("a raising group does not abort the drop",
+      mineB.kvmgr_drop_gpu_cache() is True)
+eq("...the others are still released", len(seenB), 3)
+txtB = harness.log_text()
+check("...and the count SAYS it was partial", "released 3/4" in txtB)
+check("...naming the class that failed", "_Angry" in txtB)
+
+# And the fallback: if the stash never happened, releasing one group is still
+# better than releasing none -- but it must WARN, because patch7 will refuse.
+flags.reset_for_tests()
+poolC = _Pool(free=22000)
+seenC = []
+mineC = _mgr_with_pool(poolC, release=lambda *a, **k: seenC.append("ours"))
+DSparkMLAAttentionManager.all_managers = ()
+harness.clear_log()
+mineC.kvmgr_drop_gpu_cache()
+eq("with no manager list, it still releases ITS OWN group", len(seenC), 1)
+txtC = harness.log_text()
+check("*** and warns that patch7 will refuse a one-group release ***",
+      "only THIS group" in txtC and "whole pool" in txtC)
+
+if _saved_all is None:
+    del DSparkMLAAttentionManager.all_managers
+else:
+    DSparkMLAAttentionManager.all_managers = _saved_all
+
 # A refusal must say so and say what to do -- a drop that silently did nothing
 # would send somebody hunting a bug in a read path that never ran.
 pool2 = _Pool(free=10, resets_ok=False)

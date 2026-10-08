@@ -233,7 +233,37 @@ def _install_group_geometry_hook(manager_cls) -> None:
                 "falling back to _num_managers, which is a process-global "
                 "counter and may be wrong"
             )
-        return original(self, kv_cache_config, *args, **kwargs)
+        out = original(self, kv_cache_config, *args, **kwargs)
+        # *** AND STASH EVERY MANAGER, because a POOL-WIDE operation needs
+        # POOL-WIDE releases. *** Measured 2026-10-08: `gpu_cache_epoch` fired,
+        # released group 0's protection and was REFUSED, with the log naming the
+        # cause in one number -- "pool free blocks 22536 -> 22581", and +45 is
+        # exactly group 0's share of an 11,764-token prompt (11764/256 = 46).
+        # We are registered for MLAAttentionSpec only, so our instance can
+        # release only its own group; the other four run upstream's
+        # SlidingWindowMLAManager and held ~1,700 blocks that patch7's
+        # `num_used_blocks != 1` gate then refused on, forever.
+        #
+        # `release_protected_prompt_blocks` is defined on
+        # SingleTypeKVCacheManager (patch6:691), so it is available on every
+        # manager including the ones we did not replace. This is the only place
+        # that holds the whole tuple -- the coordinator builds it at :67 -- which
+        # is why the stash goes here rather than being discovered later.
+        try:
+            manager_cls.all_managers = tuple(
+                getattr(self, "single_type_managers", ()) or ())
+            logger.info(
+                "kvmgr: holding %d manager(s) for pool-wide releases "
+                "(ours: %d)",
+                len(manager_cls.all_managers),
+                sum(1 for m in manager_cls.all_managers
+                    if isinstance(m, manager_cls)),
+            )
+        except Exception:
+            logger.exception(
+                "kvmgr: could not stash the manager list; a GPU cache drop will "
+                "release only group 0 and patch7 will refuse the reset")
+        return out
 
     __init__._kvmgr_wrapped = True  # type: ignore[attr-defined]
     base.__init__ = __init__  # type: ignore[method-assign]
