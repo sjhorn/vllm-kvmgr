@@ -1699,6 +1699,18 @@ class _Tiny:
 
 
 eq("...and a real row count is reported as itself", _Tiny()._bounds(), (7, 7))
+
+# *** BOTH HANDLERS MUST REPORT THEIR BOUNDS, and only the store one did. ***
+# The load handler's snapshot omitted the fields, so it showed gpu_rows=None --
+# and "the key is absent" and "the bound is unknown" are different facts that
+# want opposite responses. The load path is where the 0-bound crash happened,
+# so it is the one that most needs to be readable. Asserted against the SOURCE,
+# because a snapshot needs a live handler to call.
+_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                         "diskio.py")).read()
+eq("both handler snapshots report gpu_rows", _src.count("gpu_rows=self._bounds()[0]"), 2)
+eq("...and staging_rows", _src.count("staging_rows=self._bounds()[1]"), 2)
+eq("...and the ledger", _src.count("ledger=self._ledger_snapshot()"), 2)
 check("...and an unusable answer is NOT cached, so a later call can succeed",
       getattr(_NoTensors(), "_bounds_cache", None) is None)
 

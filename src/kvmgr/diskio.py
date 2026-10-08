@@ -1881,4 +1881,14 @@ class DiskLoadHandler:
 
     def snapshot(self) -> dict:
         return dict(self.stats, jobs_open=len(self._jobs),
-                    reads_open=len(self._reading))
+                    reads_open=len(self._reading),
+                    # *** THESE WERE MISSING AND I MISREAD THEIR ABSENCE. ***
+                    # Only the store handler reported its bounds, so the load
+                    # handler showed gpu_rows=None -- and I read "the key is
+                    # not here" as "the bound is unknown", which are different
+                    # facts that want opposite responses. The load path is
+                    # exactly where the 0-bound crash happened, so it is the
+                    # one that most needs to be readable.
+                    gpu_rows=self._bounds()[0],
+                    staging_rows=self._bounds()[1],
+                    ledger=self._ledger_snapshot())
