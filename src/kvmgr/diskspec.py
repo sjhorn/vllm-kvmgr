@@ -174,8 +174,11 @@ def capture_offload_sched_from_caller(depth: int = 5) -> bool:
 
 # Counters for upstream's completion ARRIVAL point. Module-level so a reload
 # preserves them (and so the wrap is idempotent against the class).
-_ARRIVAL = {"calls": 0, "calls_with_meta": 0, "job_ids_seen": 0,
-            "stale_skipped": 0}
+# `installed` is the field that keeps the zeros honest: without it, "nobody is
+# counting" and "nothing arrives" are the same reading, and they point the
+# investigation in opposite directions.
+_ARRIVAL = {"installed": False, "calls": 0, "calls_with_meta": 0,
+            "job_ids_seen": 0, "stale_skipped": 0}
 
 
 def install_arrival_counter() -> bool:
@@ -370,7 +373,13 @@ def offload_sched_snapshot() -> dict:
                 getattr(cs, "_current_batch_jobs_to_flush", ()) or ()),
             "num_workers": getattr(getattr(cs, "config", None),
                                    "num_workers", None),
-            "arrival": dict(_ARRIVAL),
+            # If `installed` is False the counts mean NOTHING -- say so here
+            # rather than letting a reader infer it from four zeros.
+            "arrival": (dict(_ARRIVAL) if _ARRIVAL.get("installed") else
+                        {"installed": False,
+                         "why": "the arrival counter is not installed, so "
+                                "these counts would be an ABSENCE rendered "
+                                "as zero"}),
         }
     except Exception as exc:
         return {"available": False, "why": "reading upstream state raised: %r" % (exc,)}
@@ -629,7 +638,16 @@ class DiskPresenceManager(OffloadingManager):
         # inside the call rather than preventing it.
         if not _LIVE_OFFLOAD_SCHED:
             capture_offload_sched_from_caller()
-            install_arrival_counter()
+        # *** INSTALLED UNCONDITIONALLY, and gating it was a real bug. ***
+        # It used to sit inside the capture's one-shot, so once the handle was
+        # preserved across a reload the capture branch never ran again and the
+        # counter was never installed -- and it then reported `calls: 0`, which
+        # reads as "update_connector_output is never reached" when the truth was
+        # "nobody was counting". Absent rendered as zero, inside the instrument
+        # built to avoid exactly that. It is idempotent via _kvmgr_wrapped, so
+        # calling it every time costs one getattr.
+        if not _ARRIVAL.get("installed"):
+            _ARRIVAL["installed"] = install_arrival_counter()
 
         if flags.peek("disk_store_paused"):
             self._stats["paused"] += len(keys)

@@ -530,6 +530,12 @@ _sys.modules[_key] = _fake_mod
 try:
     diskspec._ARRIVAL.update(calls=0, calls_with_meta=0, job_ids_seen=0,
                              stale_skipped=0)
+    # *** THE ZEROS MUST NOT BE READABLE AS A MEASUREMENT. *** Gating the
+    # installer behind the capture one-shot meant it never ran after a reload,
+    # and `calls: 0` then read as "update_connector_output is never reached"
+    # when the truth was "nobody was counting".
+    diskspec._ARRIVAL["installed"] = False
+    _sn_before = diskspec.offload_sched_snapshot()
     eq("the counter installs", diskspec.install_arrival_counter(), True)
     eq("...and installing twice is idempotent",
        diskspec.install_arrival_counter(), True)
@@ -580,6 +586,32 @@ try:
     eq("*** a raising output still passes through -- the instrument cannot "
        "break the path it measures ***",
        _hostile_result, "passed-through")
+
+    # and the snapshot must refuse to show counts it has not been collecting
+    diskspec._ARRIVAL["installed"] = False
+    del diskspec._LIVE_OFFLOAD_SCHED[:]
+
+    # The snapshot bails before `arrival` unless the handle looks like a real
+    # scheduler, so the fake needs _jobs -- otherwise this section would test
+    # the early return instead of the thing it is about.
+    class _SchedWithJobs(_FakeSched):
+        def __init__(self):
+            _FakeSched.__init__(self)
+            self._jobs = {}
+            self._job_counter = 0
+            self._block_id_to_pending_jobs = {}
+            self._current_batch_jobs_to_flush = set()
+            self.config = None
+
+    diskspec._LIVE_OFFLOAD_SCHED.append(_SchedWithJobs())
+    _a = diskspec.offload_sched_snapshot().get("arrival", {})
+    eq("*** uninstalled reports installed=False ***", _a.get("installed"), False)
+    check("...and withholds the counts entirely", "calls" not in _a)
+    check("...and says why", bool(_a.get("why")))
+    diskspec._ARRIVAL["installed"] = True
+    _a = diskspec.offload_sched_snapshot().get("arrival", {})
+    check("...while installed DOES report calls", "calls" in _a)
+    del diskspec._LIVE_OFFLOAD_SCHED[:]
 finally:
     if _saved_mod is not None:
         _sys.modules[_key] = _saved_mod
