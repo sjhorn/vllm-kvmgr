@@ -203,6 +203,8 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     ("kvmgr.diskspec", "_LIVE_OFFLOAD_SCHED",
      "upstream's offload scheduler -- the open job set behind the fence"),
     ("kvmgr.diskspec", "_SCHED_FOUND_BY", "how that handle was obtained"),
+    ("kvmgr.diskspec", "_ARRIVAL",
+     "completion-arrival counters -- losing them restarts the measurement"),
     ("kvmgr.diskio", "_LIVE_CONN_WORKER",
      "upstream's connector worker -- the unshipped completion queue"),
 )

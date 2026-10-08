@@ -500,6 +500,92 @@ eq("*** the capture retains no frame in the module's globals ***",
    _frames_held_by(diskspec), [])
 del diskspec._LIVE_OFFLOAD_SCHED[:]
 
+print("== (1w) the completion-ARRIVAL counter ==")
+# Every guard on the completion path is satisfied by inspection and the
+# completions still do not arrive, so the arrival point has to be counted. The
+# three outcomes it separates are in the function's docstring; the test's job is
+# that the wrap is idempotent, passes the call through unchanged, and cannot
+# break the scheduler if the counting itself raises.
+import sys as _sys  # noqa: E402
+import types as _types  # noqa: E402
+
+_seen = []
+
+
+class _FakeSched:
+    def __init__(self):
+        self._stale_job_threshold = 5
+
+    def update_connector_output(self, out):
+        _seen.append(out)
+        return "passed-through"
+
+
+_fake_mod = _types.ModuleType(
+    "vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler")
+_fake_mod.OffloadingConnectorScheduler = _FakeSched
+_key = "vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler"
+_saved_mod = _sys.modules.get(_key)
+_sys.modules[_key] = _fake_mod
+try:
+    diskspec._ARRIVAL.update(calls=0, calls_with_meta=0, job_ids_seen=0,
+                             stale_skipped=0)
+    eq("the counter installs", diskspec.install_arrival_counter(), True)
+    eq("...and installing twice is idempotent",
+       diskspec.install_arrival_counter(), True)
+    check("...leaving ONE wrap, not two",
+          getattr(_FakeSched.update_connector_output, "_kvmgr_wrapped", False))
+
+    class _Meta:
+        completed_jobs = {3: 1, 7: 1, 9: 1}   # 3 and ... below the threshold 5
+
+    class _Out:
+        kv_connector_worker_meta = _Meta()
+
+    _s = _FakeSched()
+    eq("*** the call is passed through UNCHANGED ***",
+       _s.update_connector_output(_Out()), "passed-through")
+    eq("...and the original ran", len(_seen), 1)
+    eq("calls counted", diskspec._ARRIVAL["calls"], 1)
+    eq("calls_with_meta counted", diskspec._ARRIVAL["calls_with_meta"], 1)
+    eq("job ids seen counted", diskspec._ARRIVAL["job_ids_seen"], 3)
+    eq("*** stale-skipped counted separately -- that branch drops completions "
+       "SILENTLY at debug level upstream ***",
+       diskspec._ARRIVAL["stale_skipped"], 1)
+
+    # a meta of None must count the call but not pretend to have seen jobs
+    class _OutNoMeta:
+        kv_connector_worker_meta = None
+
+    _s.update_connector_output(_OutNoMeta())
+    eq("a call with NO meta still counts as a call",
+       diskspec._ARRIVAL["calls"], 2)
+    eq("...and does not inflate calls_with_meta",
+       diskspec._ARRIVAL["calls_with_meta"], 1)
+
+    # and the counting must never break the scheduler
+    class _Hostile:
+        @property
+        def kv_connector_worker_meta(self):
+            raise RuntimeError("boom")
+
+    # Catch it HERE rather than letting it escape: with the guard removed this
+    # raises, and an escaping exception aborts the whole file with a traceback
+    # instead of reporting a named failure. A test that fails for the wrong
+    # reason is as unhelpful as one that passes for it.
+    try:
+        _hostile_result = _s.update_connector_output(_Hostile())
+    except Exception as _exc:
+        _hostile_result = "RAISED: %r" % (_exc,)
+    eq("*** a raising output still passes through -- the instrument cannot "
+       "break the path it measures ***",
+       _hostile_result, "passed-through")
+finally:
+    if _saved_mod is not None:
+        _sys.modules[_key] = _saved_mod
+    else:
+        _sys.modules.pop(_key, None)
+
 print("== (1y) the scheduler-side job set: ABSENT IS NOT ZERO ==")
 # The worker reports jobs_open: 0 while the scheduler can hold a hundred jobs,
 # and the scheduler's _jobs is what `jobs_to_flush` names -- so this field is

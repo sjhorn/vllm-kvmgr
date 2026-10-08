@@ -172,6 +172,80 @@ def capture_offload_sched_from_caller(depth: int = 5) -> bool:
     return False
 
 
+# Counters for upstream's completion ARRIVAL point. Module-level so a reload
+# preserves them (and so the wrap is idempotent against the class).
+_ARRIVAL = {"calls": 0, "calls_with_meta": 0, "job_ids_seen": 0,
+            "stale_skipped": 0}
+
+
+def install_arrival_counter() -> bool:
+    """Count what actually reaches `update_connector_output`. Read-only.
+
+    *** EVERY GUARD ON THE COMPLETION PATH IS SATISFIED AND THE COMPLETIONS
+    *** STILL DO NOT ARRIVE, so reading more code cannot settle it.
+    Established by inspection: the worker attaches the meta
+    (`gpu/kv_connector.py` sets `output.kv_connector_worker_meta`), the
+    aggregator carries it across ranks (`utils.py` lines 133-140 and 168), the
+    aggregator IS initialised (`core.py:159`, guarded only on the connector
+    existing), and the scheduler calls `update_connector_output`
+    unconditionally (`scheduler.py:2318`). Measured: the worker has 0 unshipped
+    completions and the scheduler has 125 of 135 jobs open with pending_count=2
+    on 118.
+    
+    Those two sets of facts cannot both be true, so one of the calls is not
+    happening at runtime. This counts the arrival point and separates the three
+    possibilities in one reading:
+    
+      calls == 0                  -> update_connector_output is never reached
+      calls > 0, with_meta == 0   -> it is reached and the meta is always None,
+                                     i.e. the loss is in transit or aggregation
+      with_meta > 0               -> the meta DOES arrive and the loss is in
+                                     the processing (stale threshold, or a
+                                     count that never sums to num_workers)
+    
+    Wraps rather than patches: no upstream file is edited, and `_kvmgr_wrapped`
+    makes it idempotent across reloads.
+    """
+    try:
+        import importlib
+        m = importlib.import_module(
+            "vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler")
+        cls = m.OffloadingConnectorScheduler
+    except Exception:
+        return False
+    try:
+        original = cls.update_connector_output
+        if getattr(original, "_kvmgr_wrapped", False):
+            return True
+
+        def update_connector_output(self, connector_output):
+            try:
+                _ARRIVAL["calls"] += 1
+                meta = getattr(connector_output, "kv_connector_worker_meta", None)
+                jobs = getattr(meta, "completed_jobs", None) if meta else None
+                if jobs:
+                    _ARRIVAL["calls_with_meta"] += 1
+                    _ARRIVAL["job_ids_seen"] += len(jobs)
+                    thr = getattr(self, "_stale_job_threshold", 0) or 0
+                    _ARRIVAL["stale_skipped"] += sum(
+                        1 for j in jobs if j < thr)
+            except Exception:
+                pass
+            return original(self, connector_output)
+
+        update_connector_output._kvmgr_wrapped = True
+        cls.update_connector_output = update_connector_output
+        logger.info(
+            "kvmgr: completion-arrival counter installed on "
+            "update_connector_output -- /kv reports calls / calls_with_meta / "
+            "job_ids_seen, which is what says whether the store completions "
+            "reach the scheduler at all")
+        return True
+    except Exception:
+        logger.exception("kvmgr: could not install the arrival counter")
+        return False
+
+
 def _discover_offload_sched():
     """Find a live OffloadingConnectorScheduler by scanning gc. On demand only.
 
@@ -296,6 +370,7 @@ def offload_sched_snapshot() -> dict:
                 getattr(cs, "_current_batch_jobs_to_flush", ()) or ()),
             "num_workers": getattr(getattr(cs, "config", None),
                                    "num_workers", None),
+            "arrival": dict(_ARRIVAL),
         }
     except Exception as exc:
         return {"available": False, "why": "reading upstream state raised: %r" % (exc,)}
@@ -554,6 +629,7 @@ class DiskPresenceManager(OffloadingManager):
         # inside the call rather than preventing it.
         if not _LIVE_OFFLOAD_SCHED:
             capture_offload_sched_from_caller()
+            install_arrival_counter()
 
         if flags.peek("disk_store_paused"):
             self._stats["paused"] += len(keys)
