@@ -510,6 +510,77 @@ rep3 = control.reload_modules()
 check("the response always says what it FOUND, so empty is not ambiguous",
       "found" in rep3 and isinstance(rep3["found"], dict), str(rep3)[:90])
 
+print("\n== (15) the boot sync: the HEAD's file is the cluster's source ==")
+
+# *** MEASURED, NOT FEARED: the flags file is PER NODE and the worker's goes
+# stale. *** 2026-10-08, after a /kv/knob/clear, rank 0 reported source=file
+# and rank 1 reported source=DEFAULT --
+#     head    Oct 8 07:59  12 keys  disk_store_paused=1
+#     worker  Oct 7 20:29   9 keys  disk_store_paused ABSENT
+# -- so every knob set through the file reached rank 0 only, and a deploy made
+# "safe" by pausing the disk store had it paused on rank 0 and RUNNING on rank
+# 1. The plane fixes a knob set over HTTP, because that fans out; it does not
+# fix the BOOT defaults, which each node reads from its own file.
+flags.reset_for_tests()
+F.write(evict_order="lru_tail_first", kvmgr_log_level=2)
+
+sent = []
+
+
+class _Core:
+    def collective_rpc(self, method, args=(), kwargs=None):
+        sent.append((method, dict(kwargs or {})))
+        return [{"ok": True, "rank": 0}, {"ok": True, "rank": 1}]
+
+
+rep = control.sync_knobs_to_workers(_Core())
+pushed = {k["name"]: k["value"] for _, k in sent}
+eq("no errors", rep["errors"], [])
+eq("*** a knob the FILE set is pushed ***", pushed.get("evict_order"),
+   "lru_tail_first")
+eq("...and another", pushed.get("kvmgr_log_level"), 2)
+check("*** a knob at its DEFAULT is NOT pushed ***",
+      "swa_recycle" not in pushed,
+      "pushing it would make source_of() say 'override' for a knob nobody set")
+eq("...so only what was really set crosses", sorted(pushed), 
+   ["evict_order", "kvmgr_log_level"])
+check("every push is a kvmgr_set_knob, which is what the Worker resolves",
+      all(m == "kvmgr_set_knob" for m, _ in sent))
+
+# an ENV pin must be pushed too, or the worker starts without it
+os.environ["VLLM_PROTECT_ALLOC"] = "by_need"
+flags.reset_for_tests()
+F.write()
+sent.clear()
+control.sync_knobs_to_workers(_Core())
+pushed = {k["name"]: k["value"] for _, k in sent}
+eq("*** an ENV pin is pushed as well, or the worker boots without it ***",
+   pushed.get("protect_alloc"), "by_need")
+del os.environ["VLLM_PROTECT_ALLOC"]
+flags.reset_for_tests()
+
+# and a failing RPC must not take the boot down
+class _AngryCore:
+    def collective_rpc(self, method, args=(), kwargs=None):
+        raise RuntimeError("workers not up yet")
+
+
+F.write(evict_order="lru")
+rep2 = control.sync_knobs_to_workers(_AngryCore())
+check("*** a failed sync REPORTS rather than raising, so a boot survives it ***",
+      rep2["pushed"] == [] and len(rep2["errors"]) >= 1,
+      str(rep2["errors"])[:70])
+
+# the wrap must be idempotent -- plugins load more than once per process
+_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                         "control.py")).read()
+for fn in ("wrap_engine_core_init", "wrap_engine_core_rpc"):
+    i = _src.index(f"def {fn}(")
+    body = _src[i:i + 1400]
+    check(f"{fn} is idempotent, because plugins load more than once",
+          "_kvmgr" in body and "return" in body.split("if getattr")[1][:90],
+          "a double wrap would double every call")
+
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print("  FAILED:", f)

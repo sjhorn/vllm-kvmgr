@@ -154,6 +154,7 @@ def _install_control_plane() -> None:
 
         control.install_worker_methods()
         control.wrap_engine_core_rpc()
+        control.wrap_engine_core_init()
         control.install_router_hook()
     except Exception:
         logger.exception("kvmgr: control plane install failed (continuing; the "

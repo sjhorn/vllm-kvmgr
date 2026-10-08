@@ -381,6 +381,85 @@ def wrap_engine_core_rpc() -> None:
                 "HTTP reaches the scheduler as well as both workers")
 
 
+def sync_knobs_to_workers(engine_core) -> dict:
+    """Push the ENGINE CORE's resolved knobs to every worker, once, at boot.
+
+    *** THE FLAGS FILE IS PER NODE AND THE WORKER'S GOES STALE, which was
+    measured rather than feared. *** 2026-10-08, after a `/kv/knob/clear`,
+    rank 0 reported `source=file` and rank 1 reported `source=DEFAULT`:
+
+        head    Oct 8 07:59   12 keys   disk_store_paused=1
+        worker  Oct 7 20:29    9 keys   disk_store_paused ABSENT
+
+    So every knob set through the file reached rank 0 only. The consequence
+    that matters: a deploy made "safe" by pausing the disk store path had it
+    paused on rank 0 and RUNNING on rank 1 -- the half-applied knob this whole
+    phase exists to prevent.
+
+    The control plane fixes a knob set over HTTP, because that fans out. It
+    does NOT fix the BOOT defaults, which each node reads from its own file --
+    so without this, every restart begins with the two ranks disagreeing and
+    the only symptom is behaviour that differs by node.
+
+    So the head's file becomes the single source of truth for the cluster: at
+    boot the core pushes every knob the file or the env actually SET, as an
+    override, to both workers. Knobs at their default are deliberately NOT
+    pushed -- sending them would make `source_of()` report `override` for a
+    knob nobody set, which trades a split view for a misleading one.
+
+    Best-effort and late: the executor exists by the end of `EngineCore
+    .__init__`, and a failure here costs the sync and nothing else -- the
+    engine serves, and the knobs are still settable over HTTP.
+    """
+    from . import flags
+
+    pushed, errors = [], []
+    for name in flags.DEFAULTS:
+        try:
+            src = flags.source_of(name)
+            if src not in ("file", "env"):
+                continue
+            value = flags.raw(name)
+            engine_core.collective_rpc(
+                "kvmgr_set_knob", args=(), kwargs={"name": name,
+                                                   "value": value})
+            pushed.append(f"{name}={value!r}({src})")
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    if pushed or errors:
+        logger.info(
+            "kvmgr: boot knob sync -- pushed %d knob(s) to the workers so both "
+            "ranks start from the HEAD's file rather than their own: %s%s",
+            len(pushed), pushed,
+            f"; {len(errors)} error(s): {errors}" if errors else "")
+    return {"pushed": pushed, "errors": errors}
+
+
+def wrap_engine_core_init() -> None:
+    """Fan the boot knobs out once the executor exists."""
+    try:
+        from vllm.v1.engine.core import EngineCore
+    except Exception:
+        return
+    original = EngineCore.__init__
+    if getattr(original, "_kvmgr_sync", False):
+        return
+
+    def __init__(self, *a, **kw):
+        out = original(self, *a, **kw)
+        try:
+            sync_knobs_to_workers(self)
+        except Exception:
+            logger.exception(
+                "kvmgr: the boot knob sync failed, so the two ranks may start "
+                "from DIFFERENT files. Knobs set over HTTP still fan out "
+                "correctly; it is only the boot defaults that may disagree.")
+        return out
+
+    __init__._kvmgr_sync = True  # type: ignore[attr-defined]
+    EngineCore.__init__ = __init__  # type: ignore[method-assign]
+
+
 def _apply_locally(method: str, args: tuple, kwargs: dict) -> None:
     if method == "kvmgr_set_knob":
         name = kwargs.get("name", args[0] if args else None)
