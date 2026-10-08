@@ -798,6 +798,27 @@ class DiskStoreHandler:
         self._writing: list[tuple[int, Any, list[int]]] = []
         self._next_inner = 1
         self._saturated = False
+        # *** COMPLETIONS MUST SURVIVE wait(). *** `wait()` looped over
+        # `self.get_finished()` and kept only `r.job_id`, DISCARDING the
+        # TransferResult -- and `get_finished` pops the job, so a result can
+        # never be produced twice. Upstream's
+        # `OffloadingConnectorWorker.get_finished()` is the ONLY caller of
+        # `mark_completed()`, so every completion the fence happened to observe
+        # was EATEN: the scheduler never heard it, pending_count stayed at
+        # num_workers forever, complete_store never fired, the key was never
+        # indexed, and the job stayed in `jobs_to_flush` fencing its blocks
+        # permanently. Measured 2026-10-08: 5 store jobs, 1 report delivered;
+        # 7% of keys indexed on a 41K prompt against ~90% on a 3K one, because
+        # the fence waits far more under load. It also explains the +13,312
+        # tokens-per-pass convergence, `jobs_open: 0` on the worker against 125
+        # open on the scheduler, and the 9,300 fenced blocks that deferred a
+        # request until NCCL's watchdog killed the worker.
+        #
+        # So COLLECTION and REPORTING are separate now. `_collect()` advances
+        # the machinery and parks finished results here; `get_finished()` is the
+        # only thing that drains this list, because it is the only path that
+        # reaches upstream. `wait()` reads it without draining.
+        self._ready: list = []
         self.stats = {"submitted": 0, "refused_pairing": 0,
                       "files": 0, "bytes": 0, "errors": 0,
                       # *** THE FENCE, MEASURED. *** `handle_preemptions`
@@ -936,7 +957,7 @@ class DiskStoreHandler:
             files += 1
         return total, files
 
-    def get_finished(self) -> list:
+    def _collect(self) -> None:
         from vllm.v1.kv_offload.worker.worker import TransferResult
 
         if not _LIVE_CONN_WORKER:
@@ -989,7 +1010,7 @@ class DiskStoreHandler:
         self._pump()
 
         # 4. a job is done only when every round of it is.
-        out = []
+        out = self._ready_buf()
         for job_id in [j for j, st in self._jobs.items()
                        if st["pending"] == 0 and (not st["batches"] or st["failed"])]:
             st = self._jobs.pop(job_id)
@@ -1013,7 +1034,7 @@ class DiskStoreHandler:
                     job_id=job_id, success=True, transfer_size=st["bytes"],
                     transfer_time=_elapsed(st.get("t0")),
                     transfer_type=("GPU", self._spec.disk_medium)))
-        return out
+        return None
 
     def wait(self, job_ids: set) -> None:
         """Block until OUR jobs among `job_ids` are on disk.
@@ -1060,7 +1081,12 @@ class DiskStoreHandler:
         deadline = time.monotonic() + 120.0
         while remaining and time.monotonic() < deadline:
             self.stats["wait_rounds"] += 1
-            for r in self.get_finished():
+            # *** _collect, NEVER get_finished. *** Calling get_finished here
+            # DRAINED the results and threw them away, so the scheduler never
+            # learned the store had completed. The fence only needs to know a
+            # job is DONE; reporting it is upstream's call to make.
+            self._collect()
+            for r in self._ready_buf():
                 remaining.discard(r.job_id)
             if remaining:
                 time.sleep(0.0005)
@@ -1077,6 +1103,38 @@ class DiskStoreHandler:
 
     def shutdown(self) -> None:
         self._writers.shutdown(wait=True)
+
+    def _ready_buf(self) -> list:
+        """The parked-completions buffer, created on demand.
+
+        *** A RELOAD NEVER RUNS __init__. *** `rebind` re-points a live object
+        with `obj.__class__ = new`, so an attribute introduced alongside a
+        method is absent on exactly the objects that matter. `_gcounts` crashed
+        the engine this way earlier today; `_ready` sits on the STORE path, so
+        the same mistake here would be worse. Lazily initialised on the
+        instance -- never a class attribute, which every instance would share,
+        aliasing two handlers' completions into one list.
+        """
+        buf = getattr(self, "_ready", None)
+        if buf is None:
+            buf = []
+            self._ready = buf
+        return buf
+
+    def get_finished(self) -> list:
+        """Report completions upstream. *** THE ONLY DRAIN OF self._ready. ***
+
+        Upstream's `OffloadingConnectorWorker.get_finished()` is the only caller
+        of `mark_completed()`, so a TransferResult that leaves this method and
+        is not handed to it is LOST FOREVER -- the job is already popped and can
+        never be reported again. That is precisely what `wait()` used to do.
+        Keeping the drain in one method is what makes that checkable by reading
+        one function instead of auditing every caller.
+        """
+        self._collect()
+        out = self._ready_buf()
+        self._ready = []
+        return out
 
     def snapshot(self) -> dict:
         return dict(self.stats, staging=self._pool.snapshot(),
@@ -1137,6 +1195,7 @@ class DiskLoadHandler:
         # The LOAD handler shares wait()'s shape, so it shares the counters --
         # a missing key here is a KeyError in the fence, which is exactly the
         # bug the offline fixture-parity assertion caught before it shipped.
+        self._ready: list = []
         self.stats = {"submitted": 0, "refused_pairing": 0, "files": 0,
                       "bytes": 0, "errors": 0,
                       "wait_calls": 0, "wait_ours": 0, "wait_blocked_ms": 0,
@@ -1202,7 +1261,7 @@ class DiskLoadHandler:
                 else:
                     st["batches"][0] = [g, bkeys[n:], bids[n:]]
 
-    def get_finished(self) -> list:
+    def _collect(self) -> None:
         from vllm.v1.kv_offload.base import GPULoadStoreSpec
         from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
         from vllm.v1.kv_offload.worker.worker import TransferResult
@@ -1269,7 +1328,7 @@ class DiskLoadHandler:
 
         self._pump()
 
-        out = []
+        out = self._ready_buf()
         for job_id in [j for j, st in self._jobs.items()
                        if st["pending"] == 0 and (not st["batches"] or st["failed"])]:
             st = self._jobs.pop(job_id)
@@ -1281,7 +1340,7 @@ class DiskLoadHandler:
                 transfer_size=st["bytes"] if not st["failed"] else None,
                 transfer_time=_elapsed(st.get("t0")),
                 transfer_type=(self._spec.disk_medium, "GPU")))
-        return out
+        return None
 
     def wait(self, job_ids: set) -> None:
         """Block until OUR loads among `job_ids` are in GPU memory.
@@ -1325,6 +1384,38 @@ class DiskLoadHandler:
 
     def shutdown(self) -> None:
         self._readers.shutdown(wait=True)
+
+    def _ready_buf(self) -> list:
+        """The parked-completions buffer, created on demand.
+
+        *** A RELOAD NEVER RUNS __init__. *** `rebind` re-points a live object
+        with `obj.__class__ = new`, so an attribute introduced alongside a
+        method is absent on exactly the objects that matter. `_gcounts` crashed
+        the engine this way earlier today; `_ready` sits on the STORE path, so
+        the same mistake here would be worse. Lazily initialised on the
+        instance -- never a class attribute, which every instance would share,
+        aliasing two handlers' completions into one list.
+        """
+        buf = getattr(self, "_ready", None)
+        if buf is None:
+            buf = []
+            self._ready = buf
+        return buf
+
+    def get_finished(self) -> list:
+        """Report completions upstream. *** THE ONLY DRAIN OF self._ready. ***
+
+        Upstream's `OffloadingConnectorWorker.get_finished()` is the only caller
+        of `mark_completed()`, so a TransferResult that leaves this method and
+        is not handed to it is LOST FOREVER -- the job is already popped and can
+        never be reported again. That is precisely what `wait()` used to do.
+        Keeping the drain in one method is what makes that checkable by reading
+        one function instead of auditing every caller.
+        """
+        self._collect()
+        out = self._ready_buf()
+        self._ready = []
+        return out
 
     def snapshot(self) -> dict:
         return dict(self.stats, jobs_open=len(self._jobs),

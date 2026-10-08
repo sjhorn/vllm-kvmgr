@@ -1404,6 +1404,67 @@ eq("an upstream change is an absence, never an exception",
 check("...and still never a zero", "unshipped_completions" not in _s)
 del diskio._LIVE_CONN_WORKER[:]
 
+# -- (b18) A COMPLETION OBSERVED BY wait() MUST STILL BE REPORTED ----------
+#
+# *** THE ROOT CAUSE OF THE WHOLE PHASE, AND IT WAS MINE. *** wait() looped
+# `for r in self.get_finished(): remaining.discard(r.job_id)` -- and
+# get_finished POPS the job, so a result can never be produced twice. Upstream's
+# OffloadingConnectorWorker.get_finished() is the ONLY caller of
+# mark_completed(), so every completion the fence happened to observe was EATEN.
+# Measured live: 5 store jobs, 1 report delivered; 7% of a 41K prompt's keys
+# indexed against ~90% of a 3K one, because the fence waits far more under load.
+# Downstream of that one line: the +13,312-tokens-per-pass convergence,
+# jobs_open 0 on the worker against 125 open on the scheduler, 9,300 blocks
+# fenced forever, a request deferred until NCCL's watchdog killed the worker.
+#
+# The property is simple to state and was impossible to see: wait() may OBSERVE
+# completions, and only get_finished() may CONSUME them.
+
+
+class _FakeHandler:
+    """The smallest thing with the real collect/report/wait split."""
+
+    def __init__(self):
+        self._jobs = {1: {}, 2: {}}
+        self.stats = {"wait_calls": 0, "wait_ours": 0, "wait_rounds": 0,
+                      "wait_blocked_ms": 0, "wait_max_pending": 0}
+
+    # the same accessor shape as the real handlers
+    _ready_buf = diskio.DiskStoreHandler._ready_buf
+
+    def _collect(self):
+        # one job finishes per call
+        for jid in list(self._jobs):
+            del self._jobs[jid]
+            self._ready_buf().append(
+                type("R", (), {"job_id": jid, "success": True})())
+            break
+
+    get_finished = diskio.DiskStoreHandler.get_finished
+    wait = diskio.DiskStoreHandler.wait
+
+
+_h = _FakeHandler()
+_h.wait({1, 2})
+eq("wait() observes both jobs and returns", len(_h._jobs), 0)
+_reported = [r.job_id for r in _h.get_finished()]
+eq("*** and BOTH completions are still reported afterwards ***",
+   sorted(_reported), [1, 2])
+eq("...and a second report is empty, so nothing is double-counted",
+   _h.get_finished(), [])
+
+# the structural guard: get_finished must be the ONLY thing that clears the
+# buffer, because a drain anywhere else is unreportable and invisible.
+_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                         "diskio.py")).read()
+_drains = [ln.strip() for ln in _src.splitlines()
+           if "self._ready = []" in ln and not ln.strip().startswith("#")]
+eq("exactly one drain site per handler, and no more", len(_drains), 2)
+_calls_gf_in_wait = [ln.strip() for ln in
+                     _src[_src.index("def wait("):].splitlines()[:40]
+                     if "self.get_finished()" in ln]
+eq("*** wait() must never call get_finished ***", _calls_gf_in_wait, [])
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
     for f in FAIL:
