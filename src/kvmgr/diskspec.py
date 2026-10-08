@@ -104,27 +104,56 @@ _LIVE_OFFLOAD_SCHED: list = []
 
 
 def _discover_offload_sched():
-    """Find a live OffloadingConnectorScheduler by scanning gc. On demand only."""
+    """Find a live OffloadingConnectorScheduler by scanning gc. On demand only.
+
+    Returns `(obj_or_None, why)`. *** A REFUSAL MUST NAME ITS CAUSE, and the
+    first version of this did not. *** It returned a bare None, so a failed
+    discovery and an engine with genuinely no connector were indistinguishable
+    -- and the three real causes (the module will not import, the class is not
+    where we look, nothing of that type is alive in THIS process) want
+    completely different responses. That cost a round.
+    """
     try:
         import gc
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
-            scheduler as _osched,
-        )
-        cls = _osched.OffloadingConnectorScheduler
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, "gc unavailable: %r" % (exc,)
+    mods = (
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler",
+        # Upstream has moved this at least once; both spellings are tried and
+        # the one that worked is reported, so a future move is a named miss.
+        "vllm.v1.kv_offload.scheduler",
+    )
+    tried = []
+    cls = None
+    for mod in mods:
+        try:
+            import importlib
+            m = importlib.import_module(mod)
+            cls = getattr(m, "OffloadingConnectorScheduler", None)
+            if cls is not None:
+                tried.append("%s: found class" % mod)
+                break
+            tried.append("%s: imported, no OffloadingConnectorScheduler" % mod)
+        except Exception as exc:
+            tried.append("%s: %r" % (mod, exc))
+    if cls is None:
+        return None, "class not found -- " + "; ".join(tried)
+    n = 0
     try:
         for obj in gc.get_objects():
+            n += 1
             try:
                 if isinstance(obj, cls):
                     del _LIVE_OFFLOAD_SCHED[:]
                     _LIVE_OFFLOAD_SCHED.append(obj)
-                    return obj
+                    return obj, "gc-scan"
             except Exception:
                 continue
-    except Exception:
-        return None
-    return None
+    except Exception as exc:
+        return None, "gc scan raised after %d objects: %r" % (n, exc)
+    return None, ("no live instance in THIS process (%s); scanned %d objects. "
+                  "The scheduler-side connector lives in the engine core, so "
+                  "this answer is only meaningful there." % (tried[-1], n))
 
 
 def offload_sched_snapshot() -> dict:
@@ -154,11 +183,14 @@ def offload_sched_snapshot() -> dict:
         # the same list the hook uses, so the scan happens at most once per
         # process. `found_by` says which route supplied it, because "the hook
         # fired" and "we went looking" are different facts about the build.
-        cs = _discover_offload_sched()
+        cs, _why = _discover_offload_sched()
+    else:
+        _why = "hook"
     if cs is None:
         return {"available": False,
-                "why": "the OffloadingConnectorScheduler hook did not fire; "
-                       "this is an ABSENCE, not zero pending jobs"}
+                "why": "no OffloadingConnectorScheduler reachable -- this is an "
+                       "ABSENCE, not zero pending jobs",
+                "discovery": _why}
     try:
         jobs = getattr(cs, "_jobs", None)
         if jobs is None:
