@@ -297,6 +297,92 @@ check("an existing handler is still chained to, not stolen",
 check("...and that case dumps the stack too",
       "Current thread" in proc3.stderr or "Thread 0x" in proc3.stderr)
 
+print("== the serializer shim: a numpy scalar must not kill the output thread ==")
+# *** THIS PRESENTED AS A HANG, TWICE. *** vLLM's enc_hook handles np.ndarray
+# but NOT numpy scalars, so one numpy int in EngineCoreOutputs raises inside
+# process_output_sockets -- killing that THREAD, not the engine. Results then
+# never reach the API server: requests complete, the core goes idle on an empty
+# input queue, clients hang for ever, and nothing logs an error. I read that as
+# a memory ceiling for an evening.
+import types as _types
+
+_calls = []
+
+
+class _FakeEncoder:
+    def enc_hook(self, obj):
+        _calls.append(obj)
+        raise TypeError("Object of type %s is not serializable" % type(obj))
+
+
+class _FakeGeneric:
+    """Stands in for numpy.generic: has .item() and is caught by isinstance."""
+
+    def __init__(self, v):
+        self._v = v
+
+    def item(self):
+        return self._v
+
+    def __repr__(self):
+        return "numpy.int64(%r)" % self._v
+
+
+_fake_np = _types.ModuleType("numpy")
+_fake_np.generic = _FakeGeneric
+_fake_su = _types.ModuleType("vllm.v1.serial_utils")
+_fake_su.MsgpackEncoder = _FakeEncoder
+
+_saved = {k: sys.modules.get(k) for k in ("numpy", "vllm.v1.serial_utils")}
+sys.modules["numpy"] = _fake_np
+sys.modules["vllm.v1.serial_utils"] = _fake_su
+try:
+    import importlib
+    reg = importlib.import_module("kvmgr.register")
+    reg._install_serializer_shim()
+    check("the shim installs",
+          getattr(_FakeEncoder.enc_hook, "_kvmgr_wrapped", False))
+    reg._install_serializer_shim()
+    check("...and is idempotent",
+          getattr(_FakeEncoder.enc_hook, "_kvmgr_wrapped", False))
+
+    enc = _FakeEncoder()
+
+    # Wrapped: under mutation these RAISE, and an escaping exception aborts the
+    # file instead of reporting a named failure. Third time this suite has
+    # needed that correction -- any assertion whose subject can raise under
+    # mutation has to catch, or break-verification reads a crash as a pass.
+    def _hook_safe(v):
+        try:
+            return enc.enc_hook(v)
+        except Exception as exc:
+            return "RAISED: %r" % (exc,)
+
+    eq("*** a numpy scalar is COERCED, not raised ***",
+       _hook_safe(_FakeGeneric(22755)), 22755)
+    eq("...losslessly", _hook_safe(_FakeGeneric(1039680)), 1039680)
+    eq("...and upstream's hook was never reached for it", _calls, [])
+
+    # `except TypeError` was too narrow: an over-wide shim calls .item() on a
+    # plain object and raises AttributeError, which escaped and aborted the
+    # file. Catch everything and DISTINGUISH, so "upstream raised correctly"
+    # and "the shim grabbed something it should not have" are separate results.
+    _what = None
+    try:
+        enc.enc_hook(object())
+    except Exception as exc:
+        _what = type(exc).__name__
+    check("*** a non-numpy object still reaches upstream's hook, so the shim "
+          "narrows nothing ***",
+          _what == "TypeError" and len(_calls) == 1)
+    check("...and the shim did NOT try to coerce it", _what != "AttributeError")
+finally:
+    for _k, _v in _saved.items():
+        if _v is not None:
+            sys.modules[_k] = _v
+        else:
+            sys.modules.pop(_k, None)
+
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print("  FAILED:", f)

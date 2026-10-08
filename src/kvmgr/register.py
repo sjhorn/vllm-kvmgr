@@ -89,6 +89,7 @@ def register() -> None:
 
     _install_group_geometry_hook(DSparkMLAAttentionManager)
     _install_offload_scheduler_hook()
+    _install_serializer_shim()
 
     # Opt-in, and it logs nothing unless offload_allow_hybrid is set. Installed
     # from register() so it lands in every process that loads the plugin --
@@ -247,6 +248,77 @@ def _install_hang_dump() -> None:
         )
     except Exception:
         logger.exception("kvmgr: could not arm the hang dump (continuing)")
+
+def _install_serializer_shim() -> None:
+    """Make a numpy SCALAR serialisable, and say where it came from.
+
+    *** THIS KILLED THE ENGINE'S OUTPUT THREAD TWICE AND PRESENTED AS A HANG.
+    *** `vllm/v1/serial_utils.py`'s `enc_hook` handles `np.ndarray` but NOT
+    numpy scalars -- `np.int64` is not an ndarray -- so a single numpy integer
+    anywhere in `EngineCoreOutputs` raises:
+
+        TypeError: Object of type <class 'numpy.int64'> is not serializable
+          core.py:1561 in process_output_sockets
+
+    And it kills that THREAD, not the engine. Results then never reach the API
+    server: requests complete, the core goes idle in `queue.get()` on an empty
+    queue, clients hang for ever, and the main loop logs NOTHING. I spent an
+    evening reading that as a memory ceiling.
+
+    *** WHY A SHIM AND NOT JUST A FIX AT THE SOURCE. *** I did fix our source
+    (`file_plan` coerces now) and it recurred, so at least one numpy scalar
+    reaches the encoder from somewhere else -- possibly not ours at all. A
+    lossless `.item()` is strictly better than killing the output thread
+    whoever produced it, and the alternative on offer
+    (`VLLM_ALLOW_INSECURE_SERIALIZATION=1`) buys the same robustness by
+    enabling pickle for everything, which is a much larger blast radius.
+
+    It is also the only instrument that can NAME the culprit: the hook is
+    handed the offending object, so one log line carries its type and value,
+    which no traceback does. Logged once per distinct type so a hot path cannot
+    flood.
+    """
+    try:
+        import numpy as _np
+        from vllm.v1 import serial_utils as _su
+    except Exception:
+        return
+    try:
+        cls = _su.MsgpackEncoder
+    except Exception:
+        logger.info("kvmgr: no MsgpackEncoder to shim (upstream layout differs)")
+        return
+    try:
+        original = cls.enc_hook
+        if getattr(original, "_kvmgr_wrapped", False):
+            return
+        seen: set = set()
+
+        def enc_hook(self, obj):
+            if isinstance(obj, _np.generic):
+                name = type(obj).__name__
+                if name not in seen:
+                    seen.add(name)
+                    logger.warning(
+                        "kvmgr: coerced a numpy scalar in the engine's OUTPUT "
+                        "path -- numpy.%s value=%r -> %r. Upstream's enc_hook "
+                        "handles ndarrays but not scalars, and the raise kills "
+                        "process_output_sockets, which strands every result "
+                        "and presents as a hang with no error. Lossless, but "
+                        "the PRODUCER should be fixed: this value is the clue.",
+                        name, obj, obj.item())
+                return obj.item()
+            return original(self, obj)
+
+        enc_hook._kvmgr_wrapped = True
+        cls.enc_hook = enc_hook
+        logger.info(
+            "kvmgr: serializer shim installed -- a numpy scalar in the output "
+            "path is now coerced and logged once with its value, instead of "
+            "killing the output socket thread and stranding every result")
+    except Exception:
+        logger.exception("kvmgr: could not install the serializer shim")
+
 
 def _install_offload_scheduler_hook() -> None:
     """Publish upstream's OffloadingConnectorScheduler so /kv can read its jobs.
