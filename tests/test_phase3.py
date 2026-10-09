@@ -675,6 +675,83 @@ check("...and is an int, so it can be bumped repeatedly",
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()
+print("== THE DROP MUST REFUSE WHILE A KV TRANSFER IS IN FLIGHT ==")
+# *** THIS KILLED THE ENGINE ON 2026-10-09. *** At 11:50:00 the drop released
+# 449 blocks and reset the pool with store jobs outstanding on BOTH ranks
+# ("store path busy -- 2 job(s) outstanding" at 11:49:23; rank 0 still
+# reporting 1 at 11:50:08). Four seconds later: Xid 32 TWICE on the worker node
+# -- a corrupted push buffer -- and Worker_TP1 died with `CUDA error:
+# unspecified launch failure`, surfacing at `synchronize_input_prep`, nowhere
+# near the cause, because the fault is asynchronous.
+#
+# A store copies GPU -> staging. Free its source block and hand it back to the
+# allocator mid-copy and the DMA reads what is no longer there. *** AND THE
+# EXISTING GATE CANNOT SEE IT: *** patch7 gates on `num_used_blocks`, which
+# counts REQUEST references, and a store job OUTLIVES its request because
+# stores are deferred past token sampling and pumped over rounds. "Idle" by
+# request count is not idle by transfer, and every earlier drop was luck about
+# timing -- which is why this needs a test rather than a comment.
+# *** THE REAL diskspec CANNOT BE IMPORTED HERE, and that is a fixture fact
+# *** rather than a problem. *** This file stubs the `vllm.*` leaves patch6/7/8
+# need, not `vllm.v1.kv_offload`, which only the *_disk.py suites fake. But the
+# manager does `from . import diskspec` at CALL time, so a stub module in
+# sys.modules is enough -- and it keeps the test beside the manager fixtures it
+# needs instead of moving the drop's tests away from the drop.
+import sys as _sysP3
+import types as _tP3
+
+_saved_ds = _sysP3.modules.get("kvmgr.diskspec")
+
+
+def _drop_with(snap):
+    """Run a fresh drop against a faked scheduler snapshot. Returns (ok, pool)."""
+    _p = _Pool(free=22000)
+    _m = _mgr_with_pool(_p, release=lambda *a, **k: None)
+    _stub = _tP3.ModuleType("kvmgr.diskspec")
+    _stub.offload_sched_snapshot = lambda: snap
+    _sysP3.modules["kvmgr.diskspec"] = _stub
+    harness.clear_log()
+    try:
+        return _m.kvmgr_drop_gpu_cache(), _p
+    finally:
+        if _saved_ds is not None:
+            _sysP3.modules["kvmgr.diskspec"] = _saved_ds
+        else:
+            _sysP3.modules.pop("kvmgr.diskspec", None)
+
+
+_ok, _p = _drop_with({"available": True, "jobs_open": 2, "stores_open": 2,
+                      "loads_open": 0, "blocks_with_pending_jobs": 7})
+eq("*** a drop with store jobs outstanding is REFUSED ***", _ok, False)
+eq("*** AND THE POOL IS NOT RESET -- that is the whole safety property, "
+   "because the reset is what recycles the blocks mid-DMA ***",
+   _p.reset_calls, 0)
+check("...and it names the counts and the remedy",
+      "REFUSED" in harness.log_text() and "outstanding" in harness.log_text())
+
+# Blocks held with no job open is still unsafe: the scheduler will not reuse a
+# block with a pending store, so a non-zero block count means the same thing.
+_ok, _p = _drop_with({"available": True, "jobs_open": 0, "stores_open": 0,
+                      "loads_open": 0, "blocks_with_pending_jobs": 3})
+eq("blocks still pending a transfer also refuse", _ok, False)
+eq("...without resetting", _p.reset_calls, 0)
+
+# A genuinely drained scheduler must still allow the drop, or the lever is dead.
+_ok, _p = _drop_with({"available": True, "jobs_open": 0, "stores_open": 0,
+                      "loads_open": 0, "blocks_with_pending_jobs": 0})
+eq("*** a DRAINED scheduler still drops, or the lever is dead ***", _ok, True)
+eq("...and the pool really was reset", _p.reset_calls, 1)
+
+# *** ABSENT IS NOT ZERO. *** An unreachable scheduler cannot say there are no
+# transfers. It proceeds -- refusing forever would disable the lever on any
+# build without the connector -- but it must SAY that it is proceeding on a
+# not-knowing, because that line is the first thing somebody reads after the
+# next Xid 32.
+_ok, _p = _drop_with({"available": False, "why": "no scheduler reachable"})
+eq("an unreachable scheduler still drops", _ok, True)
+check("*** ...but says the transfer state is UNKNOWN rather than zero ***",
+      "UNKNOWN" in harness.log_text(), harness.log_text()[-300:])
+
 if FAIL:
     for f in FAIL:
         print("  FAILED:", f)

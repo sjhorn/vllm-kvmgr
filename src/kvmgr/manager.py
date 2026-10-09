@@ -551,6 +551,58 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
 
         before = _free()
 
+        # *** THE DROP MUST NOT RECYCLE BLOCKS A KV TRANSFER IS STILL READING.
+        # *** THIS KILLED THE ENGINE ON 2026-10-09. ***
+        # Measured: at 11:50:00 the drop released 449 blocks and reset the pool
+        # with store jobs outstanding on BOTH ranks ("store path busy -- 2
+        # job(s) outstanding" at 11:49:23, and rank 0 still reporting 1 at
+        # 11:50:08). Four seconds later, Xid 32 twice on the worker node --
+        # a corrupted push buffer -- and Worker_TP1 died with `CUDA error:
+        # unspecified launch failure`, surfacing at `synchronize_input_prep`,
+        # which is nowhere near the cause because the fault is ASYNCHRONOUS.
+        #
+        # A store copies GPU -> staging. Free its source block and hand it back
+        # to the allocator mid-copy and the DMA reads something that is no
+        # longer what it was told to read. *** AND THE EXISTING GATE CANNOT SEE
+        # THIS: *** patch7 gates on `num_used_blocks`, which counts REQUEST
+        # references -- and a store job OUTLIVES its request, because stores are
+        # deferred past token sampling and pumped over rounds. So "the engine is
+        # idle" by request count is NOT idle by transfer, and every earlier drop
+        # that worked was luck about timing.
+        #
+        # Refuse rather than wait: a drop is an operator action with a human
+        # behind it, the remedy is three seconds of patience, and a blocking
+        # wait inside the scheduler's step would be its own hazard.
+        try:
+            from . import diskspec as _ds
+            _sn = _ds.offload_sched_snapshot() or {}
+        except Exception:
+            _sn = {}
+        if _sn.get("available"):
+            _open = int(_sn.get("jobs_open") or 0)
+            _blocked = int(_sn.get("blocks_with_pending_jobs") or 0)
+            if _open or _blocked:
+                logger.warning(
+                    "kvmgr: GPU prefix cache drop REFUSED -- %d KV transfer "
+                    "job(s) outstanding (%d store, %d load) holding %d block(s). "
+                    "Resetting now would recycle blocks a DMA is still reading, "
+                    "which is how Xid 32 killed the worker on 2026-10-09. Wait "
+                    "for the store path to drain and bump gpu_cache_epoch again.",
+                    _open, int(_sn.get("stores_open") or 0),
+                    int(_sn.get("loads_open") or 0), _blocked)
+                return False
+        else:
+            # *** ABSENT IS NOT ZERO. *** If the scheduler is unreachable we
+            # cannot say there are no transfers, and proceeding on that
+            # not-knowing is exactly the crash above. Say which it is.
+            logger.warning(
+                "kvmgr: GPU prefix cache drop -- cannot see the offload "
+                "scheduler (%s), so whether transfers are in flight is UNKNOWN "
+                "rather than zero. Proceeding, because refusing forever would "
+                "disable the lever on any build without the connector -- but if "
+                "a worker dies with Xid 32 moments from now, this line is why.",
+                _sn.get("why") or "no reason given")
+
         # *** RELEASE EVERY GROUP, NOT JUST OURS, AND THAT WAS A REAL REFUSAL.
         # *** Measured 2026-10-08: the drop fired, released group 0 and was
         # REFUSED -- and the log named the cause in one number, "pool free
