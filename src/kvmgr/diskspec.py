@@ -554,12 +554,67 @@ def _now() -> float:
     return time.monotonic()
 
 
-def choose_victims(items: "Sequence[tuple]", need_bytes: int) -> list:
+def decay_hits(count: float, last_ts: float, now: float,
+               halflife_s: float) -> float:
+    """A hit count aged by elapsed time. PURE.
+
+    *** A RAW COUNT NEVER FORGETS, which is the whole problem with "matched N
+    *** times this week". *** A prefix hit fifty times last Tuesday and never
+    since would hold reserved budget for ever, and the budget's job is to
+    reflect what is hot NOW. So the count decays: every `halflife_s` of not
+    being hit, it halves.
+
+    *** AND THE DECAY IS LAZY, computed on read rather than swept. *** The
+    obvious implementation is TinyLFU's periodic halving of every counter, and
+    at 560,000 keys that is a 560,000-entry sweep on a timer, on the engine
+    core, for a number nobody is looking at between evictions. Decaying on
+    access is O(1) and needs no timer at all; the cost is that a stored count
+    means nothing without its timestamp, which is why they travel together
+    everywhere including the manifest.
+
+    A zero halflife means NO DECAY -- a raw count -- rather than instant
+    forgetting, because 0 reads as "feature off" everywhere else in this file
+    and the alternative would silently zero every counter.
+    """
+    if count <= 0:
+        return 0.0
+    if halflife_s <= 0:
+        return float(count)
+    dt = now - last_ts
+    if dt <= 0:
+        return float(count)
+    # 2 ** -(dt/halflife): one halving per halflife of silence.
+    return float(count) * (0.5 ** (dt / float(halflife_s)))
+
+
+def bump_hits(count: float, last_ts: float, now: float,
+              halflife_s: float) -> "tuple[float, float]":
+    """Register one hit, decaying what was there first. PURE.
+
+    Returns `(count, last_ts)` to store. Decay-then-add is the order that
+    matters: adding first would let a long-cold key jump straight back to its
+    old height on a single hit, which is exactly the "never forgets" behaviour
+    the decay exists to remove.
+    """
+    return (decay_hits(count, last_ts, now, halflife_s) + 1.0, float(now))
+
+
+def choose_victims(items: "Sequence[tuple]", need_bytes: int,
+                   hot_threshold: float = 0.0) -> list:
     """Pick keys to evict until `need_bytes` is freed. PURE.
 
-    `items` is `(key, nbytes, pos, recency)` in NO required order; `recency` is
-    any comparable where SMALLER is older. Returns the victim keys in the order
-    they should be dropped.
+    `items` is `(key, nbytes, pos, recency)` or `(key, nbytes, pos, recency,
+    hits)` in NO required order; `recency` is any comparable where SMALLER is
+    older, and `hits` is an ALREADY-DECAYED count (see `decay_hits`). A
+    4-tuple means "no hit information", which bands as cold -- so every
+    existing caller keeps its behaviour exactly.
+
+    *** HOTNESS DEPRIORITISES; IT DOES NOT VETO. *** A hot key that could never
+    be evicted makes the budget unenforceable the moment everything is hot,
+    which is the "refusal that does nothing" shape this project keeps finding:
+    the budget would report a target it cannot meet and the disk would grow
+    anyway. So hot keys sort LAST and are reached only if the cold ones did not
+    free enough.
 
     *** THE VICTIM RULE IS THE WHOLE POINT OF PHASE 5, AND PLAIN LRU IS THE
     *** WRONG ANSWER. *** External reuse is a CONTIGUOUS RUN FROM TOKEN 0,
@@ -585,10 +640,21 @@ def choose_victims(items: "Sequence[tuple]", need_bytes: int) -> list:
     """
     if need_bytes <= 0:
         return []
-    # Oldest first; within an age, the furthest from token 0 first.
-    ordered = sorted(items, key=lambda it: (it[3], -it[2]))
+
+    def band(it: tuple) -> int:
+        """0 = evict freely, 1 = only if we must."""
+        if hot_threshold <= 0:
+            return 0
+        hits = it[4] if len(it) > 4 else 0.0
+        return 1 if (hits or 0.0) >= hot_threshold else 0
+
+    # Cold before hot; then oldest first; then, within an age, the furthest
+    # from token 0 -- which is what stops a head being orphaned behind its own
+    # tail.
+    ordered = sorted(items, key=lambda it: (band(it), it[3], -it[2]))
     out, freed = [], 0
-    for key, nbytes, _pos, _rec in ordered:
+    for it in ordered:
+        key, nbytes, _pos = it[0], it[1], it[2]
         out.append(key)
         freed += int(nbytes)
         if freed >= need_bytes:
