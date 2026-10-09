@@ -314,6 +314,15 @@ class _FakeEncoder:
         _calls.append(obj)
         raise TypeError("Object of type %s is not serializable" % type(obj))
 
+    # *** THE OUTPUT LOOP HAS TWO ENCODE CALLS AND ONLY ONE WAS WRAPPED. ***
+    # core.py uses encode_into() per output and encode() for the coordinator
+    # socket, so the fixture must carry both or the test cannot see the gap.
+    def encode(self, obj, *a, **kw):
+        return b""
+
+    def encode_into(self, obj, buf, *a, **kw):
+        return b""
+
 
 class _FakeGeneric:
     """Stands in for numpy.generic: has .item() and is caught by isinstance."""
@@ -730,6 +739,98 @@ finally:
         else:
             _s3.modules.pop(_k, None)
 
+
+print("== the coercion walk must search BOTH encode roots ==")
+# *** MEASURED ON THE BOX, 2026-10-09: the coercion fired (numpy.int64
+# *** value=1) and the walk reported "none reachable". *** That near
+# contradiction was the clue: the walk searched root["obj"], which only
+# encode_into set, while `v1/engine/core.py` ALSO calls
+# `encoder.encode(outputs)` for the coordinator socket. A scalar arriving
+# through encode() left the walk searching a STALE object from an earlier
+# encode_into -- and a walk looking in the wrong place reports exactly like a
+# walk with nothing to find.
+import types as _t5
+import sys as _s5
+import importlib as _il5
+
+_np5 = _t5.ModuleType("numpy")
+
+
+class _G5:
+    def __init__(self, v):
+        self.v = v
+
+    def item(self):
+        return self.v
+
+    def __repr__(self):
+        return "numpy.int64(%r)" % self.v
+
+
+_np5.generic = _G5
+_np5.ndarray = type("ndarray", (), {})
+_warn5 = []
+
+
+class _Enc6:
+    def enc_hook(self, obj):
+        raise TypeError("not serializable")
+
+    def encode(self, obj, *a, **kw):
+        return b""
+
+    def encode_into(self, obj, buf, *a, **kw):
+        return b""
+
+
+_su5 = _t5.ModuleType("vllm.v1.serial_utils")
+_su5.MsgpackEncoder = _Enc6
+_sv5 = {k: _s5.modules.get(k) for k in ("numpy", "vllm.v1.serial_utils")}
+_s5.modules["numpy"] = _np5
+_s5.modules["vllm.v1.serial_utils"] = _su5
+try:
+    reg5 = _il5.import_module("kvmgr.register")
+    _rl5, reg5.logger = reg5.logger, _t5.SimpleNamespace(
+        warning=lambda *a, **k: _warn5.append(a[0] % tuple(a[1:])),
+        info=lambda *a, **k: None,
+        exception=lambda *a, **k: _warn5.append("EXCEPTION"))
+    try:
+        reg5._install_serializer_shim()
+        check("the encode() path is wrapped at all -- it was not, and that is "
+              "the whole defect", getattr(_Enc6.encode, "_kvmgr_wrapped", False))
+        e6 = _Enc6()
+
+        class _ViaEncode:
+            def __init__(self):
+                self.coordinator_field = _G5(1)
+
+        # An encode_into FIRST, with a clean object, so the stale-root
+        # condition the box actually hit is reproduced exactly.
+        class _CleanOut:
+            def __init__(self):
+                self.a = 1
+
+        e6.encode_into(_CleanOut(), bytearray())
+        e6.encode(_ViaEncode())
+        try:
+            e6.enc_hook(_G5(1))
+        except Exception:
+            pass
+        _pp = [w for w in _warn5 if "PRODUCER" in w]
+        check("*** the scalar is found on the encode() root even though the "
+              "LAST encode_into was clean -- the stale-root failure ***",
+              any("coordinator_field" in w for w in _pp), _pp)
+        check("...and the message says WHICH call carried it, which is what "
+              "identifies the producer",
+              any("via obj_encode" in w for w in _pp), _pp)
+    finally:
+        reg5.logger = _rl5
+finally:
+    for _k, _v in _sv5.items():
+        if _v is not None:
+            _s5.modules[_k] = _v
+        else:
+            _s5.modules.pop(_k, None)
 
 print("== the reload must RE-ARM every installer, audited not listed ==")
 # *** A RELOAD NEVER CALLS `register()`, SO ANYTHING INSTALLED FROM THERE IS

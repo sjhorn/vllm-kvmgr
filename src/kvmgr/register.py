@@ -259,7 +259,7 @@ _SCAN_LIMIT = 600
 
 
 def _numpy_paths(root, limit: int = 12, max_depth: int = 8,
-                 max_nodes: int = 200000) -> list:
+                 max_nodes: int = 200000, max_items: int = 512) -> list:
     """Dotted paths to every numpy SCALAR reachable from `root`. Bounded.
 
     *** THE HOOK SEES THE SCALAR, NOT ITS PARENT, and that is why two runs of
@@ -300,7 +300,7 @@ def _numpy_paths(root, limit: int = 12, max_depth: int = 8,
         seen.add(oid)
         try:
             if isinstance(obj, dict):
-                for k, v in list(obj.items())[:512]:
+                for k, v in list(obj.items())[:max_items]:
                     # *** A DICT KEY CAN BE THE SCALAR, and this walk could not
                     # *** see one. *** It descended into values only, so a
                     # numpy integer used as a KEY was invisible -- and that is
@@ -315,7 +315,7 @@ def _numpy_paths(root, limit: int = 12, max_depth: int = 8,
                     walk(v, "%s[%r]" % (path, k), depth + 1)
                 return
             if isinstance(obj, (list, tuple, set, frozenset)):
-                for i, v in enumerate(list(obj)[:512]):
+                for i, v in enumerate(list(obj)[:max_items]):
                     walk(v, "%s[%d]" % (path, i), depth + 1)
                 return
             slots = getattr(type(obj), "__slots__", None)
@@ -419,6 +419,7 @@ def _install_serializer_shim() -> None:
                 orig_encode, "_kvmgr_wrapped", False):
             def encode_into(self, obj, buf, *a, **kw):
                 root["obj"] = obj
+                root["obj_encode_into"] = obj
                 # *** LOOK PROACTIVELY, because the coercion is RARE. ***
                 # Two occurrences in a whole evening (value=1, then 39), and a
                 # deliberate reproduction attempt -- a restore plus three
@@ -493,19 +494,64 @@ def _install_serializer_shim() -> None:
             encode_into._kvmgr_original = orig_encode
             cls.encode_into = encode_into
 
+        # *** `encode_into` IS NOT THE ONLY ENCODE CALL, and that is very
+        # *** probably why the coercion walk reported "none". ***
+        # `v1/engine/core.py`'s output loop has TWO: the per-output
+        # `encoder.encode_into(outputs, buffer)` and, for the coordinator
+        # socket, `coord_socket.send_multipart(encoder.encode(outputs))`. Only
+        # the first was wrapped, so when the scalar arrived through `encode()`
+        # the walk searched a STALE object from some earlier encode_into and
+        # truthfully found nothing -- a walk that is looking in the wrong place
+        # reports exactly like a walk that has nothing to find. Measured
+        # 2026-10-09: value=1 coerced, walk found none.
+        #
+        # Both roots are kept SEPARATELY rather than one being overwritten,
+        # because the two calls are made from different threads and a single
+        # slot would race -- and the path label then says which call carried
+        # it, which is the part that identifies the producer.
+        _orig_plain = getattr(cls, "encode", None)
+        if _orig_plain is not None:
+            if getattr(_orig_plain, "_kvmgr_wrapped", False):
+                _orig_plain = getattr(_orig_plain, "_kvmgr_original",
+                                      _orig_plain)
+
+            def encode(self, obj, *a, **kw):
+                root["obj"] = obj
+                root["obj_encode"] = obj
+                return _orig_plain(self, obj, *a, **kw)
+
+            encode._kvmgr_wrapped = True
+            encode._kvmgr_original = _orig_plain
+            cls.encode = encode
+
         def enc_hook(self, obj):
             if isinstance(obj, _np.generic):
                 name = type(obj).__name__
                 if name not in seen:
                     seen.add(name)
                     try:
-                        paths = _numpy_paths(root.get("obj"))
+                        # Thorough, not cheap: this runs ONCE per process per
+                        # numpy type, so the bounds that keep the sampled scan
+                        # off the hot path are the wrong bounds here.
+                        found = []
+                        for _which in ("obj_encode_into", "obj_encode"):
+                            _o = root.get(_which)
+                            if _o is None:
+                                continue
+                            for _p in _numpy_paths(
+                                    _o, limit=12, max_depth=12,
+                                    max_nodes=2000000, max_items=4096):
+                                found.append("via %s: %s" % (_which, _p))
                         logger.warning(
                             "kvmgr: numpy scalar PRODUCER -- %s",
-                            "; ".join(paths) if paths else
-                            "the walk found none, so it is not reachable by "
-                            "attribute from the encoded root (a __slots__ type "
-                            "or a C extension holds it)")
+                            "; ".join(found) if found else
+                            "neither encode root reaches it by attribute "
+                            "(roots searched: %s). A C extension or a "
+                            "non-attribute container holds it, or it was "
+                            "built inside the encode call itself."
+                            % (",".join(k for k in ("obj_encode_into",
+                                                    "obj_encode")
+                                        if root.get(k) is not None) or "none"))
                     except Exception:
                         logger.exception("kvmgr: the producer walk raised")
                     logger.warning(
