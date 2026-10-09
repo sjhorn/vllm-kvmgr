@@ -626,28 +626,36 @@ class DiskPresenceManager(OffloadingManager):
         """
         try:
             from vllm.v1.kv_offload.base import get_offload_group_idx
-            sizes = getattr(self, "_group_sizes", None)
-            if sizes is None:
-                sizes = self._spec_group_sizes()
-                self._group_sizes = sizes
-            g = get_offload_group_idx(key)
-            if sizes and 0 <= g < len(sizes):
-                return int(sizes[g])
+            g = int(get_offload_group_idx(key))
+        except Exception:
+            return 0
+        cache = getattr(self, "_group_bytes", None)
+        if cache is None:
+            cache = {}
+            self._group_bytes = cache
+        if g in cache:
+            return cache[g]
+        # *** STAT THE FILE. The first version asked the live HANDLER for its
+        # *** sizes, and the handler lives in the WORKER while this manager
+        # lives in the ENGINE CORE -- so `_LIVE_HANDLERS` was always empty here
+        # and every key cost 0. Measured on the box: 521,628 keys reporting
+        # "0.0 GB held", a budget of 1 GB, and `over_budget: False`. The
+        # accounting was a fiction and the budget could never fire.
+        #
+        # One stat per GROUP, ever, cached: the five groups have fixed and
+        # different per-block sizes (985,664 / 822,272 / 784,896 / 860,160 /
+        # 655,360 B), the files are on this node by definition, and a uniform
+        # estimate would be up to 50% wrong. Five syscalls for an exact answer
+        # beats importing worker state that does not exist here.
+        try:
+            import os as _os
+            size = int(_os.path.getsize(self._mapper.get_file_name(key)))
+            if size > 0:
+                cache[g] = size
+                return size
         except Exception:
             pass
         return 0
-
-    def _spec_group_sizes(self) -> list:
-        """Per-group file sizes, if the live handler can tell us. Best effort."""
-        try:
-            from kvmgr import diskio as _dio
-            for h in list(getattr(_dio, "_LIVE_HANDLERS", [])):
-                sizes = getattr(h, "_sizes", None)
-                if sizes:
-                    return [int(x) for x in sizes]
-        except Exception:
-            pass
-        return []
 
     def _remember(self, key: bytes, pos: int) -> None:
         """Record a key as present, with its cost and position. Idempotent."""
@@ -1102,11 +1110,21 @@ class DiskPresenceManager(OffloadingManager):
             for what, d in sorted(getattr(self, "_gcounts", {}).items())
         }
         _budget = budget_bytes(flags.peek("disk_budget_gb"))
+        # *** 0 BYTES HELD WITH KEYS PRESENT IS AN ABSENCE, NOT A MEASUREMENT.
+        # *** That exact reading -- 521,628 keys at "0.0 GB" -- was the broken
+        # accounting above, and it made a 1 GB budget report `over: False`. A
+        # budget computed from an unknown total must say so, because silently
+        # never firing is the worst of the three possible behaviours.
+        _sized = bool(getattr(self, "_group_bytes", None))
+        _accounting_ok = (not self._present) or (self._bytes > 0 and _sized)
         return dict(self._stats, present=len(self._present),
                     bytes_held=self._bytes,
                     budget_bytes=_budget,
                     budget_gb=round(_budget / 1e9, 2) if _budget else 0,
                     over_budget=bool(_budget and self._bytes > _budget),
+                    byte_accounting_ok=_accounting_ok,
+                    group_bytes_known=sorted(
+                        getattr(self, "_group_bytes", {}) or {}),
                     budget_enforced=bool(_budget),
                     num_workers=self._num_workers,
                     by_group=by_group,

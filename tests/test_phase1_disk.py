@@ -898,6 +898,45 @@ except Exception as _exc:
 eq("*** the migration is idempotent, so calling it per-entry costs nothing ***",
    _after, _before)
 
+print("== (5g) byte accounting comes from a STAT, not from worker state ==")
+# *** THE FIRST VERSION ASKED THE LIVE HANDLER, WHICH LIVES IN THE WORKER. ***
+# This manager runs in the ENGINE CORE, so `_LIVE_HANDLERS` is always empty
+# here and every key costed 0. Measured on the box: 521,628 keys reporting
+# "0.0 GB held" with a 1 GB budget and over_budget=False -- the accounting was
+# a fiction and the budget could never fire. One stat per GROUP, cached.
+_bm = diskspec.DiskPresenceManager(_tmpspec.file_mapper(), num_workers=WORLD)
+_bk = base.make_offload_key(b"\xd4" * 32, 2)
+_bpath = _tmpspec.file_mapper().get_file_name(_bk)
+os.makedirs(os.path.dirname(_bpath), exist_ok=True)
+with open(_bpath, "wb") as _f:
+    _f.write(b"\0" * 4096)
+eq("*** the cost is the file's real size ***", _bm._key_bytes(_bk), 4096)
+eq("...cached per group, so it is one stat ever",
+   sorted(_bm._group_bytes), [2])
+os.unlink(_bpath)
+eq("...and the cache survives the file going away (it is a group constant)",
+   _bm._key_bytes(_bk), 4096)
+
+_bk_absent = base.make_offload_key(b"\xd5" * 32, 3)
+eq("a group with no file yet costs 0 rather than raising",
+   _bm._key_bytes(_bk_absent), 0)
+
+print("== (5h) 0 bytes held with keys present is an ABSENCE, not a measurement ==")
+_am = diskspec.DiskPresenceManager(_tmpspec.file_mapper(), num_workers=WORLD)
+eq("an empty index has sound accounting", _am.snapshot()["byte_accounting_ok"],
+   True)
+# the exact broken state seen live: keys present, nothing sized
+_am._present[b"ghost"] = (0, -1)
+_am._bytes = 0
+check("*** keys present at 0 bytes is flagged, because a budget computed from "
+      "it silently never fires ***",
+      _am.snapshot()["byte_accounting_ok"] is False)
+_am._group_bytes = {0: 1000}
+_am._present[b"real"] = (1000, 0)
+_am._bytes = 1000
+check("...and sound accounting reports True",
+      _am.snapshot()["byte_accounting_ok"] is True)
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()
 if FAIL:
