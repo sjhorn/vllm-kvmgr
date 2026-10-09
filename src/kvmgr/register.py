@@ -301,6 +301,17 @@ def _numpy_paths(root, limit: int = 12, max_depth: int = 8,
         try:
             if isinstance(obj, dict):
                 for k, v in list(obj.items())[:512]:
+                    # *** A DICT KEY CAN BE THE SCALAR, and this walk could not
+                    # *** see one. *** It descended into values only, so a
+                    # numpy integer used as a KEY was invisible -- and that is
+                    # not a hypothetical shape here:
+                    # `OffloadingWorkerMetadata.completed_jobs` is
+                    # `{job_id: count}`, a dict keyed by integers, and it
+                    # travels to the scheduler in the engine's output. msgpack
+                    # has to serialise a key exactly as it serialises a value,
+                    # so a numpy key is the same fatal TypeError with none of
+                    # the visibility.
+                    walk(k, "%s.KEY" % path, depth + 1)
                     walk(v, "%s[%r]" % (path, k), depth + 1)
                 return
             if isinstance(obj, (list, tuple, set, frozenset)):

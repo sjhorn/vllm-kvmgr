@@ -462,6 +462,21 @@ try:
           any("outputs.scheduler_stats.hits" in p for p in _paths), _paths)
     check("...and one nested in a list and a dict",
           any("things[1]['deep']" in p for p in _paths), _paths)
+
+    # *** A DICT KEY CAN BE THE SCALAR, and the walk could not see one. ***
+    # It descended into values only. That is not a hypothetical shape here:
+    # `OffloadingWorkerMetadata.completed_jobs` is `{job_id: count}`, a dict
+    # keyed by integers, and it travels to the scheduler in the engine's
+    # output. msgpack serialises a key exactly as it serialises a value, so a
+    # numpy KEY is the same fatal TypeError with none of the visibility -- and
+    # the two observed values (1, then 39) are the size a job id would be.
+    class _Keyed:
+        def __init__(self):
+            self.completed_jobs = {_Gen(39): 1}
+
+    _kpaths = _walk(_Keyed())
+    check("*** a numpy scalar used as a dict KEY is found ***",
+          any(".KEY" in p and "39" in p for p in _kpaths), _kpaths)
     check("...carrying the VALUE too, so it ties to the hook's line",
           any("39" in p for p in _paths), _paths)
     eq("a clean object yields no paths", _walk(_Stats.__new__(_Stats)) if False
