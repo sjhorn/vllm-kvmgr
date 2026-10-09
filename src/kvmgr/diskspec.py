@@ -528,6 +528,8 @@ class DiskPresenceManager(OffloadingManager):
     # per block; batching costs at most this many keys of a crash's worth of
     # forgotten (not wrong) presence, which only ever means a needless recompute.
     MANIFEST_FLUSH_KEYS = 512
+    # How often a steady-state eviction summary may be logged.
+    EVICT_LOG_S = 60.0
     # And a time floor, because a session adding fewer than 512 keys would
     # otherwise never flush at all. See flush_manifest for the measurement.
     MANIFEST_FLUSH_S = 30.0
@@ -993,13 +995,38 @@ class DiskPresenceManager(OffloadingManager):
             self._events.append(OffloadingEvent(
                 keys=list(victims), medium=DISK_MEDIUM, removed=True))
             self._unflushed += len(victims)
-            logger.info(
-                "kvmgr: disk budget -- evicting %d key(s) / %.2f GB to make "
-                "room for %.2f GB (held %.2f GB, budget %.2f GB). Tail-first "
-                "within an age, so a prefix shortens rather than losing its "
-                "head; the delete rides the store spec to BOTH ranks.",
-                len(victims), freed / 1e9, incoming_bytes / 1e9,
-                self._bytes / 1e9, budget / 1e9)
+            # *** THROTTLED, BECAUSE AT STEADY STATE THIS IS NOT NEWS. ***
+            # Measured: once the index is at budget every store evicts ~90 keys
+            # to make room for the same bytes, so an unthrottled line is one
+            # per store round -- about one a second, for ever. That is a
+            # ROUTINE event logged as though it were notable, which trains a
+            # reader to skip exactly the channel the interesting first eviction
+            # arrives on ("say a thing once").
+            #
+            # So: the first eviction after crossing the budget logs in full,
+            # because dropping 100,665 keys / 71.8 GB genuinely is an event;
+            # after that it is a periodic SUMMARY carrying the totals, which is
+            # what somebody watching a steady-state cache actually wants.
+            now = _now()
+            first = not getattr(self, "_evict_logged", False)
+            due = (now - getattr(self, "_evict_log_at", 0.0)) >= self.EVICT_LOG_S
+            if first or due:
+                self._evict_logged = True
+                self._evict_log_at = now
+                since = self._stats.get("evicted", 0) - getattr(
+                    self, "_evict_log_count", 0)
+                self._evict_log_count = self._stats.get("evicted", 0)
+                logger.info(
+                    "kvmgr: disk budget -- evicted %d key(s) / %.2f GB just now"
+                    "%s; held %.2f GB against a %.2f GB budget, %d keys / "
+                    "%.1f GB evicted in total. Tail-first within an age, so a "
+                    "prefix shortens rather than losing its head; the delete "
+                    "rides the store spec to BOTH ranks.",
+                    len(victims), freed / 1e9,
+                    "" if first else " (%d since the last line)" % since,
+                    self._bytes / 1e9, budget / 1e9,
+                    self._stats.get("evicted", 0),
+                    self._stats.get("evicted_bytes", 0) / 1e9)
         return victims
 
     def complete_store(

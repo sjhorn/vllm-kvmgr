@@ -1201,12 +1201,29 @@ class DiskStoreHandler:
         if errs:
             self.stats["delete_errors"] = self.stats.get(
                 "delete_errors", 0) + errs
-        if gone or errs:
+        # *** THROTTLED FOR THE SAME REASON AS THE SCHEDULER'S LINE. *** At
+        # steady state every store round unlinks ~90 files, so an unthrottled
+        # line is one per round for ever -- a routine event logged as though it
+        # were notable. An ERROR is never throttled, because that is the thing
+        # somebody needs to see the moment it happens.
+        now = _now()
+        first = not getattr(self, "_del_logged", False)
+        due = (now - getattr(self, "_del_log_at", 0.0)) >= 60.0
+        if errs:
+            logger.error(
+                "kvmgr: budget eviction -- %d file(s) FAILED to unlink on this "
+                "rank (%d succeeded). A file that will not delete costs disk; "
+                "raising here would fail the store and then the request, so it "
+                "is counted and ignored.", errs, gone)
+        if gone and (first or due):
+            self._del_logged = True
+            self._del_log_at = now
             logger.info(
                 "kvmgr: budget eviction -- unlinked %d file(s) on this rank "
-                "(%d failed). The scheduler chose them; this rank deletes only "
-                "its own slice, and the same keys go on every rank because the "
-                "spec reaches them all.", gone, errs)
+                "just now, %d in total. The scheduler chose them; this rank "
+                "deletes only its own slice, and the same keys go on every "
+                "rank because the spec reaches them all.",
+                gone, self.stats.get("deleted", 0))
 
     def transfer_async(self, job_id: int, spec) -> bool:
         """Accept a job of ANY size, and submit it over as many rounds as needed.

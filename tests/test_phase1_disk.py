@@ -962,6 +962,29 @@ _am._bytes = 1000
 check("...and sound accounting reports True",
       _am.snapshot()["byte_accounting_ok"] is True)
 
+print("== (5i) the eviction log must be THROTTLED at steady state ==")
+# *** MEASURED ON THE BOX: ONE LINE PER STORE ROUND, ABOUT ONE A SECOND. ***
+# Once the index sits at budget, every store evicts ~90 keys to make room for
+# the same bytes, so the unthrottled line never stops -- a ROUTINE event logged
+# as though it were notable, which trains a reader to skip the very channel the
+# interesting first eviction (100,665 keys / 71.8 GB) arrives on.
+check("there is a throttle interval, and it is not sub-second",
+      diskspec.DiskPresenceManager.EVICT_LOG_S >= 10)
+_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                         "diskspec.py")).read()
+check("*** the first eviction still logs in full -- dropping 71.8 GB IS an "
+      "event ***", "first = not getattr(self, \"_evict_logged\"" in _src)
+check("...and later lines carry the TOTALS, which is what a steady-state "
+      "reader wants", "evicted in total" in _src)
+
+_dsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                          "diskio.py")).read()
+check("the worker's unlink line is throttled too", "_del_log_at" in _dsrc)
+check("*** but an unlink FAILURE is never throttled -- that is the thing "
+      "somebody needs the moment it happens ***",
+      "FAILED to unlink" in _dsrc and _dsrc.index("FAILED to unlink")
+      < _dsrc.index("_del_logged = True"))
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()
 if FAIL:
