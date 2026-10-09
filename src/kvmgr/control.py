@@ -191,6 +191,13 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     ("kvmgr.stats", "_groups", "all per-group counters -- the observability"),
     ("kvmgr.offload", "_real_odirect", "the saved platform O_DIRECT value"),
     ("kvmgr.serve", "_server", "the stats HTTP server handle"),
+    # *** AND THE LOCK THAT GUARDS IT, because a reload rebinds it. *** A
+    # fresh Lock means a thread holding the OLD one no longer excludes anybody,
+    # so start and stop could both believe they hold it. Found by auditing the
+    # reload list rather than by a failure: `offload` and `serve` were never
+    # reloaded at all, so their _PRESERVE entries protected state across a
+    # reload that did not happen -- which is itself the tell.
+    ("kvmgr.serve", "_lock", "the lock guarding the server handle"),
     # A reload re-executes the module, so this would go back to False and
     # _start_watchdog() would start a SECOND thread on the next handler --
     # every reload leaking one more, each dumping the same stacks. Fifth
@@ -410,9 +417,18 @@ def reload_modules() -> dict:
 
     # Order matters: leaves before the modules that import them, so a reloaded
     # parent picks up the reloaded child rather than the stale one it holds.
+    # *** `kvmgr.register` WAS MISSING FROM THIS LIST, so no change to it was
+    # *** EVER hot. *** `import_module("kvmgr.register")` below returns
+    # whatever is in sys.modules, which for an un-reloaded module is the OLD
+    # one -- so the re-arm calls below ran the OLD installers and logged
+    # nothing. The hang dump and watchdog re-arms hid it perfectly, because
+    # they are idempotent no-ops whose old and new versions behave identically;
+    # it only surfaced when a CHANGE to register.py had to take effect. Three
+    # reloads reported success while running the previous code.
     for name in ("kvmgr.flags", "kvmgr.policy", "kvmgr.diskio",
                  "kvmgr.diskspec", "kvmgr.manager", "kvmgr.stats",
-                 "kvmgr.control"):
+                 "kvmgr.offload", "kvmgr.serve",
+                 "kvmgr.register", "kvmgr.control"):
         try:
             import sys
 

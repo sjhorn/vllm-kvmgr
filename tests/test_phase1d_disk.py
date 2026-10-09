@@ -773,6 +773,45 @@ eq("*** every installer in register.py is re-armed by the reload, or exempt "
 _stale = [f for f in _EXEMPT if f not in _installers]
 eq("...and no exemption names a function that no longer exists", _stale, [])
 
+print("== the reload must cover every MODULE, audited not listed ==")
+# *** `kvmgr.register` WAS MISSING FROM THE RELOAD LIST, so no change to it
+# *** was ever hot. *** `import_module("kvmgr.register")` returns whatever is
+# in sys.modules, which for an un-reloaded module is the OLD one -- so the
+# re-arm calls ran the OLD installers. The hang-dump and watchdog re-arms hid
+# it perfectly, because they are idempotent no-ops whose old and new versions
+# behave identically; it surfaced only when a CHANGE to register.py had to
+# take effect, and three reloads reported success while running the previous
+# code. Same shape as the installer audit above, one level up.
+_pkg = _os4.path.join(_REPO4, "patches", "kvmgr_plugin", "kvmgr")
+_mods = sorted(f[:-3] for f in _os4.listdir(_pkg)
+               if f.endswith(".py") and f != "__init__.py")
+check("the module audit found modules at all", len(_mods) >= 5, _mods)
+
+_MOD_EXEMPT = {
+    # Re-exports only (`from .register import register`). Reloading it would
+    # rebind a name nothing reads after boot, and the import-time re-export is
+    # exactly what makes `from kvmgr import register` return the FUNCTION
+    # rather than the module -- a trap this repo has already paid for.
+    "__init__",
+}
+# *** AND THE FIRST VERSION OF THIS CHECK COULD NOT FAIL. *** It searched the
+# WHOLE of control.py for the module name, and `"kvmgr.offload"` /
+# `"kvmgr.serve"` both appear there in _PRESERVE entries -- so two modules that
+# are genuinely absent from the reload list passed. The same defect the lint
+# exists to catch, in the lint. Scope it to the reload tuple itself.
+_m_tuple = _re4.search(r"for name in \(([^)]*)\):", _ctl_src, _re4.S)
+check("the reload tuple was actually located -- otherwise this lint is "
+      "scanning nothing", _m_tuple is not None)
+_reload_list = _re4.findall(r'"kvmgr\.(\w+)"', _m_tuple.group(1) if _m_tuple else "")
+check("...and it names several modules", len(_reload_list) >= 5, _reload_list)
+_mod_missing = [m for m in _mods
+                if m not in _MOD_EXEMPT and m not in _reload_list]
+eq("*** every module in the package is reloaded, or exempt with a reason ***",
+   _mod_missing, [])
+_mod_stale = [m for m in _MOD_EXEMPT if m not in _mods and m != "__init__"]
+eq("...and no module exemption names a file that no longer exists",
+   _mod_stale, [])
+
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print("  FAILED:", f)
