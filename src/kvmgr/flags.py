@@ -153,6 +153,14 @@ DEFAULTS: dict[str, Any] = {
     "free_queue_prepend_uncached": False,
     "pin_static_head": False,
     "head_pin_fraction": 0.05,
+    # *** READ BY patch6 AND DECLARED NOWHERE until 2026-10-09. ***
+    # `_maybe_pin_static_head` reads it with an inline default, so it worked --
+    # and it was invisible: absent from this table, so absent from the knob
+    # listing, from the published policy and from anything auditing coverage.
+    # An undeclared knob is one nobody can discover, which is the quiet half of
+    # "a flag that governs nothing": here the flag governs something and no
+    # reader can tell it exists. Found by auditing reads against declarations.
+    "head_pin_partial": False,
 }
 
 # Knobs whose value must stay OUT of .env.dspark or the file cannot move them.

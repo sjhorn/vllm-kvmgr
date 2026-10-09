@@ -502,6 +502,75 @@ finally:
 
 # ---------------------------------------------------------------------------
 print()
+print("== EVERY KNOB READ MUST BE DECLARED, AND EVERY DECLARED KNOB PUBLISHED ==")
+# *** `head_pin_partial` WAS READ BY patch6 AND DECLARED NOWHERE. ***
+# `_maybe_pin_static_head` reads it with an inline default, so it worked -- and
+# it was invisible: absent from DEFAULTS, so absent from the knob listing, from
+# the published policy, and from anything auditing coverage. That is the quiet
+# half of "a flag that governs nothing": here the flag governs something and no
+# reader can tell it exists.
+#
+# And the published policy was a HAND-WRITTEN list carrying 7 of 24 knobs, so
+# `pin_static_head`, `head_pin_fraction`, the staging sizes and
+# `disk_budget_gb` could not be seen at all -- you could not read the state of
+# the one mechanism that reserves KV for a static system prompt. Same lesson as
+# the _PRESERVE table and the reload audit: enumerate from the declaration.
+import re as _reA
+import os as _osA
+
+_REPO_A = _osA.path.dirname(_osA.path.dirname(_osA.path.dirname(
+    _osA.path.abspath(__file__))))
+
+
+def _src(*names):
+    out = ""
+    for n in names:
+        fp = _osA.path.join(_REPO_A, "patches", n)
+        if _osA.path.isfile(fp):
+            out += open(fp).read()
+    return out
+
+
+_plugin = _src(*["kvmgr_plugin/kvmgr/%s.py" % m for m in
+                 ("diskio", "diskspec", "manager", "policy", "control",
+                  "stats", "offload", "register", "serve")])
+_patches = _src("patch6-single_type_kv_cache_manager.py",
+                "patch7-block_pool-dedupe.py",
+                "patch8-kv_cache_utils.py")
+
+_declared = set(flags.DEFAULTS)
+check("the declaration table was found and is not tiny", len(_declared) >= 10,
+      len(_declared))
+
+# Every name any reader asks for, across the plugin AND the overlays.
+_read = set()
+for _pat in (r'peek\(\s*"([a-z0-9_]+)"', r'raw\(\s*"([a-z0-9_]+)"',
+             r'knob\(\s*"([a-z0-9_]+)"', r'changed\(\s*"([a-z0-9_]+)"',
+             r'_flag\(\s*"([a-z0-9_]+)"', r'source_of\(\s*"([a-z0-9_]+)"'):
+    _read |= set(_reA.findall(_pat, _plugin + _patches))
+check("the read-scan found names at all -- a regex matching nothing is a lint "
+      "that cannot fail", len(_read) >= 5, sorted(_read)[:8])
+
+_undeclared = sorted(n for n in _read if n not in _declared)
+eq("*** every knob READ anywhere is DECLARED in DEFAULTS -- an undeclared knob "
+   "is one nobody can discover ***", _undeclared, [])
+
+# And the published surface must cover the table.
+flags.reset_for_tests()
+_snap = stats.snapshot() if hasattr(stats, "snapshot") else {}
+_pub = set((_snap.get("knobs") or {}).keys())
+check("the endpoint publishes a knobs block at all", bool(_pub), sorted(_snap))
+_unpublished = sorted(_declared - _pub)
+eq("*** every DECLARED knob is PUBLISHED, so a knob added tomorrow is visible "
+   "without anybody remembering this list ***", _unpublished, [])
+
+# Each entry must say WHO set it: "what is it?" and "who set it?" are different
+# questions, and the second explains a knob that appears not to have taken,
+# because an env pin outranks the flags file silently.
+_one = (_snap.get("knobs") or {}).get(sorted(_declared)[0]) or {}
+check("*** each knob publishes its SOURCE, not just its value ***",
+      "source" in _one or "error" in _one, _one)
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()
 if FAIL:

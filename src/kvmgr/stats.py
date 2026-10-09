@@ -251,6 +251,22 @@ def snapshot() -> dict[str, Any]:
         # peek(), never knob(): a reader must not consume the change edge that
         # new_step_starts() reconciles on. See flags.peek's docstring -- polling
         # this endpoint used to suppress the very change it then reported.
+        # *** EVERY DECLARED KNOB, DRIVEN FROM THE TABLE. ***
+        # The curated fields below stay, because each carries a caveat a bare
+        # value cannot (which flag governs nothing, which fact is measured
+        # rather than asked). But a HAND-WRITTEN list published 7 of 24 knobs,
+        # so `pin_static_head`, `head_pin_fraction`, the staging sizes and
+        # `disk_budget_gb` were all invisible to anything reading this endpoint
+        # -- you could not see the state of the one mechanism that reserves KV
+        # for a static system prompt. Same lesson as the _PRESERVE table and
+        # the reload audit: enumerate from the declaration, so a knob added
+        # tomorrow is visible without anybody remembering to add it here.
+        #
+        # `source` is published beside each value because "what is it set to?"
+        # and "who set it?" are different questions, and the second is the one
+        # that explains a knob that appears not to have taken: an env pin
+        # outranks the flags file, silently.
+        "knobs": _all_knobs(),
         "policy": {
             "kvmgr_enabled": bool(flags.raw("kvmgr_enabled")),
             "protected_fraction": float(flags.raw("protected_fraction")),
@@ -329,6 +345,29 @@ def _refuse_blocked() -> list[str]:
         except Exception:
             continue
     return asked
+
+def _all_knobs() -> dict:
+    """Every declared knob: effective value, and which source won.
+
+    Table-driven on purpose. `peek` rather than `knob`, because a reader must
+    never consume the change edge that `new_step_starts()` reconciles on --
+    polling this endpoint used to suppress the very change it then reported.
+    """
+    # Local import, exactly as snapshot() and the other helpers here do: stats
+    # is imported early in the boot and a module-level `from . import flags`
+    # would make that order load-bearing.
+    from . import flags
+    out: dict = {}
+    for name in sorted(getattr(flags, "DEFAULTS", {})):
+        try:
+            out[name] = {"value": flags.peek(name),
+                         "source": flags.source_of(name)}
+        except Exception as exc:
+            # A knob that cannot be read is a fact worth publishing, not a
+            # reason to drop the whole block.
+            out[name] = {"error": "%s: %s" % (type(exc).__name__, exc)}
+    return out
+
 
 def _disk_spec_is_live() -> bool:
     """Is OUR disk spec the one the connector was configured with?
