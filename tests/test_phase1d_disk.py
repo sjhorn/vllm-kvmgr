@@ -478,6 +478,145 @@ finally:
     else:
         _s2.modules.pop("numpy", None)
 
+print("== the proactive scan's WINDOW: it must cover the life, not the boot ==")
+# *** THE FIRST VERSION OF THIS SCAN COULD NOT SEE THE EVENT IT EXISTED FOR. ***
+# Its budget was "the first 25 encodes of the process" -- which are the BOOT's
+# encodes, handshake and startup traffic carrying no generated output. The
+# numpy scalar only ever appeared under load. So the scan ran, cost its walks,
+# found nothing, and read as coverage. No test covered the window, which is
+# exactly why the dead window shipped; this is that test.
+import types as _t3
+import sys as _s3
+import importlib as _il3
+
+_np3 = _t3.ModuleType("numpy")
+
+
+class _G3:
+    def __init__(self, v):
+        self.v = v
+
+    def item(self):
+        return self.v
+
+    def __repr__(self):
+        return "numpy.int64(%r)" % self.v
+
+
+_np3.generic = _G3
+_np3.ndarray = type("ndarray", (), {})
+
+_warned = []
+
+
+class _Enc3:
+    def enc_hook(self, obj):
+        raise TypeError("not serializable")
+
+    def encode_into(self, obj, buf, *a, **kw):
+        return b""
+
+
+_su3 = _t3.ModuleType("vllm.v1.serial_utils")
+_su3.MsgpackEncoder = _Enc3
+
+_sv3 = {k: _s3.modules.get(k) for k in ("numpy", "vllm.v1.serial_utils")}
+_s3.modules["numpy"] = _np3
+_s3.modules["vllm.v1.serial_utils"] = _su3
+try:
+    reg3 = _il3.import_module("kvmgr.register")
+
+    class _Clock:
+        def __init__(self):
+            self.t = 1000.0
+
+        def monotonic(self):
+            return self.t
+
+    _clk = _Clock()
+    _real_time, reg3._time = reg3._time, _clk
+    _real_log, reg3.logger = reg3.logger, _t3.SimpleNamespace(
+        warning=lambda *a, **k: _warned.append(a[0] % tuple(a[1:])),
+        info=lambda *a, **k: None,
+        exception=lambda *a, **k: _warned.append("EXCEPTION"))
+    try:
+        reg3._install_serializer_shim()
+        enc3 = _Enc3()
+        buf = bytearray()
+
+        # *** THE WINDOW TEST: a clean payload for far more encodes than the
+        # *** old budget of 25, and only THEN the scalar. *** Under the old
+        # code every one of these would have burned the budget on boot
+        # traffic and the scalar would never be scanned.
+        class _Clean:
+            def __init__(self):
+                self.a = 1
+
+        class _Dirty:
+            def __init__(self):
+                self.late_field = _G3(39)
+
+        for n in range(60):
+            _clk.t += 6.0           # past the spacing, so each one scans
+            enc3.encode_into(_Clean(), buf)
+        eq("60 clean encodes past the old 25-encode budget find nothing",
+           _warned, [])
+
+        _clk.t += 6.0
+        enc3.encode_into(_Dirty(), buf)
+        check("*** a scalar on encode #61 is STILL named -- the old window "
+              "would have been spent on boot traffic ***",
+              any("late_field" in w and "39" in w for w in _warned), _warned)
+        check("...and says it found it by scanning, before any coercion",
+              any("before any coercion" in w for w in _warned), _warned)
+
+        _found = len(_warned)
+        _clk.t += 6.0
+        enc3.encode_into(_Dirty(), buf)
+        eq("...and it stops once found, so one path is reported not thousands",
+           len(_warned), _found)
+    finally:
+        reg3._time, reg3.logger = _real_time, _real_log
+
+    # THE SPACING, verified the same way: without it a busy output thread pays
+    # a walk per encode. Drive many encodes inside one spacing interval.
+    _warned2 = []
+    _scans = []
+    _real_walk = reg3._numpy_paths
+    _real_time2, reg3._time = reg3._time, _clk
+    try:
+        reg3._numpy_paths = lambda o, **k: (_scans.append(1), [])[1]
+        # A fresh shim needs a class with its OWN methods. *** SUBCLASSING
+        # _Enc3 INHERITED `_kvmgr_wrapped`, so the install returned early and
+        # this drove the PREVIOUS shim -- whose root already had found=True, so
+        # the assertion saw 0 walks and read as a spacing that never fires. ***
+        class _Enc4:
+            def enc_hook(self, obj):
+                raise TypeError("not serializable")
+
+            def encode_into(self, obj, buf, *a, **kw):
+                return b""
+        _su3.MsgpackEncoder = _Enc4
+        reg3._install_serializer_shim()
+        enc4 = _Enc4()
+        _clk.t += 100.0
+        for n in range(40):
+            _clk.t += 0.1           # 4.0s total: INSIDE one 5s interval
+            enc4.encode_into(_Clean(), buf)
+        check("*** 40 encodes inside one spacing interval cost ONE walk, not "
+              "40 -- this runs in the engine's output thread ***",
+              len(_scans) == 1, len(_scans))
+    finally:
+        reg3._numpy_paths = _real_walk
+        reg3._time = _real_time2
+finally:
+    for _k, _v in _sv3.items():
+        if _v is not None:
+            _s3.modules[_k] = _v
+        else:
+            _s3.modules.pop(_k, None)
+
+
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print("  FAILED:", f)

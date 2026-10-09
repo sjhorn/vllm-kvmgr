@@ -27,6 +27,8 @@ every group's block size, and a single manager only knows its own.
 
 from __future__ import annotations
 
+import time as _time
+
 from vllm.logger import init_logger
 
 # *** THE LOGGER NAME IS LOAD-BEARING, and `__name__` is the wrong one. ***
@@ -249,6 +251,13 @@ def _install_hang_dump() -> None:
     except Exception:
         logger.exception("kvmgr: could not arm the hang dump (continuing)")
 
+# The proactive scan's budget. Spacing keeps it off the per-encode path;
+# the limit keeps it from being a standing cost. Both are deliberately
+# generous in TIME and stingy in RATE: the event is rare, not fast.
+_SCAN_EVERY_S = 5.0
+_SCAN_LIMIT = 600
+
+
 def _numpy_paths(root, limit: int = 12, max_depth: int = 8,
                  max_nodes: int = 200000) -> list:
     """Dotted paths to every numpy SCALAR reachable from `root`. Bounded.
@@ -379,23 +388,39 @@ def _install_serializer_shim() -> None:
                 # event to name itself is not a strategy when the walk can
                 # simply go and look.
                 #
-                # Bounded hard: the first few encodes only, then never again.
-                # This runs in the engine's OUTPUT THREAD, so the budget is a
-                # handful of bounded walks once per process, not a standing
-                # cost. It stops at the first find, because one path is the
-                # answer.
-                if root.get("scan", 0) < 25 and not root.get("found"):
-                    root["scan"] = root.get("scan", 0) + 1
-                    try:
-                        paths = _numpy_paths(obj, limit=6)
-                        if paths:
-                            root["found"] = True
-                            logger.warning(
-                                "kvmgr: numpy scalar PRODUCER (found by "
-                                "scanning encode #%d, before any coercion) -- "
-                                "%s", root["scan"], "; ".join(paths))
-                    except Exception:
-                        root["found"] = True      # never scan in a loop
+                # *** AND THE FIRST VERSION OF THIS SCAN COULD NOT SEE THE
+                # *** EVENT IT EXISTED FOR. *** Its budget was "the first 25
+                # encodes of the process", which are the BOOT's encodes --
+                # handshake and startup traffic, carrying no generated output
+                # at all. The scalar only ever appeared under real load. So it
+                # ran, cost its walks, found nothing, and read as coverage:
+                # exactly the failure this repo keeps paying for.
+                #
+                # Sampled over the process's LIFE instead, which is the window
+                # the event actually lives in. Bounded three ways: a minimum
+                # spacing so a busy output thread is not walked per encode, a
+                # total count so it cannot run forever, and a stop on the
+                # first find, because one path is the answer. The per-walk
+                # bounds are tightened too, since this now runs against live
+                # output rather than once at boot.
+                if (not root.get("found")
+                        and root.get("scan", 0) < _SCAN_LIMIT):
+                    now = _time.monotonic()
+                    if now - root.get("last", 0.0) >= _SCAN_EVERY_S:
+                        root["last"] = now
+                        root["scan"] = root.get("scan", 0) + 1
+                        try:
+                            paths = _numpy_paths(obj, limit=6, max_depth=6,
+                                                 max_nodes=20000)
+                            if paths:
+                                root["found"] = True
+                                logger.warning(
+                                    "kvmgr: numpy scalar PRODUCER (found by "
+                                    "scanning encode sample #%d, before any "
+                                    "coercion) -- %s",
+                                    root["scan"], "; ".join(paths))
+                        except Exception:
+                            root["found"] = True  # never scan in a loop
                 return orig_encode(self, obj, buf, *a, **kw)
             encode_into._kvmgr_wrapped = True
             cls.encode_into = encode_into
