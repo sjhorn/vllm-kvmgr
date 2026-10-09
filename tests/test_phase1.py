@@ -305,6 +305,13 @@ PROBE = {
     "free_queue_prepend_uncached": (0, 1),
     "pin_static_head": (0, 1),
     "head_pin_fraction": (0.05, 0.25),
+    # *** ADDED BECAUSE THIS LOOP REFUSED TO RUN WITHOUT IT, which is the
+    # table-driven discipline working. *** `head_pin_partial` was read by
+    # patch6 with an inline default and declared nowhere, so it was an
+    # invisible knob; declaring it immediately failed here, because this suite
+    # enumerates DEFAULTS and demands a probe pair per knob. A new knob cannot
+    # be added without somebody verifying its hot-config behaviour.
+    "head_pin_partial": (0, 1),
 }
 # *** THIS ASSERTION IS WHY A NEW KNOB CANNOT SHIP UNPROVEN, and it caught one
 # on 2026-10-08. *** `disk_store_paused` was added to DEFAULTS and not here, and
