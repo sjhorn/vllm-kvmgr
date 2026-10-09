@@ -76,7 +76,131 @@ DISK_MEDIUM = "DSPARK_DISK"
 # Phase 4 moves this INTO the fingerprint hash proper (FileMapper's `fields`),
 # which is stronger because it also covers a future change of our own format.
 # A separate root is the cheap half of that and is enough today.
-DISK_FORMAT_ROOT = "dspark-kv-v1"
+# *** PHASE 4: THE VERSION OF *OUR* ON-DISK FORMAT. ***
+# Bumping this orphans every file written by an older format, by construction,
+# because it lands in a different directory AND a different fingerprint hash.
+# That is the whole point: KV bytes are only valid for the engine AND the writer
+# that produced them, and a restore across a changed layout returns plausible
+# tensors that decode to nonsense with nothing crashing -- the F8_E8M0 failure
+# class. A refusal has to be structural, not remembered.
+#
+# *** AND THE DANGEROUS CASE IS THE ACCIDENTAL CHANGE, NOT THE DELIBERATE ONE.
+# *** Anybody bumping this constant has already thought about it. The failure to
+# design against is somebody editing `file_plan`, `write_chunks` or the chunk
+# geometry and NOT bumping it -- after which every pre-change file restores
+# silently as wrong KV. A runtime hash of the writer's own source would catch
+# that, and would also orphan 400 GB the first time anybody fixed a typo in a
+# comment. So the guard is OFFLINE: `test_phase1_disk.py` pins a hash of the
+# layout-determining code with comments and docstrings stripped, and FAILS if it
+# moves without this constant moving too. Zero runtime cost, no mass orphaning
+# on a cosmetic edit, and the failure arrives on a laptop instead of on disk.
+DISK_FORMAT_VERSION = 1
+DISK_FORMAT_ROOT = "dspark-kv-v%d" % DISK_FORMAT_VERSION
+
+# The functions whose source decides WHICH BYTES LAND IN WHICH FILE. The offline
+# guard hashes exactly these; anything else in diskio.py may change freely.
+# Keeping the list here rather than in the test means the module being guarded
+# declares its own surface, so adding a layout function and forgetting the guard
+# shows up as a NAMED test failure rather than as silent coverage loss.
+DISK_LAYOUT_FUNCTIONS = ("file_plan", "write_chunks", "plan_nbytes")
+
+def model_dir(model: str, revision: "str | None" = None,
+              hub: "str | None" = None) -> "str | None":
+    """The local directory the model is actually loaded from, or None.
+
+    Either a plain path, or a huggingface_hub cache entry resolved the way the
+    hub itself resolves it: `models--<org>--<name>/refs/<rev>` names a commit,
+    and the commit names a `snapshots/<commit>` directory.
+    """
+    import os as _os
+    if model and _os.path.isdir(model):
+        return model
+    if not model:
+        return None
+    root = hub or _os.environ.get("HF_HUB_CACHE") or (
+        _os.path.join(_os.environ["HF_HOME"], "hub")
+        if _os.environ.get("HF_HOME") else "/models/hub")
+    repo = _os.path.join(root, "models--" + model.replace("/", "--"))
+    if not _os.path.isdir(repo):
+        return None
+    commit = revision
+    if commit:
+        # A pinned revision may still be a ref name rather than a commit.
+        ref = _os.path.join(repo, "refs", commit)
+        if _os.path.isfile(ref):
+            try:
+                commit = open(ref).read().strip()
+            except OSError:
+                return None
+    else:
+        ref = _os.path.join(repo, "refs", "main")
+        if not _os.path.isfile(ref):
+            return None
+        try:
+            commit = open(ref).read().strip()
+        except OSError:
+            return None
+    snap = _os.path.join(repo, "snapshots", commit)
+    return snap if _os.path.isdir(snap) else None
+
+
+def model_content_id(d: "str | None", _hash=None) -> str:
+    """A 12-hex identity for the model's KV-RELEVANT CONTENT, or `unknown`.
+
+    *** THE HF COMMIT IS THE WRONG THING TO FINGERPRINT, and this box proves
+    *** it. *** `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` has TWO snapshots in
+    the hub cache, and measured 2026-10-09 they share all 49 safetensors blob
+    targets and a byte-identical `config.json` -- they differ in `LICENSE`,
+    `README.md`, `encoding/` and `inference/`. So the KV written under one is
+    byte-valid under the other, and a commit-keyed fingerprint would have
+    orphaned 400 GB of warm cache to protect against a docs-only revision bump.
+    That is a false positive expensive enough to design away.
+
+    What actually determines KV validity is the WEIGHTS and the CONFIG, so that
+    is what this hashes: `config.json` verbatim, plus the (filename -> blob)
+    mapping of every safetensors entry. Reading the blob NAMES costs nothing --
+    they are content-addressed by the hub, so the mapping changes exactly when
+    the weights change. No weight bytes are read.
+
+    *** `unknown` IS NOT A REFUSAL, and that is deliberate. *** If the layout is
+    one this cannot read, the identity degrades to the model NAME alone -- which
+    is exactly today's behaviour, so the change is never a regression. It is
+    logged and exposed in /kv rather than hidden, because the honest statement
+    is "this cache is no better protected than before", not "it is protected".
+    """
+    import hashlib as _hl
+    import os as _os
+    if not d:
+        return "unknown"
+    h = _hash or _hl.sha256()
+    try:
+        cfg = _os.path.join(d, "config.json")
+        if _os.path.isfile(cfg):
+            with open(cfg, "rb") as f:
+                h.update(b"config.json\0")
+                h.update(f.read())
+        rows = []
+        for name in sorted(_os.listdir(d)):
+            if ".safetensors" not in name:
+                continue
+            full = _os.path.join(d, name)
+            try:
+                target = _os.path.basename(_os.readlink(full))
+            except OSError:
+                # A real file rather than a hub symlink: size is the cheapest
+                # content proxy that does not read the weights.
+                try:
+                    target = "size:%d" % _os.path.getsize(full)
+                except OSError:
+                    target = "?"
+            rows.append("%s=%s" % (name, target))
+        if not rows:
+            return "unknown"
+        h.update(("\0".join(rows)).encode("utf-8"))
+    except OSError:
+        return "unknown"
+    return h.hexdigest()[:12]
+
 
 # The name KV_TRANSFER_CONFIG must use as `spec_name`, and the one
 # register.py registers with. A constant rather than two string
@@ -1240,7 +1364,39 @@ class DiskPresenceManager(OffloadingManager):
                     by_group=by_group,
                     sched=offload_sched_snapshot(),
                     restore_enabled=bool(flags.peek("disk_restore")),
-                    store_paused=bool(flags.peek("disk_store_paused")))
+                    store_paused=bool(flags.peek("disk_store_paused")),
+                    fingerprint=self._fingerprint())
+
+    def _fingerprint(self) -> dict:
+        """What this cache is KEYED ON, exposed so the proxy can see it.
+
+        *** A FINGERPRINT NOBODY CAN READ IS A CLAIM NOBODY CAN CHECK. *** The
+        2026-10-07 failure was the worker and the engine core computing
+        DIFFERENT base paths and nothing saying so -- 552 keys pruned as "the
+        file is gone" with the files right there. It cost one boot per guess
+        until the FIELDS were printed. Publishing it means the proxy can show
+        which checkpoint a 400 GB cache belongs to, and a future reader can tell
+        "the model changed" from "the cache is cold" without reading a log.
+        `model_identity` is the part worth watching: `unknown` means the cache
+        is no better protected than a model NAME, which is a fact about this
+        deployment rather than a bug.
+        """
+        out = {"format_version": DISK_FORMAT_VERSION,
+               "format_root": DISK_FORMAT_ROOT}
+        m = getattr(self, "_mapper", None)
+        if m is None:
+            return out
+        try:
+            out["base_path"] = m.base_path
+            name = (m.fields or {}).get("model_name") or ""
+            out["model_name"] = name.split("@")[0]
+            out["model_identity"] = (
+                name.split("@", 1)[1] if "@" in name else "unknown")
+            out["writer"] = (m.fields or {}).get("inference_engine")
+            out["hash_block_size"] = (m.fields or {}).get("hash_block_size")
+        except Exception:
+            out["error"] = "fields unreadable"
+        return out
 
 
 def _nothing_to_store() -> PrepareStoreOutput:
@@ -1342,6 +1498,82 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
             self.page_size_per_worker, self.root_dir,
         )
 
+    def _migrate_legacy_base(self, parallel_config) -> None:
+        """Rename the pre-Phase-4 fingerprint directory onto the new one.
+
+        *** STRENGTHENING A FINGERPRINT ORPHANS EVERY FILE UNDER THE OLD ONE,
+        *** and here that is 400 GB and 560,000 keys of warm cache. *** The
+        bytes are not wrong -- the LAYOUT did not change, only the identity
+        string did -- so throwing them away would be a pure loss, paid in cold
+        prefills at 430-795 s each. A directory rename is O(1) on the same
+        filesystem and preserves the manifest too, because `presence.json`
+        lives at the format root and is keyed by block hash, not by path.
+
+        *** THE GUARD IS THE FORMAT VERSION, and it is not optional. *** This
+        may only ever adopt files whose layout matches ours. At
+        DISK_FORMAT_VERSION 1 the old directory was written by this same layout,
+        so adopting it is correct; at any later version it would be adopting
+        bytes written by a different writer, which is the exact hazard the
+        version exists to prevent. So this refuses outright past v1 -- a
+        migration that outlives its own precondition is worse than no
+        migration.
+        """
+        import os as _os
+        if DISK_FORMAT_VERSION != 1:
+            return
+        try:
+            legacy = FileMapper(
+                root_dir=self.root_dir,
+                model_name=self.vllm_config.model_config.model,
+                hash_block_size=self.hash_block_size,
+                gpu_blocks_per_file=self.block_size_factor,
+                tp_size=parallel_config.tensor_parallel_size,
+                pp_size=parallel_config.pipeline_parallel_size,
+                pcp_size=parallel_config.prefill_context_parallel_size,
+                dcp_size=parallel_config.decode_context_parallel_size,
+                rank=parallel_config.rank,
+                dtype=str(self.vllm_config.cache_config.cache_dtype).replace(
+                    "torch.", ""),
+                kv_cache_groups=[
+                    {
+                        "block_size": group.kv_cache_spec.block_size,
+                        "layer_names": list(group.layer_names),
+                    }
+                    for group in self.kv_cache_config.kv_cache_groups
+                ],
+            )
+        except Exception:
+            logger.exception("kvmgr: could not compute the legacy base path")
+            return
+
+        old = "%s_r%d" % (legacy.base_path, self.rank)
+        new = "%s_r%d" % (self._mapper.base_path, self.rank)
+        if old == new or not _os.path.isdir(old):
+            return
+        if _os.path.exists(new):
+            logger.info(
+                "kvmgr: legacy cache at %s left in place -- the Phase 4 path "
+                "%s already exists. Nothing is merged: two directories of the "
+                "same layout are both valid, and picking files out of one is "
+                "not something a rename can do atomically.", old, new)
+            return
+        try:
+            _os.rename(old, new)
+            logger.warning(
+                "kvmgr: MIGRATED the disk tier to the Phase 4 fingerprint -- "
+                "%s -> %s. Same layout (format v1), so every file and the "
+                "manifest stay valid; this is a rename, not a rewrite, and it "
+                "is what stops a stronger fingerprint from costing 400 GB of "
+                "warm cache.", old, new)
+        except OSError as exc:
+            # Harmless: without the rename the tier simply starts empty under
+            # the new path. A migration that can break a boot is worse than no
+            # migration -- the same rule the geometry snapshot already follows.
+            logger.warning(
+                "kvmgr: legacy cache migration failed (%s). The tier will "
+                "refill under the new fingerprint; nothing is lost but the "
+                "warm bytes.", exc)
+
     def file_mapper(self) -> FileMapper:
         if self._mapper is None:
             # *** NOT `from_offloading_spec`, AND THAT IS THE WHOLE BUG. ***
@@ -1372,9 +1604,30 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
             # that must not change shape without us noticing, and
             # `test_mapper_fields_cover_upstreams` fails if upstream adds a key.
             parallel_config = self.vllm_config.parallel_config
+            mc = self.vllm_config.model_config
+            # *** PHASE 4: OUR FORMAT VERSION AND THE MODEL'S CONTENT IDENTITY
+            # *** GO INSIDE THE HASH. ***
+            # `inference_engine` is the one free-form string FileMapper takes,
+            # so it is where our format version belongs -- in the fingerprint
+            # proper rather than only in the parent directory name. And the
+            # model identity is appended to `model_name` because that field
+            # also names the directory, so an operator reading the filesystem
+            # can see WHICH checkpoint a cache belongs to instead of only a
+            # sha prefix.
+            self._content_id = model_content_id(
+                model_dir(mc.model, getattr(mc, "revision", None)))
+            if self._content_id == "unknown":
+                logger.warning(
+                    "kvmgr: could not identify the model's CONTENT (dir not "
+                    "resolvable from model=%r) -- the cache fingerprint falls "
+                    "back to the model NAME, exactly as before Phase 4. Not a "
+                    "regression, but this cache is no better protected against "
+                    "a re-quantised checkpoint at the same id than it was.",
+                    mc.model)
             self._mapper = FileMapper(
                 root_dir=self.root_dir,
-                model_name=self.vllm_config.model_config.model,
+                inference_engine="vllm+dspark-kv/v%d" % DISK_FORMAT_VERSION,
+                model_name="%s@%s" % (mc.model, self._content_id),
                 hash_block_size=self.hash_block_size,
                 gpu_blocks_per_file=self.block_size_factor,
                 tp_size=parallel_config.tensor_parallel_size,
@@ -1393,6 +1646,19 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
                     for group in self.kv_cache_config.kv_cache_groups
                 ],
             )
+            # *** `file_mapper` IS DELIBERATELY CALLABLE WITH A DUCK-TYPED
+            # *** SELF, so the migration is an OPTIONAL side effect of it. ***
+            # test_phase1d_disk.py invokes this function unbound against a
+            # minimal fake carrying only the fields the path depends on -- that
+            # is the test proving the worker and the engine core compute the
+            # SAME base path, which is the 2026-10-07 fingerprint fork (552
+            # keys pruned as "file is gone" with the files right there). Making
+            # a path accessor require a full spec would have broken exactly the
+            # test that guards the hardest bug this module has had.
+            _mig = getattr(self, "_migrate_legacy_base", None)
+            if _mig is not None:
+                _mig(parallel_config)
+
             # *** LOG THE WHOLE FINGERPRINT, because the two processes DISAGREED
             # about it and nothing said so. *** Measured 2026-10-07: the worker
             # wrote every file under `..._06be92914bd2_r0` while the engine

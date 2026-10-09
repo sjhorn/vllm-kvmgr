@@ -1100,6 +1100,305 @@ _orphan_map(_a)["x"] = 1
 eq("...and the map is per INSTANCE, not shared on the class",
    dict(_orphan_map(_b)), {})
 
+print("== (P4) THE ON-DISK LAYOUT CANNOT CHANGE WITHOUT THE VERSION MOVING ==")
+# *** THE DANGEROUS FORMAT CHANGE IS THE ACCIDENTAL ONE. *** Anybody bumping
+# DISK_FORMAT_VERSION has already thought about it. The failure to design
+# against is somebody editing `file_plan`, `write_chunks` or `plan_nbytes` and
+# NOT bumping it -- after which every pre-change file restores silently as
+# wrong KV, which is the F8_E8M0 class: plausible tensors, nothing crashing.
+#
+# *** AND THE GUARD HAS TO BE OFFLINE, NOT A RUNTIME HASH. *** Hashing the
+# writer's source at boot would catch it -- and would also orphan 400 GB the
+# first time anybody fixed a typo in a comment. So: comments and docstrings are
+# stripped, whitespace runs collapsed, and the hash is pinned HERE. A real
+# layout change fails this test on a laptop; a cosmetic edit fails it too, at
+# which point you look, see it is cosmetic, and re-pin without bumping.
+import re as _reP4
+import tokenize as _tokP4
+import io as _ioP4
+import hashlib as _hlP4
+
+# *** BLANK THE REGIONS IN PLACE, BY POSITION. *** This repo has already paid
+# for the alternative: a lint that stripped with `tokenize` and then JOINED the
+# surviving tokens turned `.data[:] =` into `. data [ : ] =`, so its pattern
+# could never match and it passed however broken the module was. Found only by
+# break-verification.
+def _normalise_p4(src):
+    out = list(src)
+    try:
+        toks = list(_tokP4.generate_tokens(_ioP4.StringIO(src).readline))
+    except Exception:
+        return src
+    starts = [0]
+    for _l in src.splitlines(keepends=True):
+        starts.append(starts[-1] + len(_l))
+    prev = None
+    for t in toks:
+        kill = t.type == _tokP4.COMMENT or (
+            t.type == _tokP4.STRING and prev in
+            (_tokP4.INDENT, _tokP4.NEWLINE, _tokP4.NL, None))
+        if kill:
+            a = starts[t.start[0] - 1] + t.start[1]
+            b = starts[t.end[0] - 1] + t.end[1]
+            for k in range(a, min(b, len(out))):
+                if out[k] != "\n":
+                    out[k] = " "
+        if t.type not in (_tokP4.NL, _tokP4.NEWLINE):
+            prev = t.type
+    return _reP4.sub(r"[ \t]+", " ", "".join(out))
+
+
+_diskio_src = open(os.path.join(REPO, "patches", "kvmgr_plugin",
+                                   "kvmgr", "diskio.py")).read()
+
+
+def _layout_hash():
+    h = _hlP4.sha256()
+    missing = []
+    for n in diskspec.DISK_LAYOUT_FUNCTIONS:
+        m = _reP4.search(r"^def %s\(.*?(?=\n(?:def |class |@)|\Z)" % n,
+                         _diskio_src, _reP4.S | _reP4.M)
+        if not m:
+            missing.append(n)
+            continue
+        h.update(_normalise_p4(m.group(0)).encode())
+    return h.hexdigest()[:16], missing
+
+
+# *** PINNED. Bump DISK_FORMAT_VERSION and re-pin only when the LAYOUT changed.
+LAYOUT_HASH_PINNED = "b961b152f2676405"
+LAYOUT_VERSION_PINNED = 1
+
+_lh, _miss = _layout_hash()
+eq("*** every declared layout function was FOUND -- a guard that hashes "
+   "nothing passes forever ***", _miss, [])
+check("...and there are several of them", len(diskspec.DISK_LAYOUT_FUNCTIONS) >= 3,
+      diskspec.DISK_LAYOUT_FUNCTIONS)
+eq("*** the on-disk layout is unchanged; if this fails, either BUMP "
+   "DISK_FORMAT_VERSION (a real layout change) or re-pin (a cosmetic edit) ***",
+   _lh, LAYOUT_HASH_PINNED)
+eq("...and the pinned hash belongs to the current format version",
+   diskspec.DISK_FORMAT_VERSION, LAYOUT_VERSION_PINNED)
+
+# The normaliser must actually normalise, or the pin tracks prose.
+_probe = "def f(x):\n    \"\"\"doc.\"\"\"\n    # note\n    return x[:] = 1\n"
+_probe2 = "def f(x):\n    \"\"\"TOTALLY different doc.\"\"\"\n    # other\n    return x[:] = 1\n"
+eq("*** comments and docstrings do NOT move the hash -- otherwise every "
+   "documentation edit would read as a format change ***",
+   _normalise_p4(_probe), _normalise_p4(_probe2))
+check("*** but the CODE does -- the subscript survives normalisation, which is "
+   "the join-the-tokens bug this repo already paid for ***",
+      "[:]" in _normalise_p4(_probe), _normalise_p4(_probe))
+check("...and a real code change moves it",
+      _normalise_p4(_probe) != _normalise_p4(_probe.replace("x[:]", "x[1:]")))
+
+print("== (P4) the format version is INSIDE the fingerprint, not beside it ==")
+eq("the root directory carries the version", diskspec.DISK_FORMAT_ROOT,
+   "dspark-kv-v%d" % diskspec.DISK_FORMAT_VERSION)
+_fp_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                               "diskspec.py")).read()
+check("*** and so does the HASH -- a root name alone can be sidestepped by "
+      "anything that computes a base path itself ***",
+      'inference_engine="vllm+dspark-kv/v%d" % DISK_FORMAT_VERSION' in _fp_src)
+
+print("== (P4) the model identity is CONTENT, not the HF commit ==")
+# *** THE HF COMMIT IS THE WRONG THING TO FINGERPRINT, AND THIS BOX PROVES IT.
+# *** Measured 2026-10-09: `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` has TWO
+# snapshots in the hub cache, and they share ALL 49 safetensors blob targets
+# with a byte-identical config.json -- they differ only in LICENSE, README.md,
+# encoding/ and inference/. So the KV written under one is byte-valid under the
+# other, and a commit-keyed fingerprint would have orphaned 400 GB of warm
+# cache to protect against a docs-only revision bump.
+#
+# This fixture IS that measurement, so the reasoning cannot quietly be undone.
+import tempfile as _tfP
+import os as _osP
+
+_hub = tempfile.mkdtemp(prefix="kvhub-")
+_repo = _osP.path.join(_hub, "models--org--mdl")
+_blobs = _osP.path.join(_repo, "blobs")
+_osP.makedirs(_blobs)
+
+
+def _snap(commit, extra_files, blob_map):
+    d = _osP.path.join(_repo, "snapshots", commit)
+    _osP.makedirs(d, exist_ok=True)
+    with open(_osP.path.join(d, "config.json"), "w") as f:
+        f.write('{"hidden_size": 4096}')
+    for name, blob in blob_map.items():
+        bp = _osP.path.join(_blobs, blob)
+        if not _osP.path.exists(bp):
+            open(bp, "wb").write(b"x")
+        _osP.symlink(_osP.path.join("..", "..", "blobs", blob),
+                     _osP.path.join(d, name))
+    for extra in extra_files:
+        open(_osP.path.join(d, extra), "w").write("doc")
+    return d
+
+
+_BLOBS = {"model-00001.safetensors": "aaa", "model-00002.safetensors": "bbb"}
+_A = _snap("c0mmit_aaaaaa", ["README.md"], _BLOBS)
+_B = _snap("c0mmit_bbbbbb", ["README.md", "LICENSE", "inference"], _BLOBS)
+
+_ida = diskspec.model_content_id(_A)
+_idb = diskspec.model_content_id(_B)
+check("the identity is a real 12-hex id, not a sentinel",
+      _ida != "unknown" and len(_ida) == 12, _ida)
+eq("*** two revisions that share weights AND config get the SAME identity -- "
+   "a docs-only bump must not orphan the tier ***", _ida, _idb)
+
+# And it must change when the thing that actually matters changes.
+_C = _snap("c0mmit_cccccc", [], {"model-00001.safetensors": "aaa",
+                                 "model-00002.safetensors": "DIFFERENT"})
+check("*** but a CHANGED WEIGHT BLOB changes it -- that is the whole point ***",
+      diskspec.model_content_id(_C) != _ida,
+      (diskspec.model_content_id(_C), _ida))
+
+_D = _snap("c0mmit_dddddd", [], _BLOBS)
+with open(_osP.path.join(_D, "config.json"), "w") as _f:
+    _f.write('{"hidden_size": 8192}')
+check("...and so does a changed config.json",
+      diskspec.model_content_id(_D) != _ida)
+
+print("== (P4) model_dir resolves the hub the way the hub does ==")
+_osP.makedirs(_osP.path.join(_repo, "refs"), exist_ok=True)
+with open(_osP.path.join(_repo, "refs", "main"), "w") as _f:
+    _f.write("c0mmit_aaaaaa\n")
+eq("a bare model id resolves through refs/main to a snapshot",
+   diskspec.model_dir("org/mdl", None, _hub), _A)
+eq("...and an explicitly pinned commit wins over refs/main",
+   diskspec.model_dir("org/mdl", "c0mmit_bbbbbb", _hub), _B)
+eq("a plain directory is used as-is", diskspec.model_dir(_A, None, _hub), _A)
+
+print("== (P4) an unidentifiable model DEGRADES, it does not pretend ==")
+# *** `unknown` IS NOT A REFUSAL, DELIBERATELY. *** If the layout cannot be
+# read the identity falls back to the model NAME alone -- exactly today's
+# behaviour, so the change is never a regression. The honest claim is "no
+# better protected than before", which is why it is logged and exposed in /kv
+# rather than hidden behind a reassuring hash.
+eq("an absent directory is unknown", diskspec.model_content_id(None), "unknown")
+eq("a missing path is unknown",
+   diskspec.model_content_id("/nonexistent/kvmgr/model"), "unknown")
+_empty = tempfile.mkdtemp(prefix="kvempty-")
+eq("*** a directory with NO safetensors is unknown rather than a hash of "
+   "nothing -- which two different empty dirs would have SHARED ***",
+   diskspec.model_content_id(_empty), "unknown")
+eq("an unresolvable model id is unknown",
+   diskspec.model_dir("no/such-model", None, _hub), None)
+
+print("== (P4) the migration keeps the warm tier, and REFUSES past v1 ==")
+# *** STRENGTHENING A FINGERPRINT ORPHANS EVERYTHING UNDER THE OLD ONE, and on
+# *** this box that is 400 GB and 560,000 keys. *** The bytes are not wrong --
+# the LAYOUT did not change, only the identity string -- so discarding them
+# would be a pure loss paid in 430-795 s cold prefills. A directory rename is
+# O(1) and keeps the manifest too, because presence.json sits at the format
+# root and is keyed by block hash rather than by path.
+_mg = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0), _KVCfg())
+_newbase = "%s_r%d" % (_mg.file_mapper().base_path, _mg.rank)
+
+# Build the pre-Phase-4 path the same way the migration does, and plant a file.
+_legacy_dir = None
+for _cand in os.listdir(_mg.root_dir) if os.path.isdir(_mg.root_dir) else []:
+    pass
+import shutil as _shP
+_old_fake = os.path.join(_mg.root_dir, "legacy-fingerprint_r0")
+os.makedirs(_old_fake, exist_ok=True)
+open(os.path.join(_old_fake, "block.bin"), "wb").write(b"kv")
+
+# The real test drives the method, with the legacy mapper monkeypatched to
+# point at our planted directory -- otherwise the assertion only ever exercises
+# a path that does not exist, which is a guard that cannot fail.
+_realFM = diskspec.FileMapper
+
+
+class _FakeFM:
+    def __init__(self, *a, **kw):
+        self.base_path = os.path.join(_mg.root_dir, "legacy-fingerprint")
+
+
+_shP.rmtree(_newbase, ignore_errors=True)
+diskspec.FileMapper = _FakeFM
+try:
+    _mg._migrate_legacy_base(_CfgTmp(WORLD, 0).parallel_config)
+finally:
+    diskspec.FileMapper = _realFM
+
+check("*** the legacy directory is RENAMED onto the new fingerprint, so the "
+      "warm tier survives a fingerprint change ***",
+      os.path.isdir(_newbase) and not os.path.isdir(_old_fake),
+      (os.path.isdir(_newbase), os.path.isdir(_old_fake)))
+check("...and the files came with it",
+      os.path.isfile(os.path.join(_newbase, "block.bin")))
+
+# *** THE VERSION GUARD IS NOT OPTIONAL. *** Past v1 the old directory was
+# written by a DIFFERENT layout, so adopting it is the exact hazard the
+# version exists to prevent. A migration that outlives its own precondition is
+# worse than no migration.
+os.makedirs(_old_fake, exist_ok=True)
+open(os.path.join(_old_fake, "block.bin"), "wb").write(b"kv")
+_shP.rmtree(_newbase, ignore_errors=True)
+_realV = diskspec.DISK_FORMAT_VERSION
+diskspec.DISK_FORMAT_VERSION = 2
+diskspec.FileMapper = _FakeFM
+try:
+    _mg._migrate_legacy_base(_CfgTmp(WORLD, 0).parallel_config)
+finally:
+    diskspec.DISK_FORMAT_VERSION = _realV
+    diskspec.FileMapper = _realFM
+check("*** at format v2 the migration REFUSES -- adopting v1 bytes under a v2 "
+      "layout is plausible-but-wrong KV, the whole thing the version prevents "
+      "***", os.path.isdir(_old_fake) and not os.path.isdir(_newbase),
+      (os.path.isdir(_old_fake), os.path.isdir(_newbase)))
+
+# *** AND THE "never clobber" GUARD HAD TO BE TESTED ON AN EMPTY TARGET. ***
+# The first version planted a file in the new directory and asserted it
+# survived -- which it does EITHER WAY, because POSIX `rename` refuses to
+# replace a NON-EMPTY directory (ENOTEMPTY), so the mutation was caught by the
+# kernel rather than by the guard and the assertion could not fail.
+# Break-verification found that. An EMPTY target is where behaviour genuinely
+# differs: there the rename would succeed, so the explicit check is what makes
+# the outcome a predictable decline with a log instead of a silent adoption.
+os.makedirs(_newbase, exist_ok=True)
+assert not os.listdir(_newbase), "the target must be EMPTY for this to bite"
+diskspec.FileMapper = _FakeFM
+try:
+    _mg._migrate_legacy_base(_CfgTmp(WORLD, 0).parallel_config)
+finally:
+    diskspec.FileMapper = _realFM
+check("*** an EXISTING new-format directory is never adopted into, even when "
+      "empty -- a rename cannot merge two caches, so it declines and says so "
+      "***", os.path.isdir(_old_fake) and os.path.isdir(_newbase),
+      (os.path.isdir(_old_fake), os.path.isdir(_newbase)))
+_shP.rmtree(_old_fake, ignore_errors=True)
+
+print("== (P4) the fingerprint is PUBLISHED, so it can be checked ==")
+# *** A FINGERPRINT NOBODY CAN READ IS A CLAIM NOBODY CAN CHECK. *** The
+# 2026-10-07 failure was the worker and the engine core computing DIFFERENT
+# base paths with nothing saying so: 552 keys pruned as "the file is gone"
+# with the files right there, one boot per guess until the fields were printed.
+_fpm = _mg.get_manager()
+_fp = _fpm.snapshot().get("fingerprint") or {}
+eq("the format version is published", _fp.get("format_version"),
+   diskspec.DISK_FORMAT_VERSION)
+eq("...and the root", _fp.get("format_root"), diskspec.DISK_FORMAT_ROOT)
+check("the base path is published, which is what two processes must AGREE on",
+      bool(_fp.get("base_path")), _fp)
+check("*** the model identity is published separately from the name, because "
+      "`unknown` is a fact about the deployment worth seeing ***",
+      "model_identity" in _fp, _fp)
+check("...and the writer string carries our format version",
+      "dspark-kv" in (_fp.get("writer") or ""), _fp.get("writer"))
+
+# It must survive a manager whose __init__ never ran -- the rebind trap, which
+# has now bitten seven times in this module.
+_orph = diskspec.DiskPresenceManager.__new__(diskspec.DiskPresenceManager)
+try:
+    _got = diskspec.DiskPresenceManager._fingerprint(_orph)
+except Exception as exc:
+    _got = "RAISED: %r" % (exc,)
+check("*** _fingerprint works on an instance that never ran __init__ ***",
+      isinstance(_got, dict) and _got.get("format_version") is not None, _got)
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()
 if FAIL:
