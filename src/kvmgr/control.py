@@ -507,6 +507,15 @@ def reload_modules() -> dict:
         # replaced rather than stacked is in test_phase1d_disk.py.
         _reg._install_serializer_shim()
         report["serializer_shim_reinstalled"] = True
+        # *** AND RE-WIRE patch6's PENDING-BLOCKS HOOK. *** It holds a
+        # reference to `diskspec.pending_block_ids`, and the reload REBINDS
+        # that module -- so after a reload patch6 would be calling the previous
+        # module's function. It would still work, which is the trap: a stale
+        # closure that behaves correctly is invisible until the behaviour
+        # changes. The audit in test_phase1d_disk.py is what required this
+        # line, and it named the omission the moment the installer was added.
+        _reg._install_pending_blocks_provider()
+        report["pending_blocks_provider_rewired"] = True
         _dio = _il2.import_module("kvmgr.diskio")
         _dio._start_watchdog()
         report["watchdog_armed"] = bool(_dio._watchdog_started)

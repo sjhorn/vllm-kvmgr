@@ -447,6 +447,35 @@ def _discover_offload_sched():
                   "this answer is only meaningful there." % (tried[-1], n))
 
 
+def pending_block_ids():
+    """GPU block ids with a KV transfer in flight, or None if unknown.
+
+    *** THIS IS ON THE PROTECT HOT PATH, so it must be O(1) and allocate
+    *** nothing. *** It returns the connector's own `_block_id_to_pending_jobs`
+    KEYS VIEW rather than a copy -- membership is O(1) against a live dict, and
+    copying a few hundred ids on every protect would be a cost paid thousands of
+    times a minute for a set that changes constantly.
+
+    Returning the live view does mean the caller sees mutations mid-iteration.
+    That is fine for the one use: a membership test per candidate block, where a
+    concurrent insert simply means the next protect skips that block instead of
+    this one.
+
+    *** None MEANS "I CANNOT SAY", NOT "NOTHING IS PENDING". *** The caller
+    fails OPEN on None (it releases), which is the right trade -- a cap that
+    cannot be enforced means memory pressure and preemptions -- but the two must
+    stay distinguishable at this boundary rather than collapsing into an empty
+    set that reads as a measurement.
+    """
+    cs = _LIVE_OFFLOAD_SCHED[0] if _LIVE_OFFLOAD_SCHED else None
+    if cs is None:
+        return None
+    d = getattr(cs, "_block_id_to_pending_jobs", None)
+    if d is None:
+        return None
+    return d.keys()
+
+
 def offload_sched_snapshot() -> dict:
     """Read-only view of upstream's scheduler-side job bookkeeping.
 
