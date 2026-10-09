@@ -551,6 +551,10 @@ class DiskPresenceManager(OffloadingManager):
         self._present: "OrderedDict[bytes, tuple[int, int]]" = OrderedDict()
         self._bytes = 0            # running total, so the budget needs no stat
         self._evicted_pending: list[bytes] = []
+        # Keys with a load in flight, which must never be evicted. Set here
+        # for the normal path AND created lazily by _loading_map(), because a
+        # hot reload rebinds a live manager without running __init__.
+        self._loading: dict[bytes, int] = {}
         # key -> block position, recorded when OFFERED and consumed at
         # completion. Bounded by what is in flight, and cleared on reset.
         self._pos_hint: dict[bytes, int] = {}
@@ -839,6 +843,24 @@ class DiskPresenceManager(OffloadingManager):
             self._stats["hit"] += 1
         return hit
 
+    def _loading_map(self) -> dict:
+        """The in-flight-load holds, created on first use.
+
+        *** A RELOAD NEVER RUNS `__init__`. *** `rebind` re-points a live
+        manager with `obj.__class__ = new`, so an instance already serving
+        requests gets every new METHOD and no new attribute -- and an
+        AttributeError in prepare_store is fatal to the scheduler. This repo
+        has paid for that six times now, once as a type change rather than a
+        missing name. So the attribute is never assumed: it is created here, on
+        the INSTANCE (a class-level dict would be shared by every manager), and
+        every reader goes through this one accessor.
+        """
+        m = getattr(self, "_loading", None)
+        if m is None:
+            m = {}
+            self._loading = m
+        return m
+
     def prepare_load(
         self, keys: "Collection[OffloadKey]", req_context: "ReqContext"
     ) -> LoadStoreSpec:
@@ -850,6 +872,23 @@ class DiskPresenceManager(OffloadingManager):
                 "scheduler should only ask for keys lookup() claimed. Refusing "
                 "rather than loading something we have not proven."
             )
+        # *** A KEY WITH A LOAD IN FLIGHT MUST NOT BE EVICTED, AND THE
+        # *** FRAMEWORK CANNOT SURVIVE IT IF IT IS. ***
+        # `offloading/worker.py:273` is a bare `assert transfer_result.success`
+        # under the comment "we currently do not support job failures" -- so a
+        # load that cannot find its file does not degrade, it raises
+        # AssertionError in the worker's output path. Phase 5's eviction made
+        # that reachable for the first time: lookup() says present, the load is
+        # issued, a concurrent store's budget picks the same key as a victim,
+        # _apply_deletes unlinks it on both ranks, and the read hits
+        # FileNotFoundError. The LRU touch makes it unlikely, because a
+        # just-looked-up key is the most recently used and so the last victim
+        # -- but UNLIKELY IS NOT A SAFETY PROPERTY, and the failure is a dead
+        # engine rather than a miss.
+        loading = self._loading_map()
+        for k in keys:
+            kb = bytes(k)
+            loading[kb] = loading.get(kb, 0) + 1
         return DiskLoadStoreSpec(list(keys))
 
     # -- writes -----------------------------------------------------------
@@ -980,7 +1019,12 @@ class DiskPresenceManager(OffloadingManager):
         if need <= 0:
             return []
         # Never consider what we are about to store as a victim.
+        # Never evict a key the scheduler is already loading -- see
+        # prepare_load. Read through _loading_map(), because a hot reload
+        # rebinds the class without running __init__, so a manager already
+        # serving requests gets the new METHODS and not the new attribute.
         skip = {bytes(k) for k in incoming}
+        skip |= set(self._loading_map())
         items = [(k, nb, pos, i)
                  for i, (k, (nb, pos)) in enumerate(self._present.items())
                  if k not in skip]
@@ -1057,6 +1101,20 @@ class DiskPresenceManager(OffloadingManager):
     def complete_load(
         self, keys: "Collection[OffloadKey]", req_context: "ReqContext"
     ) -> None:
+        """Release the eviction hold `prepare_load` took.
+
+        Counted rather than a plain set, because two requests can have a load
+        in flight for the same key and the first completion must not release
+        the second's hold.
+        """
+        loading = self._loading_map()
+        for k in keys:
+            kb = bytes(k)
+            n = loading.get(kb, 0) - 1
+            if n > 0:
+                loading[kb] = n
+            else:
+                loading.pop(kb, None)
         return None
 
     def touch(self, keys: "Collection[OffloadKey]", req_context: "ReqContext") -> None:

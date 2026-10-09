@@ -985,6 +985,121 @@ check("*** but an unlink FAILURE is never throttled -- that is the thing "
       "FAILED to unlink" in _dsrc and _dsrc.index("FAILED to unlink")
       < _dsrc.index("_del_logged = True"))
 
+print("== (5j) A KEY WITH A LOAD IN FLIGHT MUST NEVER BE A VICTIM ==")
+# *** THE FRAMEWORK CANNOT SURVIVE A FAILED TRANSFER. ***
+# `offloading/worker.py:273` is a bare `assert transfer_result.success`, under
+# the comment "we currently do not support job failures" -- confirmed in the
+# INSTALLED tree on the box, not merely in patches/pristine/. So a load that
+# cannot find its file does not degrade to a miss, it raises AssertionError in
+# the worker's output path and takes the engine with it.
+#
+# Phase 5's eviction made that reachable for the first time: lookup() says
+# present, prepare_load issues the load, a concurrent store's budget picks the
+# same key as a victim, _apply_deletes unlinks it on BOTH ranks, and the read
+# hits FileNotFoundError. The LRU touch makes it unlikely -- a just-looked-up
+# key is the most recently used and therefore the last victim -- but UNLIKELY
+# IS NOT A SAFETY PROPERTY when the failure is a dead engine.
+F.write(kvmgr_enabled=1, disk_restore=1)   # prepare_load refuses otherwise
+_lm = diskspec.DiskPresenceManager(_tmpspec.file_mapper(), num_workers=WORLD)
+_lk = base.make_offload_key(b"\xe1" * 32, 0)
+_lk2 = base.make_offload_key(b"\xe2" * 32, 0)
+
+# *** AN ASSERTION WHOSE SUBJECT CAN RAISE MUST CATCH. *** Fifth time this
+# suite has needed the correction: under mutation (dropping the lazy init from
+# _loading_map) these calls raise AttributeError, the exception escapes, and
+# the FILE ABORTS before printing its summary -- so break-verification reads a
+# crash as "no output" rather than as a named failure. Every driver below goes
+# through these.
+def _lm_load(keys):
+    try:
+        _lm.prepare_load(keys, None)
+        return "ok"
+    except Exception as exc:
+        return "RAISED: %r" % (exc,)
+
+
+def _lm_done(keys):
+    try:
+        _lm.complete_load(keys, None)
+        return "ok"
+    except Exception as exc:
+        return "RAISED: %r" % (exc,)
+
+
+def _lm_holds():
+    try:
+        return dict(_lm._loading_map())
+    except Exception as exc:
+        return "RAISED: %r" % (exc,)
+
+
+eq("no holds to begin with", _lm_holds(), {})
+_lm_load([_lk])
+check("*** prepare_load takes an eviction hold ***",
+      bytes(_lk) in (_lm_holds() or {}), _lm_holds())
+_lm_done([_lk])
+eq("...and complete_load releases it", _lm_holds(), {})
+
+# Counted, not a set: two requests can be loading the same key, and the first
+# completion must not release the second's hold.
+_lm_load([_lk])
+_lm_load([_lk])
+_lm_done([_lk])
+check("*** the hold is COUNTED -- one of two concurrent loads completing does "
+      "NOT release it ***", bytes(_lk) in (_lm_holds() or {}),
+      _lm_holds())
+_lm_done([_lk])
+eq("...and the second completion does", _lm_holds(), {})
+
+# The hold must actually reach victim selection. Index holds two keys; the
+# budget needs room for one; the held one must survive even though it is the
+# OLDEST and so the natural victim.
+# *** THE FIRST VERSION OF THIS ASSERTION PASSED VACUOUSLY. *** With no
+# budget set, _enforce_budget returns before choosing anything, so "the held
+# key is not among the victims" was true of an EMPTY victim list. Sized in real
+# bytes against a 1 GB budget so eviction genuinely fires -- and the companion
+# assertion below ("the unheld one IS chosen") is what caught it, which is the
+# reason a guard needs a partner that fails when nothing happens at all.
+F.write(kvmgr_enabled=1, disk_restore=1, disk_budget_gb=1)
+_lm._group_bytes = {0: 600_000_000}
+_lm._present[bytes(_lk)] = (600_000_000, 0)   # oldest -> first victim by LRU
+_lm._present[bytes(_lk2)] = (600_000_000, 1)
+_lm._bytes = 1_200_000_000
+_lm_load([_lk])
+_incoming = [base.make_offload_key(b"\xe3" * 32, 0)]
+try:
+    _victims = [bytes(v) for v in (_lm._enforce_budget(_incoming) or [])]
+except Exception as _exc:
+    _victims = ["RAISED: %r" % (_exc,)]
+check("the budget actually fired, so the next two are not vacuous",
+      len(_victims) > 0, _victims)
+check("*** the held key is NOT chosen, though it is the oldest ***",
+      bytes(_lk) not in _victims, _victims)
+check("...and the unheld one is, so the budget still works",
+      bytes(_lk2) in _victims, _victims)
+
+# The rebind trap, for the SEVENTH time. A reload re-points a live manager with
+# `obj.__class__ = new`, so it gets every new METHOD and no new attribute.
+_orphan = diskspec.DiskPresenceManager.__new__(diskspec.DiskPresenceManager)
+try:
+    _got = dict(diskspec.DiskPresenceManager._loading_map(_orphan))
+except Exception as exc:
+    _got = "RAISED: %r" % (exc,)
+eq("*** _loading_map works on an instance that never ran __init__ -- a reload "
+   "gives new methods and no new attributes ***", _got, {})
+_a = diskspec.DiskPresenceManager.__new__(diskspec.DiskPresenceManager)
+_b = diskspec.DiskPresenceManager.__new__(diskspec.DiskPresenceManager)
+def _orphan_map(o):
+    try:
+        return diskspec.DiskPresenceManager._loading_map(o)
+    except Exception as exc:
+        return {"RAISED": repr(exc)}
+
+
+_orphan_map(_a)["x"] = 1
+eq("...and the map is per INSTANCE, not shared on the class",
+   dict(_orphan_map(_b)), {})
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()
 if FAIL:
