@@ -451,7 +451,13 @@ finally:
 # ---------------------------------------------------------------------------
 # 5b. A KNOB THAT CANNOT WORK AT THIS LAYER REFUSES, WITH THE REASON
 # ---------------------------------------------------------------------------
-for name in ("disk_enabled", "disk_budget_gb"):
+# *** RE-AIMED, NOT DELETED, when Phase 5 built disk_budget_gb. *** The
+# property these check -- a refusal must name a cause and point somewhere -- is
+# right; only the example moved. This is the second time: disk_restore left the
+# table the same way. Driven off flags.BLOCKED itself so the next knob to be
+# built needs no edit here at all, which is what stops the table and the test
+# drifting apart.
+for name in sorted(flags.BLOCKED):
     flags.reset_for_tests()
     harness.clear_log()
     F.write(**{name: (1 if isinstance(flags.DEFAULTS[name], bool) else 64.0)})
@@ -484,7 +490,7 @@ check("*** and the restore gates use a VALIDATED read, so a future BLOCKED "
           os.path.dirname(os.path.dirname(os.path.dirname(
               os.path.abspath(__file__)))),
           "patches", "kvmgr_plugin", "kvmgr", "diskspec.py")).read())
-for _k in ("disk_enabled", "disk_budget_gb"):
+for _k in sorted(flags.BLOCKED):
     check(f"{_k}'s refusal still POINTS somewhere",
           "diskspec.py" in flags.BLOCKED[_k])
 

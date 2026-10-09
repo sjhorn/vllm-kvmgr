@@ -339,15 +339,29 @@ for _ in range(20):
 eq("twenty more polls add no further refusal lines",
    harness.log_text().count("REFUSED"), 0)
 
-# a DIFFERENT value announces again, because it is a different claim
-harness.clear_log()
-F.write(kvmgr_enabled=1, disk_budget_gb=64.0)
-stats.snapshot()
-flags.peek("disk_budget_gb")
-check("a different blocked knob announces on its own",
-      "disk_budget_gb" in harness.log_text() and "REFUSED" in harness.log_text(),
-      harness.log_text()[:160])
-F.write(kvmgr_enabled=1, disk_enabled=0, disk_budget_gb=0.0)
+# *** THIS ASSERTION'S PREMISE IS GONE, AND SAYING SO BEATS FAKING IT. ***
+# It used `disk_budget_gb` as a SECOND blocked knob to show that each one
+# announces its own refusal independently. Phase 5 built that knob, so
+# `disk_enabled` is now the only entry in BLOCKED and there is no second knob
+# to compare against. Re-aiming it at the same knob would test the dedup
+# instead -- which the twenty-poll assertion above already covers -- so it is
+# conditional, with the reason stated. Faking coverage by asserting something
+# adjacent is worse than one honestly skipped check.
+_others = sorted(flags.BLOCKED)
+if len(_others) >= 2:
+    harness.clear_log()
+    _b = _others[1]
+    F.write(**{"kvmgr_enabled": 1, _b: 1})
+    stats.snapshot()
+    flags.peek(_b)
+    check("a second blocked knob announces on its own",
+          _b in harness.log_text() and "REFUSED" in harness.log_text(),
+          harness.log_text()[:160])
+    F.write(**{"kvmgr_enabled": 1, _b: 0})
+else:
+    check("(only one blocked knob left, so 'a SECOND one announces' cannot be "
+          "tested -- stated rather than faked; BLOCKED = %s)" % _others,
+          len(_others) == 1)
 
 # peek must validate exactly as knob does, minus the recording
 flags.reset_for_tests()

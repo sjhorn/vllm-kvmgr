@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -696,6 +697,148 @@ diskspec._LIVE_OFFLOAD_SCHED.append(_NoJobs())
 eq("a renamed _jobs is absent, not empty",
    diskspec.offload_sched_snapshot().get("available"), False)
 del diskspec._LIVE_OFFLOAD_SCHED[:]
+
+print("== (5a) PHASE 5: the victim rule, tail-first within an age ==")
+# *** PLAIN LRU IS THE WRONG ANSWER AND THAT IS THE WHOLE POINT. *** External
+# reuse is a CONTIGUOUS RUN FROM TOKEN 0, so evicting a prefix's TAIL leaves a
+# shorter prefix that still hits, while evicting its HEAD writes off every block
+# behind it -- those bytes stay on disk and can never be read again. Measured on
+# the GPU side already: head-lost left 228 blocks reusable as 0, tail-first kept
+# 495 of 495.
+cv = diskspec.choose_victims
+
+# (key, nbytes, pos, recency) -- smaller recency is older
+_prefix_old = [(b"o%d" % i, 100, i, 1) for i in range(5)]   # one cold prefix
+_prefix_hot = [(b"h%d" % i, 100, i, 9) for i in range(5)]   # one hot prefix
+
+eq("nothing to free means no victims", cv(_prefix_old + _prefix_hot, 0), [])
+eq("...and a negative need is not an invitation to evict",
+   cv(_prefix_old + _prefix_hot, -1), [])
+
+_v = cv(_prefix_old + _prefix_hot, 250)
+eq("*** the COLD prefix is evicted, not the hot one ***",
+   all(k.startswith(b"o") for k in _v), True)
+eq("*** and TAIL-FIRST within it: highest block index goes first ***",
+   _v, [b"o4", b"o3", b"o2"])
+check("...which is what stops a HEAD being orphaned: o0 survives",
+      b"o0" not in _v)
+
+# recency must beat position: a hot TAIL must outlive a cold HEAD
+_v2 = cv([(b"cold-head", 100, 0, 1), (b"hot-tail", 100, 99, 9)], 100)
+eq("*** recency is PRIMARY -- a cold head goes before a hot tail ***",
+   _v2, [b"cold-head"])
+
+eq("it frees AT LEAST what was asked, and stops there",
+   len(cv(_prefix_old, 150)), 2)
+eq("...and will take everything if that is what the budget needs",
+   len(cv(_prefix_old, 10_000)), 5)
+eq("an empty index yields no victims", cv([], 1000), [])
+
+# differing sizes must be respected, not assumed uniform
+_mixed = [(b"big", 900, 1, 1), (b"small", 100, 0, 1)]
+eq("the TAIL is taken first even when it is the big one, and one suffices",
+   cv(_mixed, 500), [b"big"])
+
+print("== (5b) the budget conversion, where 0 must mean UNBOUNDED ==")
+bb = diskspec.budget_bytes
+eq("GB to bytes", bb(1.5), 1_500_000_000)
+eq("*** 0 means NO BUDGET, not 'evict everything' ***", bb(0), 0)
+eq("...and so does a negative, which is the same misread", bb(-5), 0)
+eq("...and so does garbage, rather than raising into prepare_store", bb("x"), 0)
+check("*** that direction matters: an unset knob must not wipe a 518 GB index "
+      "***", bb(0) == 0 and cv([(b"k", 1, 0, 1)], bb(0)) == [])
+
+print("== (5c) the manifest must read BOTH formats -- 520,446 keys depend on it ==")
+# Phase 5 added a block POSITION per key, so entries became [hex, pos]. A reader
+# that only understood the new shape would discard the ENTIRE existing index --
+# 518 GB of still-restorable files -- and the loss would look like a cache that
+# merely went cold. So the old bare-string form must still load.
+_mdir = tempfile.mkdtemp(prefix="kvmanifest-")
+_troot = tempfile.mkdtemp(prefix="kvroot-")
+
+
+# root_dir lives on _Cfg's kv_transfer_config, not on _KVCfg -- so the WRITABLE
+# root goes there. The default is /kvoffload, the real mount on the box and
+# read-only here, and testing the manifest means actually creating files.
+class _CfgTmp(_Cfg):
+    def __init__(self, world=WORLD, rank=0):
+        _Cfg.__init__(self, world, rank)
+        self.kv_transfer_config = type("K", (), {
+            "kv_connector_extra_config": {"root_dir": _troot}})()
+
+
+flags.reset_for_tests()
+_tmpspec = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0), _KVCfg())
+_k1 = base.make_offload_key(b"\xa1" * 32, 0)
+_k2 = base.make_offload_key(b"\xa2" * 32, 1)
+
+def _mkmanifest(entries):
+    path = os.path.join(_mdir, "presence-%d.json" % len(os.listdir(_mdir)))
+    with open(path, "w") as f:
+        json.dump({"keys": entries}, f)
+    # The files must exist or the loader's pruner drops the keys -- which is
+    # itself the behaviour that makes an unreadable manifest safe. Paths come
+    # from the real FileMapper, so this exercises the actual layout rather than
+    # a guess at it.
+    # A spec rooted in a WRITABLE temp dir: the default root is /kvoffload,
+    # which is the real mount on the box and read-only here. Testing the
+    # manifest means actually creating files, so the fixture has to own a root.
+    _fm = _tmpspec.file_mapper()
+    for e in entries:
+        h = e if isinstance(e, str) else e[0]
+        fp = _fm.get_file_name(bytes.fromhex(h))
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        open(fp, "wb").close()
+    return path
+
+_old_fmt = _mkmanifest([_k1.hex(), _k2.hex()])
+_m_old = diskspec.DiskPresenceManager(_tmpspec.file_mapper(), num_workers=WORLD,
+                                      manifest_path=_old_fmt)
+eq("*** the OLD bare-string manifest still loads every key ***",
+   len(_m_old._present), 2)
+eq("...and an unknown position is -1, not 0",
+   sorted(p for _nb, p in _m_old._present.values()), [-1, -1])
+check("*** -1 sorts BEFORE 0 under the -pos tie-break, so unknown-position "
+      "keys are the LAST victims of their age -- the conservative direction, "
+      "because one of them might be a head ***",
+      diskspec.choose_victims([(b"unknown", 10, -1, 1), (b"known-tail", 10, 5, 1)],
+                              10) == [b"known-tail"])
+
+_new_fmt = _mkmanifest([[_k1.hex(), 0], [_k2.hex(), 7]])
+_m_new = diskspec.DiskPresenceManager(_tmpspec.file_mapper(), num_workers=WORLD,
+                                      manifest_path=_new_fmt)
+eq("the NEW [hex, pos] manifest loads too", len(_m_new._present), 2)
+eq("...with the positions preserved",
+   sorted(p for _nb, p in _m_new._present.values()), [0, 7])
+
+print("== (5d) touch() is the LRU, and it was a no-op ==")
+_m = diskspec.DiskPresenceManager(_tmpspec.file_mapper(), num_workers=WORLD)
+_m._remember(b"a", 0); _m._remember(b"b", 1); _m._remember(b"c", 2)
+eq("insertion order is the initial recency", list(_m._present), [b"a", b"b", b"c"])
+_m.touch([b"a"], ctx)
+eq("*** touch moves a key to MOST recent, so a hot prefix outlives a cold one "
+   "***", list(_m._present), [b"b", b"c", b"a"])
+_m.touch([b"zzz-not-present"], ctx)
+eq("...and touching an absent key is a no-op, not an insertion",
+   list(_m._present), [b"b", b"c", b"a"])
+
+print("== (5e) the budget: 0 is unbounded, and the delete reaches BOTH ranks ==")
+flags.set_override("disk_budget_gb", 0)
+try:
+    _out = _m_new.prepare_store([_k1], ctx)
+    check("*** with no budget set, nothing is ever evicted ***",
+          _out is None or not getattr(_out.store_spec, "to_delete", []))
+finally:
+    flags.clear_override("disk_budget_gb")
+
+check("*** the delete rides the spec, which serialises to every rank ***",
+      hasattr(diskspec.DiskLoadStoreSpec([], to_delete=[b"x"]), "to_delete"))
+eq("...carrying plain bytes, because a numpy scalar in a serialised structure "
+   "killed the output thread tonight",
+   [type(x) for x in diskspec.DiskLoadStoreSpec([], to_delete=[b"x"]).to_delete],
+   [bytes])
+eq("...and an empty delete list is empty, not None",
+   diskspec.DiskLoadStoreSpec([]).to_delete, [])
 
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()

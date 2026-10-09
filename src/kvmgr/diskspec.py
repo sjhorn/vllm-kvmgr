@@ -32,6 +32,7 @@ run.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -411,6 +412,63 @@ def _now() -> float:
     return time.monotonic()
 
 
+def choose_victims(items: "Sequence[tuple]", need_bytes: int) -> list:
+    """Pick keys to evict until `need_bytes` is freed. PURE.
+
+    `items` is `(key, nbytes, pos, recency)` in NO required order; `recency` is
+    any comparable where SMALLER is older. Returns the victim keys in the order
+    they should be dropped.
+
+    *** THE VICTIM RULE IS THE WHOLE POINT OF PHASE 5, AND PLAIN LRU IS THE
+    *** WRONG ANSWER. *** External reuse is a CONTIGUOUS RUN FROM TOKEN 0,
+    exactly as GPU reuse is. So evicting a prefix's TAIL leaves a shorter
+    prefix that still hits, while evicting its HEAD writes off every block
+    behind it -- those bytes stay on disk and can never be read again. That is
+    the lesson `evict_order=lru_tail_first` already paid for on the GPU side,
+    measured: head-lost left 228 blocks reusable as 0, while tail-first kept
+    495 of 495.
+
+    So the order is **recency first, then TAIL-FIRST within an age**:
+
+      - recency primary, because that is what a byte budget is for -- a cold
+        prefix should go before a hot one, whatever its shape;
+      - `-pos` secondary, so within one age the highest block index goes first.
+        Keys of one prefix are touched together on reuse, so they share a
+        recency and this orders them tail-to-head, which is what stops a head
+        being orphaned.
+
+    The happy consequence is that heads are evicted only once their own tail is
+    already gone, so orphaning is rare BY CONSTRUCTION rather than by a second
+    pass that would need prefix identity we do not have on disk.
+    """
+    if need_bytes <= 0:
+        return []
+    # Oldest first; within an age, the furthest from token 0 first.
+    ordered = sorted(items, key=lambda it: (it[3], -it[2]))
+    out, freed = [], 0
+    for key, nbytes, _pos, _rec in ordered:
+        out.append(key)
+        freed += int(nbytes)
+        if freed >= need_bytes:
+            break
+    return out
+
+
+def budget_bytes(budget_gb: float) -> int:
+    """GB -> bytes, 0 meaning NO BUDGET. Pure.
+
+    0 is "unbounded" rather than "evict everything", which is the direction a
+    misread must fail in: an unset knob must not wipe 518 GB of index. The
+    units are GB because that is how the disk is discussed, and the conversion
+    is here rather than at three call sites.
+    """
+    try:
+        gb = float(budget_gb)
+    except Exception:
+        return 0
+    return int(gb * 1e9) if gb > 0 else 0
+
+
 class DiskLoadStoreSpec(LoadStoreSpec):
     """Addresses blocks by their OffloadKey, NOT by a block id.
 
@@ -422,15 +480,24 @@ class DiskLoadStoreSpec(LoadStoreSpec):
     precisely what makes `_r0` and `_r1` siblings under one fingerprint.
     """
 
-    def __init__(self, keys: list["OffloadKey"]):
+    def __init__(self, keys: list["OffloadKey"], to_delete: list | None = None):
         self.keys = list(keys)
+        # *** THE DELETE CHANNEL. *** Each rank writes its own slice to its own
+        # node's disk, so an eviction must reach both -- and upstream never
+        # reads `evicted_keys`, while a collective_rpc from the scheduler step
+        # is the blocking mistake that has already cost an NCCL kill. This
+        # object already serialises to every rank with no help, so it carries
+        # the delete. Plain bytes, deliberately: a numpy scalar in a serialised
+        # structure killed the engine's output thread earlier tonight.
+        self.to_delete = [bytes(k) for k in (to_delete or [])]
 
     @staticmethod
     def medium() -> str:
         return DISK_MEDIUM
 
     def __repr__(self) -> str:
-        return f"DiskLoadStoreSpec({len(self.keys)} keys)"
+        return (f"DiskLoadStoreSpec({len(self.keys)} keys"
+                f"{', %d to delete' % len(self.to_delete) if self.to_delete else ''})")
 
 
 class DiskPresenceManager(OffloadingManager):
@@ -469,7 +536,22 @@ class DiskPresenceManager(OffloadingManager):
                  manifest_path: str | None = None):
         self._mapper = file_mapper
         self._num_workers = num_workers
-        self._present: set[bytes] = set()
+        # *** AN ORDERED MAP, NOT A SET, AND THE ORDER IS THE LRU. *** Phase 5
+        # needs three things a set cannot carry: a byte cost (to enforce a
+        # budget), a block POSITION (so eviction can be tail-first), and a
+        # recency (so a cold prefix goes before a hot one). Insertion order is
+        # the recency and `move_to_end` on touch is the update, which is why
+        # this is an OrderedDict rather than a plain dict: `move_to_end` is the
+        # whole mechanism and a plain dict has no such method.
+        #
+        # Membership (`k in self._present`) and `len()` read identically to the
+        # set this replaces, so every existing call site is unchanged.
+        self._present: "OrderedDict[bytes, tuple[int, int]]" = OrderedDict()
+        self._bytes = 0            # running total, so the budget needs no stat
+        self._evicted_pending: list[bytes] = []
+        # key -> block position, recorded when OFFERED and consumed at
+        # completion. Bounded by what is in flight, and cleared on reset.
+        self._pos_hint: dict[bytes, int] = {}
         self._events: list[OffloadingEvent] = []
         self._stats = {"lookup": 0, "hit": 0, "stored": 0, "skipped_present": 0,
                        "manifest_loaded": 0, "manifest_pruned": 0,
@@ -483,6 +565,58 @@ class DiskPresenceManager(OffloadingManager):
         self._last_flush = _now()
         if manifest_path:
             self._load_manifest()
+
+    def _key_bytes(self, key: bytes) -> int:
+        """On-disk cost of one key, from its GROUP -- never a stat() call.
+
+        The five groups have measured, different per-block file sizes
+        (985,664 / 822,272 / 784,896 / 860,160 / 655,360 B), so a uniform
+        estimate would be wrong by up to 50% and the budget would be a
+        fiction. Derived from the group index packed into the key itself, so
+        this costs no I/O on the scheduler's path -- which matters, because it
+        is called for every key of every store.
+        """
+        try:
+            from vllm.v1.kv_offload.base import get_offload_group_idx
+            sizes = getattr(self, "_group_sizes", None)
+            if sizes is None:
+                sizes = self._spec_group_sizes()
+                self._group_sizes = sizes
+            g = get_offload_group_idx(key)
+            if sizes and 0 <= g < len(sizes):
+                return int(sizes[g])
+        except Exception:
+            pass
+        return 0
+
+    def _spec_group_sizes(self) -> list:
+        """Per-group file sizes, if the live handler can tell us. Best effort."""
+        try:
+            from kvmgr import diskio as _dio
+            for h in list(getattr(_dio, "_LIVE_HANDLERS", [])):
+                sizes = getattr(h, "_sizes", None)
+                if sizes:
+                    return [int(x) for x in sizes]
+        except Exception:
+            pass
+        return []
+
+    def _remember(self, key: bytes, pos: int) -> None:
+        """Record a key as present, with its cost and position. Idempotent."""
+        kb = bytes(key)
+        if kb in self._present:
+            return
+        nb = self._key_bytes(kb)
+        self._present[kb] = (nb, int(pos))
+        self._bytes += nb
+
+    def _forget(self, key: bytes) -> int:
+        """Drop a key from the index, returning the bytes reclaimed."""
+        nb, _pos = self._present.pop(bytes(key), (0, -1))
+        self._bytes -= nb
+        if self._bytes < 0:
+            self._bytes = 0
+        return nb
 
     # -- the manifest -----------------------------------------------------
     def _load_manifest(self) -> None:
@@ -513,7 +647,26 @@ class DiskPresenceManager(OffloadingManager):
             return
         try:
             with open(self._manifest) as f:
-                keys = [bytes.fromhex(h) for h in json.load(f).get("keys", [])]
+                raw = json.load(f).get("keys", [])
+            # *** BOTH FORMATS, AND THE OLD ONE IS 520,446 KEYS ON DISK RIGHT
+            # *** NOW. *** Phase 5 needs a block POSITION per key, so entries
+            # became `[hex, pos]`. A reader that only understood the new shape
+            # would throw away the entire existing index -- 518 GB of files
+            # that are still perfectly restorable -- and the loss would look
+            # like a cache that simply went cold. So a bare string is still
+            # accepted and given pos=-1, meaning "position unknown".
+            #
+            # pos=-1 sorts BEFORE 0 under the `-pos` tail-first tie-break,
+            # which makes unknown-position keys the LAST victims within their
+            # age rather than the first. That is the conservative direction: a
+            # key we cannot place in a prefix might be a head, and evicting a
+            # head orphans everything behind it.
+            keys, poss = [], []
+            for item in raw:
+                if isinstance(item, str):
+                    keys.append(bytes.fromhex(item)); poss.append(-1)
+                else:
+                    keys.append(bytes.fromhex(item[0])); poss.append(int(item[1]))
         except Exception:
             logger.exception(
                 "kvmgr: manifest %s is unreadable -- starting with an EMPTY "
@@ -527,7 +680,11 @@ class DiskPresenceManager(OffloadingManager):
                     kept.append(k)
             except Exception:
                 pass
-        self._present = set(kept)
+        self._present = OrderedDict()
+        self._bytes = 0
+        _pos_by_key = dict(zip(keys, poss))
+        for k in kept:
+            self._remember(k, _pos_by_key.get(k, -1))
         self._stats["manifest_loaded"] = len(kept)
         self._stats["manifest_pruned"] = len(keys) - len(kept)
         logger.info(
@@ -566,7 +723,12 @@ class DiskPresenceManager(OffloadingManager):
             _os.makedirs(_os.path.dirname(self._manifest), exist_ok=True)
             tmp = self._manifest + ".part"
             with open(tmp, "w") as f:
-                json.dump({"keys": sorted(k.hex() for k in self._present)}, f)
+                # [hex, pos] pairs. Sorted by key so a diff of two manifests
+                # is readable; the LRU order is deliberately NOT persisted,
+                # because a restart's recency is meaningless and pretending
+                # otherwise would evict by the age of a previous boot.
+                json.dump({"keys": sorted([k.hex(), p]
+                                          for k, (nb, p) in self._present.items())}, f)
             _os.replace(tmp, self._manifest)
             self._unflushed = 0
             self._last_flush = _now()
@@ -678,20 +840,95 @@ class DiskPresenceManager(OffloadingManager):
         self._count_groups("to_store", todo)
         if not todo:
             return _nothing_to_store()
+
+        # *** RECORD THE POSITION NOW, because this is the only moment it is
+        # *** known. *** The scheduler hands keys in block order within a
+        # group -- the same input-order invariant check_pairing depends on --
+        # so the i-th key of a group is block i of that prefix. By the time
+        # complete_store fires, that ordering is gone. Tail-first eviction is
+        # impossible without it.
+        try:
+            from vllm.v1.kv_offload.base import get_offload_group_idx
+            _seen: dict[int, int] = {}
+            for k in todo:
+                g = get_offload_group_idx(k)
+                i = _seen.get(g, 0)
+                _seen[g] = i + 1
+                self._pos_hint[bytes(k)] = i
+        except Exception:
+            pass
+
+        evicted = self._enforce_budget(todo)
         return PrepareStoreOutput(
             keys_to_store=todo,
-            store_spec=DiskLoadStoreSpec(todo),
-            # No eviction yet -- a byte budget with its own LRU is Phase 5.
-            # Returning [] means "nothing was displaced", which is true.
-            evicted_keys=[],
+            store_spec=DiskLoadStoreSpec(todo, to_delete=evicted),
+            # *** UPSTREAM IGNORES THIS FIELD -- checked, it is declared in
+            # PrepareStoreOutput and never read in scheduler.py. *** It is
+            # returned anyway because it is the documented contract and a
+            # future version may honour it; the delete that actually happens
+            # travels in the store_spec above, which reaches BOTH ranks.
+            evicted_keys=list(evicted),
         )
+
+    def _enforce_budget(self, incoming: "Sequence[OffloadKey]") -> list:
+        """Evict until the budget holds. Returns the keys to delete.
+
+        *** WHY THE DELETE RIDES THE STORE SPEC. *** Each rank writes its own
+        slice to its OWN node's disk, so a delete has to reach both -- and
+        `evicted_keys` is never read by upstream, while a `collective_rpc`
+        from inside the scheduler step is precisely the blocking-the-critical-
+        path mistake that has already cost this project an NCCL kill. Our own
+        `DiskLoadStoreSpec` already serialises to every rank with no help, and
+        a store job always accompanies an eviction because eviction is what
+        makes room for that store. So the existing channel carries it.
+        
+        *** AND EVICTION IS CLUSTER-WIDE BY NECESSITY, NOT TIDINESS. *** If one
+        rank dropped a key the other kept, a later restore would load half the
+        KV and nothing would crash -- the F8_E8M0 hazard. Per-node budgets
+        would be simpler and are not safe.
+        """
+        budget = budget_bytes(flags.peek("disk_budget_gb"))
+        if not budget:
+            return []
+        incoming_bytes = sum(self._key_bytes(bytes(k)) for k in incoming)
+        need = (self._bytes + incoming_bytes) - budget
+        if need <= 0:
+            return []
+        # Never consider what we are about to store as a victim.
+        skip = {bytes(k) for k in incoming}
+        items = [(k, nb, pos, i)
+                 for i, (k, (nb, pos)) in enumerate(self._present.items())
+                 if k not in skip]
+        victims = choose_victims(items, need)
+        freed = 0
+        for v in victims:
+            freed += self._forget(v)
+        if victims:
+            self._stats["evicted"] = self._stats.get("evicted", 0) + len(victims)
+            self._stats["evicted_bytes"] = (
+                self._stats.get("evicted_bytes", 0) + freed)
+            self._events.append(OffloadingEvent(
+                keys=list(victims), medium=DISK_MEDIUM, removed=True))
+            self._unflushed += len(victims)
+            logger.info(
+                "kvmgr: disk budget -- evicting %d key(s) / %.2f GB to make "
+                "room for %.2f GB (held %.2f GB, budget %.2f GB). Tail-first "
+                "within an age, so a prefix shortens rather than losing its "
+                "head; the delete rides the store spec to BOTH ranks.",
+                len(victims), freed / 1e9, incoming_bytes / 1e9,
+                self._bytes / 1e9, budget / 1e9)
+        return victims
 
     def complete_store(
         self, keys: "Collection[OffloadKey]", req_context: "ReqContext"
     ) -> None:
         new = [k for k in keys if bytes(k) not in self._present]
         for k in new:
-            self._present.add(bytes(k))
+            # The position was recorded when the key was OFFERED, because that
+            # is the only moment it is known: the scheduler hands keys in block
+            # order within a group, which is the same invariant check_pairing
+            # relies on. By completion time that ordering is gone.
+            self._remember(bytes(k), self._pos_hint.pop(bytes(k), -1))
         self._stats["stored"] += len(new)
         # The all-ranks edge. Counted per group so `offered - completed` is
         # readable: a gap here is a job that never finished, not a key nobody
@@ -712,6 +949,22 @@ class DiskPresenceManager(OffloadingManager):
         return None
 
     def touch(self, keys: "Collection[OffloadKey]", req_context: "ReqContext") -> None:
+        """Mark keys as recently used. *** THE LRU, AND IT WAS A NO-OP. ***
+
+        The scheduler calls this when a lookup reuses a prefix, so it is the
+        only reuse signal that reaches this layer -- without it a byte budget
+        could only evict by insertion age, which would throw away the hottest
+        long conversation on the box simply because it started first. That is
+        the opposite of what this cache is for.
+
+        `move_to_end` on an OrderedDict is the whole mechanism. Touching keys
+        of one prefix together is what gives them a shared recency, which is
+        what makes the tail-first tie-break in choose_victims meaningful.
+        """
+        for k in keys:
+            kb = bytes(k)
+            if kb in self._present:
+                self._present.move_to_end(kb)
         return None
 
     def take_events(self) -> "Iterable[OffloadingEvent]":
@@ -729,6 +982,8 @@ class DiskPresenceManager(OffloadingManager):
 
     def reset_cache(self) -> None:
         self._present.clear()
+        self._bytes = 0
+        self._pos_hint.clear()
         self.flush_manifest(force=True)
 
     def _count_groups(self, what: str, keys: "Collection[OffloadKey]") -> None:
@@ -793,7 +1048,13 @@ class DiskPresenceManager(OffloadingManager):
             what: {str(g): n for g, n in sorted(d.items())}
             for what, d in sorted(getattr(self, "_gcounts", {}).items())
         }
+        _budget = budget_bytes(flags.peek("disk_budget_gb"))
         return dict(self._stats, present=len(self._present),
+                    bytes_held=self._bytes,
+                    budget_bytes=_budget,
+                    budget_gb=round(_budget / 1e9, 2) if _budget else 0,
+                    over_budget=bool(_budget and self._bytes > _budget),
+                    budget_enforced=bool(_budget),
                     num_workers=self._num_workers,
                     by_group=by_group,
                     sched=offload_sched_snapshot(),

@@ -1165,6 +1165,49 @@ class DiskStoreHandler:
         except Exception:
             return
 
+    def _apply_deletes(self, spec) -> None:
+        """Unlink files the scheduler evicted. THIS rank's copies only.
+
+        *** THE ONLY PLACE FILES ARE EVER REMOVED, and it must never be fatal.
+        *** The budget decision is the scheduler's (it holds the index and the
+        recency); this is the hands. Each rank deletes its OWN node's file, and
+        the same key is deleted on both ranks because the spec reaches both --
+        which is the point, since one rank dropping a key the other kept would
+        make a later restore load half the KV with nothing crashing.
+        
+        A failed unlink is logged and ignored: a file that will not delete
+        costs disk, while raising here would fail the store job and ultimately
+        the request. Already-gone is success, not an error -- that is the
+        common case on a re-eviction.
+        """
+        to_delete = getattr(spec, "to_delete", None)
+        if not to_delete:
+            return
+        gone = errs = 0
+        for key in to_delete:
+            try:
+                path = self._mapper.get_file_name(key)
+            except Exception:
+                errs += 1
+                continue
+            try:
+                os.unlink(path)
+                gone += 1
+            except FileNotFoundError:
+                gone += 1          # already gone is the goal, not a failure
+            except Exception:
+                errs += 1
+        self.stats["deleted"] = self.stats.get("deleted", 0) + gone
+        if errs:
+            self.stats["delete_errors"] = self.stats.get(
+                "delete_errors", 0) + errs
+        if gone or errs:
+            logger.info(
+                "kvmgr: budget eviction -- unlinked %d file(s) on this rank "
+                "(%d failed). The scheduler chose them; this rank deletes only "
+                "its own slice, and the same keys go on every rank because the "
+                "spec reaches them all.", gone, errs)
+
     def transfer_async(self, job_id: int, spec) -> bool:
         """Accept a job of ANY size, and submit it over as many rounds as needed.
 
@@ -1182,6 +1225,11 @@ class DiskStoreHandler:
         framework's notion of done is our completion report, and we only report
         a job when every one of its rounds has been written.
         """
+        # Deletes ride the store spec -- see DiskPresenceManager._enforce_budget.
+        try:
+            self._apply_deletes(spec[1] if isinstance(spec, tuple) else spec)
+        except Exception:
+            logger.exception("kvmgr: applying budget deletes raised (ignored)")
         from vllm.v1.kv_offload.base import get_offload_group_idx
 
         gpu_spec, disk_spec = spec

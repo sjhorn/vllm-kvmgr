@@ -204,11 +204,13 @@ BLOCKED: dict[str, str] = {
         "tiering tier via KV_TRANSFER_CONFIG and not a flag. "
         "See kvmgr/diskspec.py and docs/local/KVMGR-PHASE45-20261007.md"
     ),
-    "disk_budget_gb": (
-        "Phase 5. Nothing we control writes to disk yet, so a byte budget "
-        "bounds nothing -- and bounding the TIERING tier's writes is not ours "
-        "to do from here. See kvmgr/diskspec.py"
-    ),
+    # *** disk_budget_gb IS OUT OF HERE: Phase 5 built it. *** The old reason
+    # said "nothing we control writes to disk yet", which stopped being true
+    # the moment our own spec wrote 518 GB. Leaving a built knob in this table
+    # is the defect `disk_restore` already demonstrated -- a capability running
+    # behind readers that deny it, which is worse than a refusal nobody can
+    # see, because the invisible thing is ENABLED. Enforcement is in
+    # DiskPresenceManager._enforce_budget; 0 means unbounded.
 }
 
 # Values implemented SO FAR.  A knob set to a recognised-but-unbuilt value falls
