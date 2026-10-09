@@ -1,13 +1,68 @@
-# kvmgr — a KV cache manager of our own
+# kvmgr — a KV cache manager and a disk-backed prefix cache for vLLM
 
-Our manager for **KV group 0** (full MLA, 256-token blocks), with every policy
-knob movable on a running engine. Phase 1 of the plan; see
-`docs/local/KVMGR-PHASE0-20261007.md` for what the reading settled.
+Two things, in one `vllm.general_plugins` entry point:
 
-**Phase 1 changes no behaviour.** `kvmgr_enabled` defaults false, and when false
-every override calls `super()` — patch6, unmodified. With it true and the
-defaults (`protect_alloc=equal`, `evict_order=fifo`) the cap agrees with patch6
-block for block, asserted at five fractions plus the negative-fraction contract.
+1. **A KV cache manager** for group 0 (full MLA), replacing upstream's via the
+   public `spec_manager_map`, with every policy knob movable on a running
+   engine — protection budget, allocation split, eviction order.
+2. **A disk-backed prefix cache** (`DSparkDiskOffloadingSpec`), registered
+   through the public `OffloadingSpecFactory`, which writes KV **GPU → disk
+   worker-side** and reads it back, so a prefix survives an engine restart.
+
+**The second is separable from the first.** `diskspec.py` and `diskio.py` import
+only the standard library, `vllm.logger`, the two public `vllm.v1.kv_offload`
+modules and this package's own `flags` — no overlay, no patched upstream file,
+no dependency on the manager half. If you want the disk tier on a stock vLLM,
+that is the subset to take.
+
+**What it is for, in one number.** On this cluster a 2,000-token delta on a warm
+770K prefix costs **0.9 s**; the same 770K arrived at cold costs **686 s**. An
+engine restart or a head eviction is the whole difference, which is why
+disk-backed restore is worth real risk.
+
+## If you are reading this to take something
+
+- **The disk tier only**: `kvmgr/{diskspec,diskio,flags}.py` plus a register
+  shim that calls `OffloadingSpecFactory.register_spec`. No upstream file is
+  patched.
+- **What we found wrong in upstream `kv_offload`** while building it, with
+  verified line numbers and what each cost: `docs/UPSTREAM-FINDINGS.md`. Five
+  items, one of which is silent data corruption on a cross-node tensor
+  parallel.
+- **The offline harness**: `local-ops/kvharness/`, 1,257 assertions, no GPU and
+  no cluster, loading the real upstream sources with numpy and torch stubbed.
+  Start here; it is the fastest way to see what the contract is.
+
+## Requirements
+
+- **vLLM with `v1/kv_offload`** — developed against
+  `0.21.1rc1.dev339+g1967a5627bc3`. The contract it depends on is pinned by
+  `local-ops/kvharness/test_phase0_disk.py` against the real upstream sources,
+  so an upstream bump that moves it fails as a named assertion rather than at
+  boot as "the plugin did not load".
+- **`PYTHONHASHSEED` set to a fixed value, and never changed.** This is not
+  optional and it is the single easiest way to get nothing but misses. vLLM's
+  block hash is a Merkle chain rooted at `NONE_HASH`, which is
+  `os.urandom(32)` when `PYTHONHASHSEED` is unset — so every block hash chains
+  off 32 random bytes chosen fresh at each process start, and the files a
+  previous boot wrote are keyed by hashes this boot **cannot compute**. The fs
+  lookup is `os.path.exists`, so that is a **miss, not an error**, for ever,
+  with the data sitting right there. Measured before the fix: 54,070 queries,
+  0 hits, 27 GB on disk. **Changing the value later orphans every file already
+  written**, silently, as a miss.
+- **`--enable-prefix-caching`**, and a writable directory per node for the tier.
+- Selection is explicit: nothing happens unless `KV_TRANSFER_CONFIG` names the
+  spec.
+
+		KV_TRANSFER_CONFIG='{"kv_connector":"OffloadingConnector",
+		  "kv_role":"kv_both",
+		  "kv_connector_extra_config":{
+		    "spec_name":"DSparkDiskOffloadingSpec",
+		    "staging_blocks":256,"write_threads":4,"root_dir":"/kvoffload"}}'
+
+  Registering the name is **inert** — the committed default is "no offload at
+  all", so a restart without this reverts to known-good rather than to a
+  half-built path.
 
 ## Why it exists
 
@@ -62,46 +117,178 @@ All in `/var/tmp/vllm-kv-flags/flags.json` on the host (`/etc/vllm-kv-flags`
 inside the container), re-stat'ed at most once a second. **Defaults are chosen
 so an empty file behaves exactly as today.**
 
-| flag | default | effect | built |
-|---|---|---|---|
-| `kvmgr_enabled` | 0 | our policy vs patch6's, per call | yes |
-| `protected_fraction` | 0.30 | the cap, moved off `os.environ` | yes |
-| `protect_alloc` | `equal` | `equal` \| `by_need` | yes |
-| `evict_order` | `fifo` | `fifo` \| `lru` \| `lru_tail_first` | yes |
-| `disk_enabled` / `disk_budget_gb` / `disk_restore` | off | the disk tier | **cannot** — see below |
-| `kvmgr_log_level` | 0 | per-decision eviction logging | Phase 2 |
+**THE AUTHORITATIVE LIST IS NOT IN THIS FILE, and that is deliberate.** A
+hand-written table here listed six knobs while twenty-four were declared, and
+said the disk ones "cannot" be built while the tier was writing — the same way
+the published policy block listed seven of twenty-four. Enumerate from the
+declaration instead:
 
-A value that is **recognised but not yet built** falls back to the default and
-**says so** in the log. Shipping a half-built policy as though it were live is
-worse than refusing it.
+- `DEFAULTS` in `kvmgr/flags.py` is the source of truth.
+- `GET /kv` on the stats port publishes **every** declared knob with its
+  **effective value and the source that won** — override (control plane) beats
+  env beats the flags file beats the default. A knob reading `default` while
+  you believe you set it is almost always an env pin, or a flags file on the
+  other node.
+- A test audits both directions: every knob read anywhere must be declared, and
+  every declared knob must be published. It was written after finding
+  `head_pin_partial` read by the manager and declared nowhere — a knob that
+  governed something and that no reader could discover.
+
+The handful whose values change behaviour most:
+
+| flag | default | effect |
+|---|---|---|
+| `kvmgr_enabled` | 0 | our policy vs upstream's, re-read per call |
+| `protected_fraction` | 0.30 | the protection budget |
+| `protect_alloc` | `equal` | `equal` \| `by_need` — the 4.2x retention fix |
+| `evict_order` | `fifo` | `fifo` \| `lru` \| `lru_tail_first` |
+| `disk_restore` | 0 | read back from disk on a miss |
+| `disk_store_paused` | 0 | the write path's hot off switch |
+| `disk_budget_gb` | 0 | per-node byte budget; 0 means unbounded |
+| `gpu_cache_epoch` | 0 | bump to drop the GPU prefix cache, keeping the disk index |
+| `pin_static_head` | 0 | reserve KV for a static prompt head — **built, never enabled** |
+
+Defaults are chosen so **an empty flags file behaves exactly as upstream**:
+every new mechanism off, every pre-existing one at its prior value. A value that
+is recognised but refused falls back to the default and **says so** in the log —
+shipping a half-built policy as though it were live is worse than refusing it.
+
+**A mechanism gets a hot off switch before it gets a feature.** That rule cost a
+user-visible outage: the disk store path had no way to be disabled without a
+six-minute restart, so the only mitigation available was one the box could not
+afford. A knob whose OFF state needs a boot is not a knob.
 
 	bash local-ops/kv-flags.sh                       # read both nodes
 	bash local-ops/kv-flags.sh kvmgr_enabled 1
 
-## The disk tier is not buildable here, and the knobs say so
+## The disk tier, which this README used to say was impossible
 
-Phases 4–5 of the plan are **not delivered**, for a structural reason:
-**a KV cache manager holds no KV bytes.** `KVCacheBlock` is metadata only, and
-across the 3,691 lines of this layer — `patch6`, `patch7`, the coordinator and
-`kv_cache_manager.py` — a search for `torch`, `tensor`, `cuda`, `device` or
-`kv_caches` returns **one** hit, which is the word "safetensors" in a comment
-this work added. The tensors live in the **worker** processes, indexed by
-`block_id`. Writing them needs a `KVConnector`, which `vllm/v1/kv_offload`
-already is — and that path is parked on **vllm#45663**, where the sparse indexer
-materialises every KV block at once and OOMs past ~120K tokens against a 570K
-working set. Nothing we build moves that; a hand-rolled writer arrives at the
-same wall from a different direction.
+**This section previously read "The disk tier is not buildable here, and the
+knobs say so", and every word of its conclusion was wrong.** It argued that a
+KV cache manager holds no KV bytes — true, `KVCacheBlock` is metadata and the
+tensors live in the workers — and concluded that a disk tier was therefore
+unbuildable, blaming vllm#45663. The layer argument was right and the
+conclusion did not follow: the bytes are reachable from the **worker** side,
+which is where `kv_offload` already operates, and the tier has since written
+tens of thousands of files and read them back.
 
-So the three knobs stay in the table and **refuse loudly**, carrying the reason,
-rather than being removed or silently doing nothing:
+It is left here, named, rather than quietly deleted. A README that was
+confidently wrong about its own central question is worth knowing about if you
+are deciding how much to trust the rest of it.
 
-	kvmgr: disk_enabled=True REFUSED -- a KV cache manager holds NO KV BYTES …
+### What is live and measured
 
-`raw()` still reports what was *asked for*, so "nobody set it" stays
-distinguishable from "it was set and refused".
+| | |
+|---|---|
+| GPU → disk writes, both ranks | **live**, byte-verified round trip |
+| disk → GPU restore | **live and correct** — same prompt, byte-identical output |
+| restore at scale | **3.3 s against a 122.1 s cold pass** (166,438-token prefix, 100% restored) |
+| a prefix surviving an engine restart | **live** — 458,679 keys restored, 0 pruned |
+| bounded growth | **live** — per-node byte budget with an LRU, 105,339 keys evicted in one session |
+| the path fingerprint | **live** — format version plus a content identity for the model |
 
-Full evidence, the Phase 6 assessment and the re-check trigger:
-`docs/local/KVMGR-PHASE45-20261007.md`.
+### Why not upstream's tiering spec
+
+`TieringOffloadingSpec` routes every tier through a **CPU primary tier**, and
+`tiering/spec.py` builds that region in **shared memory**, sized
+`page × world_size`, with the secondary tiers created scheduler-side in one
+process. On a single host every rank maps the same `/dev/shm` and that works.
+
+Our topology is `world_size=2, local_world_size=1` — **one rank per node** — so
+rank 1 maps a *different* kernel's `/dev/shm` and nothing on that node has a
+secondary tier to cascade to. Measured: every file upstream's tier wrote was
+`page × world_size` bytes with the **second half entirely zero**, six out of six
+sampled. The disk held half a cache, and restoring it would have loaded zeros
+into half the KV silently.
+
+Upstream will not "fix" this because it is their stated design assumption —
+*"the framework consolidates all shards into a single shared host memory
+region"* — and `kv_offload` carries **no guard at all**: `world_size` only
+*sizes* the region and never asserts the workers are local, so a cross-node
+tensor parallel is silently wrong rather than refused. See
+`docs/UPSTREAM-FINDINGS.md`.
+
+So this spec does the transfer **worker-side**, GPU → a small pinned staging
+buffer → the local disk, each rank writing its own slice to its own node. No CPU
+tier, which also avoids paying for RAM out of the KV pool on unified memory.
+
+### The knobs are live now, not refused
+
+The three `BLOCKED` reasons quoted in the old section are gone. `disk_enabled`
+remains blocked and is reported as **governing nothing**, because what actually
+turns the store path on is `KV_TRANSFER_CONFIG` naming this spec — reporting a
+flag there printed a confident `false` about a tier that was demonstrably
+writing. Report the fact, not the ask.
+
+## What this does NOT guarantee
+
+The failure mode to design against is not a crash. **KV bytes are only valid
+for the exact engine and writer that produced them, and vLLM's block hash is a
+Merkle chain over token ids and the previous hash — it does not include the
+engine config.** So a restore across a changed configuration returns plausible
+tensors that decode to nonsense and nothing crashes. That is strictly worse than
+refusing to start. Everything below is about that.
+
+**Covered:**
+
+- **Config changes** land in a different directory. `FileMapper`'s fingerprint
+  is a sha256 over the model name, hash block size, tp/pp/pcp/dcp sizes, cache
+  dtype and every KV group's `block_size` and `layer_names`, so a changed
+  config simply misses — refuse-by-construction rather than best-effort.
+- **Our own on-disk format**, via `DISK_FORMAT_VERSION`, which is inside the
+  hash and not merely in a directory name.
+- **An accidental format change** — somebody editing the writer and forgetting
+  to bump the version — is caught **offline**, by a pinned hash of the
+  layout-determining functions with comments stripped. A runtime hash would
+  catch it too and would orphan the whole tier the first time anyone fixed a
+  typo.
+- **The model's content**: `config.json` plus the `(filename → blob)` mapping
+  of every safetensors entry. Note this is deliberately **not** the HF
+  revision: on this box the served model has two snapshots sharing all 49
+  blob targets and a byte-identical config, so a revision-keyed fingerprint
+  would have orphaned 400 GB for a documentation-only bump.
+- **All-ranks presence.** The framework completes a transfer only when every
+  rank confirms, so a key in the index is backed on every node. An independent
+  disk walk later found all 434,074 keys present on both ranks.
+
+**Not covered, and you should know before trusting it:**
+
+- **If the model directory cannot be read, the identity degrades to the model
+  NAME.** That is the pre-fingerprint behaviour, so it is never a regression,
+  but it means a re-quantised checkpoint at the same id would silently share
+  the cache. It is logged and published as `model_identity: unknown` rather
+  than hidden — if you see that, you have name-level protection only.
+- **Our patch-series version is not in the fingerprint**, deliberately: it
+  changes on every commit and would orphan the tier daily, while only the
+  *layout* affects byte compatibility. The offline guard covers the layout; a
+  change that alters bytes without touching those functions would not be
+  caught.
+- **A failed transfer is fatal, not a miss.** Upstream's
+  `offloading/worker.py` is a bare `assert transfer_result.success` under the
+  comment *"we currently do not support job failures"*, so a disk read or
+  write error raises in the worker's output path rather than degrading. We make
+  the reachable cases impossible by construction instead — notably by never
+  evicting a key with a load in flight — but an `EIO` or an `ENOSPC` will take
+  the engine down.
+- **Dropping the GPU prefix cache while transfers are in flight corrupted a
+  worker.** Freeing a block that a store is still reading produced `Xid 32` and
+  killed rank 1 with an asynchronous `CUDA error: unspecified launch failure`.
+  The drop refuses while any job is outstanding now; the general lesson is that
+  "idle" by *request* count is not idle by *transfer*, because a store job
+  outlives its request.
+- **Two GPU faults (`Xid 13`) remain unexplained**, from earlier work and
+  without a cache drop involved. Our indices are acquitted —
+  `refused_bounds=0` across ~19,000 transfers — but acquitted is not explained.
+- **Space is bounded per node, not cluster-wide**, because the two nodes have
+  separate disks and a cluster number could not be enforced on either. And the
+  budget bounds the **index**: files the index does not know about are
+  invisible to it, which once left 155 GiB of unreachable files in the live
+  directory. `local-ops/kvsweep.sh` is the sweep.
+- **Eviction can strand a prefix.** Reuse is a contiguous run from token 0, so
+  evicting a prefix's *head* writes off every block behind it — measured as
+  `lookup=1, hit=0` with 5,030 blocks of that prefix present on disk. The GPU
+  side solved this with `evict_order=lru_tail_first`; the disk tier has not
+  learned it yet.
 
 ## Registration is belt-and-braces, on purpose
 
@@ -373,15 +560,35 @@ answers "what is the engine using", and those differ in two silent ways.
 
 ## Tests
 
-	python3.12 local-ops/kvharness/test_phase0.py    #  59 — the plan's premises
-	python3.12 local-ops/kvharness/test_phase1.py    # 118 — parity + hot config
-	python3.12 local-ops/kvharness/test_phase2.py    #  67 — counters and exporters
+	cd local-ops/kvharness
+	for f in test_phase*.py; do python3.12 "$f" || echo "FAIL $f"; done
 
-No GPU, no cluster, ~2 s. Both load the **real** patch6/7/8 and the pristine
-coordinator; see `local-ops/kvharness/README.md`.
+**1,257 assertions across ten files, no GPU, no cluster, a few seconds.** Use
+`python3.12`: 3.9 cannot parse the overlays' evaluated `X | None` annotations.
 
-Every guard is verified by breaking it — twelve breaks, each caught and each
-naming its own cause: a knob captured at import, the kill switch not reaching
+They load the **real** upstream sources — patch6/7/8, the pristine coordinator,
+and `kv_offload/{base,worker,file_mapper,factory}.py` — with `numpy` and `torch`
+**stubbed rather than installed**, because the whole value of this harness is
+running on a laptop with nothing installed. The stub header states exactly what
+is and is not modelled, so no test can quietly assert on the stub instead of on
+vLLM. See `local-ops/kvharness/README.md`.
+
+**Count the assertions by EXIT CODE, not by the last line.** A `tail -1` sweep
+reported a file as failing when it had passed — the final PASS message carried a
+multi-line log dump, so the last line was log text rather than the summary. The
+loop above tests the command.
+
+**Every guard is verified by breaking it, and that is the only reason most of
+this is trustworthy.** Roughly a dozen of the guards written for this work
+passed *vacuously* on the first attempt and were found only by mutation —
+including an anti-stacking check that could not fail (stacked wrappers reach the
+inner function exactly once too), a "never clobber" check the kernel was
+catching rather than the guard (POSIX `rename` refuses a non-empty target), a
+lint that read its own comment as code, and an eviction assertion that was true
+of an empty victim list. **A guard needs a partner that fails when nothing
+happened at all.**
+
+Earlier breaks, each caught and each naming its own cause: a knob captured at import, the kill switch not reaching
 patch6, reconcile doing nothing, the cap not logging on change, `by_need`
 reverting to the naive reading, an unbuilt policy value shipping silently, the
 patch6 hook removed, protection counted as the offer, cap and pool evictions
