@@ -372,6 +372,30 @@ def _install_serializer_shim() -> None:
                 orig_encode, "_kvmgr_wrapped", False):
             def encode_into(self, obj, buf, *a, **kw):
                 root["obj"] = obj
+                # *** LOOK PROACTIVELY, because the coercion is RARE. ***
+                # Two occurrences in a whole evening (value=1, then 39), and a
+                # deliberate reproduction attempt -- a restore plus three
+                # concurrent 25K requests -- produced none. Waiting for a rare
+                # event to name itself is not a strategy when the walk can
+                # simply go and look.
+                #
+                # Bounded hard: the first few encodes only, then never again.
+                # This runs in the engine's OUTPUT THREAD, so the budget is a
+                # handful of bounded walks once per process, not a standing
+                # cost. It stops at the first find, because one path is the
+                # answer.
+                if root.get("scan", 0) < 25 and not root.get("found"):
+                    root["scan"] = root.get("scan", 0) + 1
+                    try:
+                        paths = _numpy_paths(obj, limit=6)
+                        if paths:
+                            root["found"] = True
+                            logger.warning(
+                                "kvmgr: numpy scalar PRODUCER (found by "
+                                "scanning encode #%d, before any coercion) -- "
+                                "%s", root["scan"], "; ".join(paths))
+                    except Exception:
+                        root["found"] = True      # never scan in a loop
                 return orig_encode(self, obj, buf, *a, **kw)
             encode_into._kvmgr_wrapped = True
             cls.encode_into = encode_into
