@@ -249,6 +249,75 @@ def _install_hang_dump() -> None:
     except Exception:
         logger.exception("kvmgr: could not arm the hang dump (continuing)")
 
+def _numpy_paths(root, limit: int = 12, max_depth: int = 8,
+                 max_nodes: int = 200000) -> list:
+    """Dotted paths to every numpy SCALAR reachable from `root`. Bounded.
+
+    *** THE HOOK SEES THE SCALAR, NOT ITS PARENT, and that is why two runs of
+    *** "value=1" and "value=39" identified nothing. *** msgspec hands enc_hook
+    the offending object alone, so the type and value are all it can report --
+    and a varying small count narrows the field without naming the field. The
+    only way to name it is to walk the object actually being encoded.
+
+    Bounded on purpose, because this runs inside the engine's output thread.
+    *** AND THE BOUNDS DO DIFFERENT JOBS, which I first got wrong in this very
+    *** comment: *** the DEPTH CAP is what stops a cycle -- break-verification
+    showed that removing the visited set changes nothing, because depth
+    terminates the walk either way. The visited set avoids re-walking a SHARED
+    subgraph, which is a cost saving and not a safety property. The node and
+    findings caps bound the total work. It runs ONCE per process, so the cost
+    is paid to answer a question rather than on every encode.
+    """
+    import numpy as _np
+
+    out: list = []
+    seen: set = set()
+    nodes = [0]
+
+    def walk(obj, path, depth):
+        if len(out) >= limit or depth > max_depth or nodes[0] > max_nodes:
+            return
+        nodes[0] += 1
+        if isinstance(obj, _np.generic):
+            out.append("%s = numpy.%s(%r)" % (path, type(obj).__name__, obj))
+            return
+        if isinstance(obj, (str, bytes, bytearray, int, float, bool, type(None))):
+            return
+        if isinstance(obj, _np.ndarray):
+            return                      # arrays ARE handled by upstream's hook
+        oid = id(obj)
+        if oid in seen:
+            return
+        seen.add(oid)
+        try:
+            if isinstance(obj, dict):
+                for k, v in list(obj.items())[:512]:
+                    walk(v, "%s[%r]" % (path, k), depth + 1)
+                return
+            if isinstance(obj, (list, tuple, set, frozenset)):
+                for i, v in enumerate(list(obj)[:512]):
+                    walk(v, "%s[%d]" % (path, i), depth + 1)
+                return
+            slots = getattr(type(obj), "__slots__", None)
+            names = (list(slots) if isinstance(slots, (list, tuple))
+                     else list(getattr(obj, "__dict__", {}) or {}))
+            for n in names[:256]:
+                if n.startswith("__"):
+                    continue
+                try:
+                    walk(getattr(obj, n), "%s.%s" % (path, n), depth + 1)
+                except Exception:
+                    continue
+        except Exception:
+            return
+
+    try:
+        walk(root, "outputs", 0)
+    except Exception:
+        pass
+    return out
+
+
 def _install_serializer_shim() -> None:
     """Make a numpy SCALAR serialisable, and say where it came from.
 
@@ -293,12 +362,35 @@ def _install_serializer_shim() -> None:
         if getattr(original, "_kvmgr_wrapped", False):
             return
         seen: set = set()
+        root: dict = {}
+
+        # Remember WHAT is being encoded, so the hook can name the field rather
+        # than only the value. One attribute store per encode; the walk itself
+        # happens once, on the first coercion.
+        orig_encode = getattr(cls, "encode_into", None)
+        if orig_encode is not None and not getattr(
+                orig_encode, "_kvmgr_wrapped", False):
+            def encode_into(self, obj, buf, *a, **kw):
+                root["obj"] = obj
+                return orig_encode(self, obj, buf, *a, **kw)
+            encode_into._kvmgr_wrapped = True
+            cls.encode_into = encode_into
 
         def enc_hook(self, obj):
             if isinstance(obj, _np.generic):
                 name = type(obj).__name__
                 if name not in seen:
                     seen.add(name)
+                    try:
+                        paths = _numpy_paths(root.get("obj"))
+                        logger.warning(
+                            "kvmgr: numpy scalar PRODUCER -- %s",
+                            "; ".join(paths) if paths else
+                            "the walk found none, so it is not reachable by "
+                            "attribute from the encoded root (a __slots__ type "
+                            "or a C extension holds it)")
+                    except Exception:
+                        logger.exception("kvmgr: the producer walk raised")
                     logger.warning(
                         "kvmgr: coerced a numpy scalar in the engine's OUTPUT "
                         "path -- numpy.%s value=%r -> %r. Upstream's enc_hook "

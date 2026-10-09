@@ -383,6 +383,101 @@ finally:
         else:
             sys.modules.pop(_k, None)
 
+print("== the producer walk: name the FIELD, not just the value ==")
+# Two runs logged "value=1" then "value=39" -- a varying small count, which
+# narrows the field without naming it. msgspec hands enc_hook the scalar alone,
+# so the only way to name the producer is to walk the object being encoded.
+import importlib as _il2
+_reg2 = _il2.import_module("kvmgr.register")
+_walk = _reg2._numpy_paths
+
+
+class _NpInt(int):
+    __module__ = "numpy"
+
+
+# the real numpy is not installed in the harness, so the walk's isinstance
+# against np.generic cannot match -- drive it with a stub module instead
+import sys as _s2
+import types as _t2
+_np_stub = _t2.ModuleType("numpy")
+
+
+class _Gen:
+    def __init__(self, v):
+        self.v = v
+    def __repr__(self):
+        return repr(self.v)
+
+
+_np_stub.generic = _Gen
+_np_stub.ndarray = type("ndarray", (), {})
+_saved_np = _s2.modules.get("numpy")
+_s2.modules["numpy"] = _np_stub
+try:
+    class _Stats:
+        __slots__ = ("hits", "queries")
+        def __init__(self):
+            self.hits = _Gen(39)
+            self.queries = 7
+
+    class _Out:
+        def __init__(self):
+            self.scheduler_stats = _Stats()
+            self.things = [1, {"deep": _Gen(1)}]
+
+    _paths = _walk(_Out())
+    check("*** the walk names a __slots__ attribute path ***",
+          any("outputs.scheduler_stats.hits" in p for p in _paths), _paths)
+    check("...and one nested in a list and a dict",
+          any("things[1]['deep']" in p for p in _paths), _paths)
+    check("...carrying the VALUE too, so it ties to the hook's line",
+          any("39" in p for p in _paths), _paths)
+    eq("a clean object yields no paths", _walk(_Stats.__new__(_Stats)) if False
+       else _walk(type("Clean", (), {"a": 1})()), [])
+
+    # bounded: a cycle must not spin, and a deep chain must stop
+    class _Node:
+        def __init__(self):
+            self.next = None
+            self.val = _Gen(5)
+
+    _a, _b = _Node(), _Node()
+    _a.next, _b.next = _b, _a
+    _cyc = _walk(_a)
+    # *** THE DEPTH CAP IS WHAT STOPS A CYCLE, NOT THE VISITED SET. ***
+    # I claimed the opposite in the walker's own docstring, and
+    # break-verification refuted it: removing the visited set left this green,
+    # because depth terminates the walk either way. So assert the real
+    # properties -- termination, and a bound on findings -- and test the
+    # visited set for what it actually does, which is avoid re-walking a
+    # SHARED subgraph.
+    check("*** a CYCLE terminates (the DEPTH cap does this) ***",
+          isinstance(_cyc, list))
+    check("...and findings are capped", len(_walk(_a, limit=1)) <= 1)
+    check("...and a shallow depth cap genuinely truncates",
+          len(_walk(_a, max_depth=0)) == 0)
+
+    # A shared CONTAINER, not a shared scalar: `walk` returns on a scalar
+    # before touching the visited set, so a shared scalar is deliberately
+    # reported once PER PATH -- which is more useful for diagnosis, since both
+    # routes to it are named. My first version of this assertion got that
+    # backwards and failed with the visited set present.
+    _shared_box = {"v": _Gen(11)}
+
+    class _Diamond:
+        def __init__(self):
+            self.left = _shared_box
+            self.right = _shared_box
+
+    eq("*** a SHARED CONTAINER is walked once, not once per path -- that is "
+       "what the visited set is for ***", len(_walk(_Diamond())), 1)
+finally:
+    if _saved_np is not None:
+        _s2.modules["numpy"] = _saved_np
+    else:
+        _s2.modules.pop("numpy", None)
+
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print("  FAILED:", f)
