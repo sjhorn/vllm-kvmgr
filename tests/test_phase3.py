@@ -506,6 +506,14 @@ class _Pool:
 
 
 def _mgr_with_pool(pool, release=None):
+    # *** THE DROP IS OPT-IN NOW, so every drop test must enable it. *** The
+    # knob defaults OFF because the lever caused Xid 32 twice on 2026-10-09
+    # with the mechanism unexplained. Enabling it HERE rather than at each call
+    # site is deliberate: this helper exists only to build managers for drop
+    # tests, and the alternative is eight F.write lines that a ninth test would
+    # forget -- after which it would pass for the wrong reason, testing the
+    # gate instead of the thing it meant to test.
+    F.write(kvmgr_enabled=1, gpu_cache_drop_allowed=1)
     obj = DSparkMLAAttentionManager.__new__(DSparkMLAAttentionManager)
     obj.block_pool = pool
     obj.release_protected_prompt_blocks = release or (lambda *a, **k: None)
@@ -676,6 +684,40 @@ check("...and is an int, so it can be bumped repeatedly",
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()
+print("== THE DROP IS OPT-IN, BECAUSE IT KILLED THE ENGINE TWICE ==")
+# *** Xid 32 at 11:50 (worker) and 17:07 (head) on 2026-10-09, both within ~4
+# *** seconds of a gpu_cache_epoch bump, on different ranks. ***
+# The second had ZERO eviction pressure (budget 1000 GB, 700 GB headroom) and
+# the pending-blocks fix live in all six processes, so neither churn nor that
+# fix explains it. The mechanism is UNESTABLISHED -- which is why the default
+# is off rather than a warning: a lever whose failure mode is a dead engine
+# and whose cause is unknown should cost a deliberate keystroke. No production
+# path drops the prefix cache, so gating it costs nothing a workload needs.
+_gp = _Pool(free=22000)
+_gm = _mgr_with_pool(_gp)
+# *** `reset_for_tests()` IS NOT ENOUGH, and that caught me. *** It clears the
+# OVERRIDE map; the flags FILE persists, and the helper above just wrote the
+# knob into it. So the first version of this test saw the drop succeed and read
+# as "the gate does not work" when the gate was never consulted at its default.
+# Rewrite the file WITHOUT the knob, which is what "at its default" means.
+F.write(kvmgr_enabled=1)
+flags.reset_for_tests()
+harness.clear_log()
+eq("*** with the knob at its default the drop REFUSES ***",
+   _gm.kvmgr_drop_gpu_cache(), False)
+eq("*** and the pool is NOT reset -- a gate that still reset would be no gate "
+   "at all ***", _gp.reset_calls, 0)
+check("...naming the Xid and that the cause is unknown, so a reader can weigh "
+      "it", "Xid 32" in harness.log_text() and "not understood" in harness.log_text(),
+      harness.log_text()[-240:])
+
+_gp2 = _Pool(free=22000)
+_gm2 = _mgr_with_pool(_gp2)                  # the helper enables the knob
+F.write(kvmgr_enabled=1, gpu_cache_drop_allowed=1)
+eq("...and with it deliberately ON the lever still works",
+   _gm2.kvmgr_drop_gpu_cache(), True)
+eq("...really resetting the pool", _gp2.reset_calls, 1)
+
 print("== THE DROP MUST REFUSE WHILE A KV TRANSFER IS IN FLIGHT ==")
 # *** THIS KILLED THE ENGINE ON 2026-10-09. *** At 11:50:00 the drop released
 # 449 blocks and reset the pool with store jobs outstanding on BOTH ranks
@@ -706,6 +748,7 @@ _saved_ds = _sysP3.modules.get("kvmgr.diskspec")
 
 def _drop_with(snap):
     """Run a fresh drop against a faked scheduler snapshot. Returns (ok, pool)."""
+    F.write(kvmgr_enabled=1, gpu_cache_drop_allowed=1)
     _p = _Pool(free=22000)
     _m = _mgr_with_pool(_p, release=lambda *a, **k: None)
     _stub = _tP3.ModuleType("kvmgr.diskspec")

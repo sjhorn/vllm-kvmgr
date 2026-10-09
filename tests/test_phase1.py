@@ -312,6 +312,7 @@ PROBE = {
     # enumerates DEFAULTS and demands a probe pair per knob. A new knob cannot
     # be added without somebody verifying its hot-config behaviour.
     "head_pin_partial": (0, 1),
+    "gpu_cache_drop_allowed": (0, 1),
 }
 # *** THIS ASSERTION IS WHY A NEW KNOB CANNOT SHIP UNPROVEN, and it caught one
 # on 2026-10-08. *** `disk_store_paused` was added to DEFAULTS and not here, and

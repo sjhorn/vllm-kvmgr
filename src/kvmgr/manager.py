@@ -536,6 +536,26 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
         a drop that silently did nothing would send somebody hunting for a bug in
         the read path that was never exercised.
         """
+        # *** OPT-IN, BECAUSE THIS HAS KILLED THE ENGINE TWICE. *** Xid 32 at
+        # 11:50 (worker) and 17:07 (head) on 2026-10-09, both within ~4s of a
+        # bump, on different ranks. The second had zero eviction pressure and
+        # the pending-blocks fix live, so neither explains it: the mechanism is
+        # UNKNOWN, which is precisely why the default is off rather than a
+        # warning. The in-flight refusal below stays as a second line, but it
+        # did NOT fire on either crash -- the scheduler reported no outstanding
+        # jobs both times, and `_block_id_to_pending_jobs` is populated only on
+        # the STORE path (scheduler.py:811, :943, both is_store=True), so a
+        # restore's DESTINATION blocks were never covered by it.
+        if not flags.peek("gpu_cache_drop_allowed"):
+            logger.warning(
+                "kvmgr: GPU prefix cache drop REFUSED -- gpu_cache_drop_allowed "
+                "is off. This lever caused Xid 32 twice on 2026-10-09, four "
+                "seconds after the bump, on both ranks in turn, and the "
+                "mechanism is not understood. No production path needs it; it "
+                "exists to test the disk restore. Set the knob deliberately if "
+                "you accept a possible engine death.")
+            return False
+
         pool = getattr(self, "block_pool", None)
         if pool is None or not hasattr(pool, "reset_prefix_cache"):
             logger.error("kvmgr: no block pool to drop (nothing was reset)")

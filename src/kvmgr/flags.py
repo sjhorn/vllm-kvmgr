@@ -161,6 +161,18 @@ DEFAULTS: dict[str, Any] = {
     # "a flag that governs nothing": here the flag governs something and no
     # reader can tell it exists. Found by auditing reads against declarations.
     "head_pin_partial": False,
+    # *** THE GPU CACHE DROP HAS KILLED THE ENGINE TWICE, SO IT IS OPT-IN. ***
+    # Xid 32 on 2026-10-09 at 11:50 (worker node) and again at 17:07 (head),
+    # both within ~4 seconds of a `gpu_cache_epoch` bump, on different ranks.
+    # The second had ZERO eviction pressure (budget 1000 GB, 700 GB headroom)
+    # and the pending-blocks fix live in all six processes, so neither churn nor
+    # that fix explains it and the MECHANISM IS UNESTABLISHED.
+    #
+    # Off by default because of that, not in spite of it: a lever whose failure
+    # mode is a dead engine and whose cause is unknown should cost somebody a
+    # deliberate keystroke. It is a TEST lever -- no production path drops the
+    # prefix cache -- so gating it costs nothing a workload needs.
+    "gpu_cache_drop_allowed": False,
 }
 
 # Knobs whose value must stay OUT of .env.dspark or the file cannot move them.
