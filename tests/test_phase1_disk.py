@@ -898,6 +898,31 @@ except Exception as _exc:
 eq("*** the migration is idempotent, so calling it per-entry costs nothing ***",
    _after, _before)
 
+print("== (5f2) a migration must repair bad VALUES, not just a bad shape ==")
+# *** THE FIRST ACCOUNTING FIX DID NOTHING ON THE BOX. *** It was deployed hot
+# onto an index that was ALREADY an OrderedDict -- built by the previous, broken
+# version -- so the type migration found nothing to convert and every entry kept
+# the cost 0 it had been given by code that could not compute one. Measured:
+# 523,194 keys, held 0.0 GB, byte_accounting_ok False, AFTER the fix.
+_vm = diskspec.DiskPresenceManager(_tmpspec.file_mapper(), num_workers=WORLD)
+_vk = base.make_offload_key(b"\xe6" * 32, 1)
+_vpath = _tmpspec.file_mapper().get_file_name(_vk)
+os.makedirs(os.path.dirname(_vpath), exist_ok=True)
+with open(_vpath, "wb") as _f:
+    _f.write(b"\0" * 2048)
+# the exact broken state: right TYPE, zero COSTS
+_vm._present[bytes(_vk)] = (0, 4)
+_vm._bytes = 0
+_vm.snapshot()                      # any entry point triggers the repair
+eq("*** zero-cost entries are RE-COSTED from the files ***",
+   _vm._present[bytes(_vk)][0], 2048)
+eq("...and the total is rebuilt", _vm._bytes, 2048)
+eq("...while the POSITION is preserved, not reset",
+   _vm._present[bytes(_vk)][1], 4)
+eq("...and the accounting now reads sound",
+   _vm.snapshot()["byte_accounting_ok"], True)
+os.unlink(_vpath)
+
 print("== (5g) byte accounting comes from a STAT, not from worker state ==")
 # *** THE FIRST VERSION ASKED THE LIVE HANDLER, WHICH LIVES IN THE WORKER. ***
 # This manager runs in the ENGINE CORE, so `_LIVE_HANDLERS` is always empty

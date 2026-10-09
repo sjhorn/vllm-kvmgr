@@ -607,6 +607,31 @@ class DiskPresenceManager(OffloadingManager):
                     len(migrated), self._bytes / 1e9)
         if not hasattr(self, "_bytes"):
             self._bytes = sum(nb for nb, _p in self._present.values())
+        # *** AND A VALUE-LEVEL REPAIR, NOT JUST A TYPE-LEVEL ONE. *** The
+        # first accounting fix was deployed hot onto an index that was ALREADY
+        # an OrderedDict -- built by the previous, broken version -- so the
+        # type migration above found nothing to do and every entry kept the
+        # cost 0 it had been given by code that could never compute one.
+        # Measured after that reload: 523,194 keys, held 0.0 GB,
+        # byte_accounting_ok False.
+        #
+        # A migration has to repair bad VALUES as well as a bad shape, or a fix
+        # only takes effect for keys stored after it. Cheap: _key_bytes caches
+        # per group, so this is five stats and a dictionary walk however many
+        # keys there are.
+        if self._present and self._bytes <= 0:
+            total = 0
+            for k, (nb, pos) in list(self._present.items()):
+                if nb <= 0:
+                    nb = self._key_bytes(k)
+                    self._present[k] = (nb, pos)
+                total += nb
+            self._bytes = total
+            logger.info(
+                "kvmgr: re-costed %d index entries that carried no byte cost "
+                "(%.1f GB) -- they were recorded by a version that read the "
+                "group sizes from the worker, which this process is not",
+                len(self._present), total / 1e9)
         if not hasattr(self, "_pos_hint"):
             self._pos_hint = {}
         if not hasattr(self, "_evicted_pending"):
