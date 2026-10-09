@@ -117,11 +117,29 @@ def model_dir(model: str, revision: "str | None" = None,
         return model
     if not model:
         return None
-    root = hub or _os.environ.get("HF_HUB_CACHE") or (
-        _os.path.join(_os.environ["HF_HOME"], "hub")
-        if _os.environ.get("HF_HOME") else "/models/hub")
-    repo = _os.path.join(root, "models--" + model.replace("/", "--"))
-    if not _os.path.isdir(repo):
+    # *** THE FALLBACK ORDER MATTERS, AND MY FIRST VERSION WAS BOX-SPECIFIC. ***
+    # It ended at "/models/hub", which is THIS deployment's bind mount -- so on
+    # any other machine the lookup would miss and the fingerprint would quietly
+    # degrade to `unknown`, i.e. the protection would silently not be there.
+    # huggingface_hub's own default is ~/.cache/huggingface/hub, so that comes
+    # first and the local convention is merely the last resort. Found by
+    # re-reading my own code for portability rather than by a failure.
+    candidates = [hub, _os.environ.get("HF_HUB_CACHE")]
+    if _os.environ.get("HF_HOME"):
+        candidates.append(_os.path.join(_os.environ["HF_HOME"], "hub"))
+    candidates.append(
+        _os.path.join(_os.path.expanduser("~"), ".cache", "huggingface", "hub"))
+    candidates.append("/models/hub")
+
+    repo = None
+    for root in candidates:
+        if not root:
+            continue
+        cand = _os.path.join(root, "models--" + model.replace("/", "--"))
+        if _os.path.isdir(cand):
+            repo = cand
+            break
+    if repo is None:
         return None
     commit = revision
     if commit:

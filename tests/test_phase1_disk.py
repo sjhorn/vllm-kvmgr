@@ -1286,6 +1286,41 @@ eq("*** a directory with NO safetensors is unknown rather than a hash of "
 eq("an unresolvable model id is unknown",
    diskspec.model_dir("no/such-model", None, _hub), None)
 
+print("== (P4) the hub lookup must not assume THIS box's layout ==")
+# *** MY FIRST VERSION ENDED AT "/models/hub", WHICH IS THIS DEPLOYMENT'S BIND
+# *** MOUNT. *** On any other machine the lookup would miss and the fingerprint
+# would quietly degrade to `unknown` -- the protection silently absent rather
+# than announced. huggingface_hub's own default is ~/.cache/huggingface/hub, so
+# that has to be tried before the local convention.
+_pt_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                            "diskspec.py")).read()
+# *** AND THE FIRST VERSION OF THIS CHECK FAILED FOR THE WRONG REASON. ***
+# It compared raw substring positions, and "/models/hub" appears in the COMMENT
+# above the code -- earlier in the file than the line it describes -- so the
+# lint read prose as code and failed against correct code. The digest already
+# records this one: strip comments first, or anchor on something only code can
+# produce. Here the honest anchor is the `candidates.append(...)` CALLS, which
+# are the order being asserted.
+_appends = [m.group(1) for m in _reP4.finditer(
+    r"candidates\.append\(\s*(.*?)\)\n", _pt_src, _reP4.S)]
+check("the append calls were located at all -- a regex that matches nothing "
+      "cannot fail", len(_appends) >= 2, _appends)
+_std_at = next((i for i, a in enumerate(_appends) if ".cache" in a), None)
+_box_at = next((i for i, a in enumerate(_appends) if "/models/hub" in a), None)
+check("*** the standard HF cache is appended BEFORE this box's convention, so "
+      "the local bind mount is only ever a last resort ***",
+      _std_at is not None and _box_at is not None and _std_at < _box_at,
+      (_std_at, _box_at, _appends))
+check("HF_HUB_CACHE is honoured", 'environ.get("HF_HUB_CACHE")' in _pt_src)
+check("...and HF_HOME", '"HF_HOME"' in _pt_src)
+# And the search must keep looking rather than stopping at the first ROOT that
+# does not hold this repo -- a single-root check would miss a model present in
+# a later candidate.
+_other = tempfile.mkdtemp(prefix="kvhub2-")
+eq("*** a candidate root without the repo is skipped, not fatal -- the search "
+   "continues to the next one ***",
+   diskspec.model_dir("org/mdl", None, _other), None)
+
 print("== (P4) the migration keeps the warm tier, and REFUSES past v1 ==")
 # *** STRENGTHENING A FINGERPRINT ORPHANS EVERYTHING UNDER THE OLD ONE, and on
 # *** this box that is 400 GB and 560,000 keys. *** The bytes are not wrong --
