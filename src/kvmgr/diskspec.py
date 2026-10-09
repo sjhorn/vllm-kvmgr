@@ -1208,14 +1208,40 @@ class DiskPresenceManager(OffloadingManager):
         # so the i-th key of a group is block i of that prefix. By the time
         # complete_store fires, that ordering is gone. Tail-first eviction is
         # impossible without it.
+        # *** INDEX OVER `keys`, NOT `todo`, AND THAT ONE WORD WAS THE BUG. ***
+        # `todo` is the NOT-PRESENT subset, so indexing it numbers the keys
+        # within THIS BATCH rather than within the prefix. For an incremental
+        # store -- a conversation growing, which is the common case -- blocks
+        # 50..60 of a prefix arrive as the only new ones and get pos 0..10, so a
+        # block deep in the prefix is labelled a HEAD while the genuine head
+        # from an earlier batch carries the same pos. Tail-first then orders on
+        # a number that means what the comment below claims only when an entire
+        # prefix arrives in one batch.
+        #
+        # Measured 2026-10-09: after evicting 150,358 keys, 41% of blocks
+        # offered were already on disk and 27 external lookups produced ZERO
+        # hits -- the data present and unreachable, because the "tail" being
+        # evicted was sometimes the head.
+        #
+        # `keys` is the full offered run (that is exactly why `todo` filters
+        # it), so the index within `keys` is the block's position in the prefix
+        # for its group. Recorded only for the keys actually being stored.
+        #
+        # HONEST LIMIT: this is the position within the OFFERED RUN. It equals
+        # the prefix position when the run starts at token 0, which is the shape
+        # the scheduler uses for a contiguous reuse match. It is not a promise
+        # about a run that starts elsewhere -- better, not perfect.
         try:
             from vllm.v1.kv_offload.base import get_offload_group_idx
+            _todo_set = {bytes(k) for k in todo}
             _seen: dict[int, int] = {}
-            for k in todo:
+            for k in keys:
                 g = get_offload_group_idx(k)
                 i = _seen.get(g, 0)
                 _seen[g] = i + 1
-                self._pos_hint[bytes(k)] = i
+                kb = bytes(k)
+                if kb in _todo_set:
+                    self._pos_hint[kb] = i
         except Exception:
             pass
 

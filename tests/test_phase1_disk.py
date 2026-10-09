@@ -1434,6 +1434,86 @@ except Exception as exc:
 check("*** _fingerprint works on an instance that never ran __init__ ***",
       isinstance(_got, dict) and _got.get("format_version") is not None, _got)
 
+print("== (P5) pos MUST be the position in the PREFIX, not in the batch ==")
+# *** THIS IS THE BUG THAT STRANDED A 300 GB CACHE. ***
+# `todo` is the NOT-PRESENT subset of `keys`, so indexing `todo` numbers keys
+# within THIS BATCH. For an incremental store -- a conversation growing, the
+# common case -- blocks 3..4 of a prefix are the only new ones and get pos
+# 0..1, labelling a block deep in the prefix as a HEAD. Tail-first eviction
+# then takes heads, and reuse is a contiguous run from token 0, so everything
+# behind a lost head becomes unreachable.
+#
+# Measured on the box: after evicting 150,358 keys, 41% of offered blocks were
+# already on disk and 27 external lookups produced ZERO hits.
+#
+# No existing test covered the incremental case, which is exactly why it
+# shipped: every other prepare_store test stores a whole run at once, where
+# indexing `todo` and indexing `keys` give the same answer.
+F.write(kvmgr_enabled=1, disk_restore=1, disk_budget_gb=0)
+_pm = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0), _KVCfg()).get_manager()
+
+# One group, five blocks, offered in prefix order.
+_run = [base.make_offload_key(bytes([0xA0 + n]) * 32, 0) for n in range(5)]
+
+# First store: the whole run is new, so batch position == prefix position and
+# the OLD code would also have been right here. This arm exists to prove the
+# fixture can express the RIGHT answer, not only the wrong one.
+_pm.prepare_store(_run, ctx)
+_pm.complete_store(_run, ctx)
+eq("a whole-run store records 0..4",
+   [_pm._present[bytes(k)][1] for k in _run], [0, 1, 2, 3, 4])
+
+# Now the incremental case: blocks 0..2 are already present, and only 3..4 are
+# new. The full run is still offered -- that is what `skipped_present` counts.
+_pm2 = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0), _KVCfg()).get_manager()
+_pm2.prepare_store(_run[:3], ctx)
+_pm2.complete_store(_run[:3], ctx)
+_pm2.prepare_store(_run, ctx)          # all five offered, three already held
+_pm2.complete_store(_run, ctx)
+_got = [_pm2._present[bytes(k)][1] for k in _run]
+eq("*** the LATER blocks keep their PREFIX positions 3 and 4 -- indexing the "
+   "batch would have labelled them 0 and 1, i.e. as heads ***",
+   _got[3:], [3, 4])
+eq("...and the whole run reads as a prefix, 0..4", _got, [0, 1, 2, 3, 4])
+
+# And the consequence that actually matters: with correct positions, the victim
+# order takes the TAIL of the prefix, so the head survives and the prefix still
+# hits. That is the entire point of tail-first.
+_items = [(bytes(k), 1000, _got[n], 0) for n, k in enumerate(_run)]
+_victims = diskspec.choose_victims(_items, 2000)
+eq("*** tail-first evicts the LAST blocks, leaving the head intact ***",
+   _victims, [bytes(_run[4]), bytes(_run[3])])
+check("...so block 0 -- the head -- is never among the first victims",
+      bytes(_run[0]) not in _victims, _victims)
+
+# *** AND pos MUST ONLY BE RECORDED FOR KEYS WE ARE STORING, or `_pos_hint`
+# *** LEAKS. *** Entries leave it only via the `pop` in complete_store, so an
+# entry written for an ALREADY-PRESENT key is never removed. The scheduler
+# re-offers present keys constantly -- 6,801 of them in half an hour on the
+# box -- so this would grow without bound on the scheduler's own path. Not a
+# correctness bug, which is why the position assertions above cannot see it:
+# a memory one, found by break-verification asking what the `if` was for.
+# *** AND THE SCENARIO HAS TO BE THE MIXED ONE. *** My first attempt offered a
+# run whose keys were ALL present, and `prepare_store` returns at
+# `if not todo` BEFORE the position loop -- so the loop never ran and the test
+# could not see the leak however broken the code was. The leak needs `todo`
+# non-empty AND some keys present, which is the incremental case again.
+_pm3 = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0), _KVCfg()).get_manager()
+_pm3.prepare_store(_run[:3], ctx)
+_pm3.complete_store(_run[:3], ctx)
+eq("after a completed store, no position hints are left over",
+   len(_pm3._pos_hint), 0)
+for _ in range(5):
+    # Three present, two new: the loop runs, and only the two NEW keys may be
+    # recorded. Recording all five would leave three behind on every pass.
+    _pm3.prepare_store(_run, ctx)
+check("*** a mixed store records hints only for the keys being STORED -- five "
+      "passes and at most the two new ones are outstanding ***",
+      len(_pm3._pos_hint) <= 2, len(_pm3._pos_hint))
+_pm3.complete_store(_run, ctx)
+eq("...and completing the store leaves the map empty, so nothing accumulates",
+   len(_pm3._pos_hint), 0)
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()
 if FAIL:
