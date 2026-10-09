@@ -840,6 +840,64 @@ eq("...carrying plain bytes, because a numpy scalar in a serialised structure "
 eq("...and an empty delete list is empty, not None",
    diskspec.DiskLoadStoreSpec([]).to_delete, [])
 
+print("== (5f) A LEGACY-SHAPED MANAGER: every public method must survive ==")
+# *** THE REBIND TRAP, SIXTH TIME, AND THIS ONE CHANGED A TYPE. *** A reload
+# never runs __init__, so a live manager keeps whatever its OLD constructor
+# built. The first five instances were MISSING attributes; Phase 5 turned
+# `_present` from a set into an OrderedDict, so a rebound manager had a set
+# (no move_to_end) and no `_bytes` at all:
+#
+#   AttributeError: 'DiskPresenceManager' object has no attribute '_bytes'
+#     -- fatal to the scheduler, measured on the box
+#
+# Five getattrs would have been five more chances to miss one. This is the
+# GENERAL guard I should have written after the first instance: build the worst
+# legacy shape and drive EVERY public entry point through it.
+_legacy = diskspec.DiskPresenceManager(_tmpspec.file_mapper(), num_workers=WORLD)
+_lk = base.make_offload_key(b"\xc3" * 32, 0)
+# the worst case: a bare set, and none of the Phase 5 attributes
+_legacy._present = {bytes(_lk)}
+for _attr in ("_bytes", "_pos_hint", "_evicted_pending", "_gcounts"):
+    if hasattr(_legacy, _attr):
+        delattr(_legacy, _attr)
+
+_failures = []
+for _name, _call in (
+    ("lookup", lambda: _legacy.lookup(_lk, ctx)),
+    ("touch", lambda: _legacy.touch([_lk], ctx)),
+    ("prepare_store", lambda: _legacy.prepare_store([_lk], ctx)),
+    ("complete_store", lambda: _legacy.complete_store([_lk], ctx)),
+    ("snapshot", lambda: _legacy.snapshot()),
+    ("take_events", lambda: list(_legacy.take_events())),
+):
+    try:
+        _call()
+    except Exception as _exc:
+        _failures.append("%s: %r" % (_name, _exc))
+eq("*** every public method survives a legacy-shaped (rebound) manager ***",
+   _failures, [])
+_migrated = isinstance(_legacy._present, type(diskspec.OrderedDict()))
+check("...and the set was migrated to the ordered index, not discarded",
+      _migrated)
+check("...keeping the key it already held", bytes(_lk) in _legacy._present)
+# Guarded: without the migration `_present` is still a set, and subscripting it
+# raises TypeError which would ABORT the file rather than report. The mutation
+# is already caught by the assertion above; this must not turn a caught
+# mutation into a crash.
+eq("...with position UNKNOWN (-1), not a fabricated 0",
+   (_legacy._present[bytes(_lk)][1] if _migrated else "NOT MIGRATED"), -1)
+check("...and a byte total exists afterwards", hasattr(_legacy, "_bytes"))
+
+# migration must be idempotent -- it runs at the top of every entry point
+_before = dict(_legacy._present) if _migrated else None
+try:
+    _legacy.lookup(_lk, ctx); _legacy.snapshot(); _legacy.touch([_lk], ctx)
+    _after = dict(_legacy._present) if _migrated else None
+except Exception as _exc:
+    _after = "RAISED: %r" % (_exc,)
+eq("*** the migration is idempotent, so calling it per-entry costs nothing ***",
+   _after, _before)
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()
 if FAIL:

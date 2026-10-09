@@ -566,6 +566,54 @@ class DiskPresenceManager(OffloadingManager):
         if manifest_path:
             self._load_manifest()
 
+    def _ensure_index(self) -> None:
+        """Migrate a REBOUND manager's state in place. Idempotent, cheap.
+
+        *** A RELOAD NEVER RUNS __init__ -- SIXTH TIME, and this one is worse
+        *** than the other five. *** They were MISSING attributes; Phase 5 also
+        CHANGED A TYPE: `_present` went from a `set` to an `OrderedDict` so it
+        could carry a byte cost and a block position. A rebound live manager
+        keeps the old set, so `move_to_end` does not exist and `_bytes` was
+        never assigned. Measured on the box, fatal to the scheduler:
+
+            AttributeError: 'DiskPresenceManager' object has no attribute
+            '_bytes'
+
+        A getattr at each site would be six more chances to miss one, so the
+        migration is ONE function called at the top of every entry point, and a
+        test drives every public method against a deliberately legacy-shaped
+        instance. *** A STATE TYPE CHANGE IS NOT HOT-RELOADABLE BY DEFAULT ***
+        -- this is what makes it so.
+        """
+        pres = getattr(self, "_present", None)
+        if not isinstance(pres, OrderedDict):
+            migrated = OrderedDict()
+            self._present = migrated
+            self._bytes = 0
+            for k in (pres or ()):        # a legacy set: order is unknown
+                kb = bytes(k)
+                nb = self._key_bytes(kb)
+                # Position -1 means UNKNOWN, which sorts before 0 under the
+                # tail-first tie-break and so makes these the LAST victims of
+                # their age. Conservative on purpose: any of them might be a
+                # prefix head, and evicting a head orphans everything behind it.
+                migrated[kb] = (nb, -1)
+                self._bytes += nb
+            if migrated:
+                logger.info(
+                    "kvmgr: migrated a legacy presence set of %d keys to the "
+                    "ordered index (%.1f GB); positions unknown, so they are "
+                    "the last victims of their age",
+                    len(migrated), self._bytes / 1e9)
+        if not hasattr(self, "_bytes"):
+            self._bytes = sum(nb for nb, _p in self._present.values())
+        if not hasattr(self, "_pos_hint"):
+            self._pos_hint = {}
+        if not hasattr(self, "_evicted_pending"):
+            self._evicted_pending = []
+        if not hasattr(self, "_gcounts"):
+            self._gcounts = {}
+
     def _key_bytes(self, key: bytes) -> int:
         """On-disk cost of one key, from its GROUP -- never a stat() call.
 
@@ -739,6 +787,7 @@ class DiskPresenceManager(OffloadingManager):
 
     # -- reads ------------------------------------------------------------
     def lookup(self, key: "OffloadKey", req_context: "ReqContext") -> bool | None:
+        self._ensure_index()
         self._stats["lookup"] += 1
         # One-shot, and `lookup` is the right place: it is called by the
         # connector scheduler on every request whether or not the store path is
@@ -798,6 +847,7 @@ class DiskPresenceManager(OffloadingManager):
         # fills a block -- the `paused` counter climbing proves it is called
         # even with the tier paused, since the gate below is OURS and sits
         # inside the call rather than preventing it.
+        self._ensure_index()
         if not _LIVE_OFFLOAD_SCHED:
             capture_offload_sched_from_caller()
         # *** INSTALLED UNCONDITIONALLY, and gating it was a real bug. ***
@@ -922,6 +972,7 @@ class DiskPresenceManager(OffloadingManager):
     def complete_store(
         self, keys: "Collection[OffloadKey]", req_context: "ReqContext"
     ) -> None:
+        self._ensure_index()
         new = [k for k in keys if bytes(k) not in self._present]
         for k in new:
             # The position was recorded when the key was OFFERED, because that
@@ -961,6 +1012,7 @@ class DiskPresenceManager(OffloadingManager):
         of one prefix together is what gives them a shared recency, which is
         what makes the tail-first tie-break in choose_victims meaningful.
         """
+        self._ensure_index()
         for k in keys:
             kb = bytes(k)
             if kb in self._present:
@@ -1044,6 +1096,7 @@ class DiskPresenceManager(OffloadingManager):
         # forever means the present filter never matches.
         # getattr, for the same rebind reason as _count_groups: a reloaded
         # class on a live instance has no __init__-assigned attributes.
+        self._ensure_index()
         by_group = {
             what: {str(g): n for g, n in sorted(d.items())}
             for what, d in sorted(getattr(self, "_gcounts", {}).items())
