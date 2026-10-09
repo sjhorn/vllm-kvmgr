@@ -896,9 +896,82 @@ def _router():
         """
         from . import flags
 
+        # *** THE SCHEDULER-SIDE GUARD IS NOT ENOUGH, AND THE DROP CRASHED THE
+        # *** HEAD AGAIN ON 2026-10-09 AT 17:51 WITH THAT GUARD LIVE.
+        #
+        # Reproduced deliberately (local-ops/kvdroploop.sh): eight drop/restore
+        # cycles at a 20K prefix were clean, and the FIRST cycle at 100K
+        # faulted -- Xid 32, Worker_TP0, `unspecified launch failure` at
+        # synchronize_input_prep, two seconds after a drop that logged
+        # `reset OK`. So SCALE is the trigger, and the log named the cause in
+        # two lines twenty seconds apart:
+        #
+        #   17:50:58 (Worker_TP0) store path busy -- 2 job(s) outstanding
+        #   17:51:18 (EngineCore)  drop -- free 22280 -> 22755, reset OK
+        #
+        # manager.py refuses on `offload_sched_snapshot()`, which reads
+        # `cs._jobs` -- the SCHEDULER's dict. But our handler queues a job of
+        # any size and pumps it over ROUNDS from `get_finished()` (the chunking
+        # fix Phase 1c needed), keeping its own `_jobs`, `_writing` and
+        # `_reading` in the WORKER PROCESS. Those are the copies actually
+        # touching GPU memory, and nothing scheduler-side can see them. This is
+        # the file's own "idle by request count is not idle by transfer" trap
+        # one layer deeper: idle by SCHEDULER JOB SET is not idle by WORKER
+        # TRANSFER either, and each time the remedy has been to ask the thing
+        # that actually knows.
+        #
+        # `kvmgr_snapshot` already returns both handlers' counts per rank and
+        # `/kv/workers` already serves them, so nothing is being built here --
+        # the quantity existed and the dangerous lever never asked for it.
+        #
+        # Refuse rather than wait, as manager.py does: a drop is an operator
+        # action with a human behind it and the remedy is seconds of patience.
+        # And refuse on an UNREADABLE answer too -- ABSENT IS NOT ZERO, and for
+        # this lever being wrong costs a dead worker and a lost prefill, so
+        # "I cannot tell" must never read as "nothing in flight".
+        try:
+            ranks = await engine_client(raw_request).collective_rpc(
+                method="kvmgr_snapshot", args=(), kwargs={})
+        except Exception as e:
+            return JSONResponse(status_code=409, content={
+                "ok": False, "refused": "worker_transfers_unknown",
+                "error": str(e),
+                "note": "Could not read the workers' handler state, so whether "
+                        "a DMA is reading GPU blocks right now is UNKNOWN, not "
+                        "zero. Refusing: this is the lever that killed a worker "
+                        "twice. Retry, or look at /kv/workers."})
+        # A RAISING GUARD MUST NOT BECOME A 500 -- and it must not become a
+        # permitted drop either. Found by mutation M6 in
+        # test_phase7_dropguard.py: breaking the non-dict-rank branch makes the
+        # helper raise instead of returning, and an unhandled raise here would
+        # surface as a server error on the one lever whose failure costs a
+        # worker. Treat it as the strongest form of "I cannot tell".
+        try:
+            busy = _transfers_busy(ranks)
+        except Exception as e:
+            return JSONResponse(status_code=409, content={
+                "ok": False, "refused": "worker_transfers_unreadable",
+                "error": repr(e),
+                "note": "Reading the per-rank transfer counts RAISED, so "
+                        "whether a DMA is in flight is unknown. Refusing, for "
+                        "the same reason as the unknown case above."})
+        if busy:
+            return JSONResponse(status_code=409, content={
+                "ok": False, "refused": "worker_transfers_outstanding",
+                "busy": busy,
+                "note": "One or more RANKS still hold KV transfer jobs. A store "
+                        "copies GPU -> pinned staging; free its source block "
+                        "mid-copy and the DMA reads what is no longer there -- "
+                        "Xid 32, with the traceback landing at "
+                        "synchronize_input_prep, nowhere near the cause. Wait "
+                        "for these to reach zero and bump again. The "
+                        "scheduler-side count can be 0 while these are not, "
+                        "which is exactly how 2026-10-09 17:51 happened."})
+
         nxt = int(flags.raw("gpu_cache_epoch") or 0) + 1
         out = await _fanout(raw_request, "kvmgr_set_knob",
                             {"name": "gpu_cache_epoch", "value": nxt})
+        out["worker_transfers"] = "drained -- checked per rank before the bump"
         out["epoch"] = nxt
         out["note"] = (
             "The drop lands on the next SCHEDULER STEP, so an idle engine has "
@@ -909,6 +982,85 @@ def _router():
         return JSONResponse(status_code=200, content=out)
 
     return router
+
+
+# The counted fields, named once rather than copied. A handler holding ANY of
+# these is touching GPU memory or about to: `jobs_open` is queued-or-running
+# rounds, `writes_open` are store rounds whose file write has not finished (so
+# their staging slots are still held), `reads_open` the same on the load side.
+_BUSY_FIELDS = ("jobs_open", "writes_open", "reads_open")
+
+
+def _transfers_busy(ranks) -> list:
+    """Per-rank outstanding transfer counts, or an UNREADABLE marker.
+
+    *** THE SHAPE IS A LIST UNDER "handlers", KEYED BY "cls", AND MY FIRST
+    *** VERSION LOOKED FOR "disk_store"/"disk_load" DICT KEYS. ***
+    It would have found nothing on every rank, returned empty, and let every
+    drop through -- a refusal that cannot fire, which is this repo's
+    invisible-icon failure in a new costume and precisely the class of bug this
+    guard exists to prevent. Found by reading `kvmgr_snapshot` rather than
+    assuming its shape, and pinned by test_phase7_dropguard.py, whose first
+    mutation is exactly that wrong key.
+
+    Pure, and separate from the route, because the one thing that must never
+    happen is an empty return for any reason other than "every rank is idle".
+    An unreadable rank -- a non-dict payload, a missing handler list, a non-int
+    count -- is therefore reported as BUSY with `unreadable: True` rather than
+    skipped. A rank we cannot parse is a rank we cannot clear.
+    """
+    busy: list = []
+    if not isinstance(ranks, (list, tuple)):
+        return [{"rank": None, "unreadable": True,
+                 "why": "collective_rpc returned %s, not a per-rank list"
+                        % type(ranks).__name__}]
+    if not ranks:
+        return [{"rank": None, "unreadable": True,
+                 "why": "collective_rpc returned NO ranks, which cannot mean "
+                        "that every rank is idle"}]
+    for i, r in enumerate(ranks):
+        if not isinstance(r, dict):
+            busy.append({"rank": i, "unreadable": True,
+                         "why": "rank payload is %s, not a dict"
+                                % type(r).__name__})
+            continue
+        rank = r.get("rank", i)
+        handlers = r.get("handlers")
+        if handlers is None:
+            # kvmgr_snapshot records a failure in place of the list, so this is
+            # "we could not look", never "there are no handlers".
+            busy.append({"rank": rank, "unreadable": True,
+                         "why": "no 'handlers' in the rank snapshot (%s)"
+                                % (r.get("handlers_error") or "no reason given")})
+            continue
+        if not isinstance(handlers, (list, tuple)):
+            busy.append({"rank": rank, "unreadable": True,
+                         "why": "'handlers' is %s, not a list"
+                                % type(handlers).__name__})
+            continue
+        counts: dict = {}
+        for h in handlers:
+            if not isinstance(h, dict):
+                busy.append({"rank": rank, "unreadable": True,
+                             "why": "a handler entry is %s, not a dict"
+                                    % type(h).__name__})
+                continue
+            cls = h.get("cls") or "handler"
+            for f in _BUSY_FIELDS:
+                if f not in h:
+                    continue
+                v = h.get(f)
+                # bool is an int subclass, so True here would be a SHAPE change
+                # reported as a quantity. Unreadable, not 1.
+                if isinstance(v, bool) or not isinstance(v, int):
+                    busy.append({"rank": rank, "unreadable": True,
+                                 "why": "%s.%s is %r, not an int" % (cls, f, v)})
+                    continue
+                if v:
+                    counts["%s.%s" % (cls, f)] = v
+        if counts:
+            busy.append({"rank": rank, "counts": counts})
+    return busy
 
 
 def _apply_locally_reported(method: str, kwargs: dict) -> dict:
