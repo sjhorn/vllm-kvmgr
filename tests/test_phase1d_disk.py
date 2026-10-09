@@ -343,8 +343,39 @@ try:
     check("the shim installs",
           getattr(_FakeEncoder.enc_hook, "_kvmgr_wrapped", False))
     reg._install_serializer_shim()
-    check("...and is idempotent",
+    reg._install_serializer_shim()
+    check("...and re-installing leaves it wrapped",
           getattr(_FakeEncoder.enc_hook, "_kvmgr_wrapped", False))
+    # *** RE-INSTALL MUST REPLACE, NEVER STACK. *** The shim is now
+    # re-installable so a hot reload can UPDATE it -- the early return was
+    # right about idempotence and wrong about updates, and it cost two
+    # four-minute restarts in one session. But wrapping a wrapper would run
+    # every old scan as well and call upstream's hook once per layer, so the
+    # install unwraps first. Three installs, then count the pass-throughs.
+    check("...and carries its original, which is what makes replacing safe",
+          getattr(_FakeEncoder.enc_hook, "_kvmgr_original", None) is not None)
+    # *** AND THE FIRST VERSION OF THIS GUARD WAS VACUOUS. *** It counted
+    # calls into upstream's hook after three installs and asserted 1 -- but
+    # STACKED wrappers also reach the real hook exactly once, because each
+    # layer delegates inward and only the innermost calls upstream. The count
+    # is identical whether the wrappers replaced or stacked, so the assertion
+    # could not fail. Break-verification caught it: removing the unwrap left
+    # the whole suite green.
+    #
+    # The discriminator is STRUCTURAL: after a correct replace, the recorded
+    # original is upstream's own function; after a stack, it is OUR previous
+    # wrapper.
+    check("*** the recorded original is NOT itself one of our wrappers -- a "
+          "stack would run every old scan as well ***",
+          not getattr(getattr(_FakeEncoder.enc_hook, "_kvmgr_original", None),
+                      "_kvmgr_wrapped", False))
+    _calls.clear()
+    try:
+        _FakeEncoder().enc_hook(object())
+    except Exception:
+        pass
+    eq("...and upstream's hook is still reached exactly once", len(_calls), 1)
+    _calls.clear()
 
     enc = _FakeEncoder()
 
@@ -535,9 +566,13 @@ try:
 
     _clk = _Clock()
     _real_time, reg3._time = reg3._time, _clk
+    # info() is CAPTURED, not discarded: the arm and exhausted lines are the
+    # evidence that the scan ran, and a test that threw them away could not
+    # tell a clean output path from a scan that never fired.
+    _infoed = []
     _real_log, reg3.logger = reg3.logger, _t3.SimpleNamespace(
         warning=lambda *a, **k: _warned.append(a[0] % tuple(a[1:])),
-        info=lambda *a, **k: None,
+        info=lambda *a, **k: _infoed.append(a[0] % tuple(a[1:])),
         exception=lambda *a, **k: _warned.append("EXCEPTION"))
     try:
         reg3._install_serializer_shim()
@@ -575,6 +610,46 @@ try:
         enc3.encode_into(_Dirty(), buf)
         eq("...and it stops once found, so one path is reported not thousands",
            len(_warned), _found)
+
+        # *** A ZERO MUST BE A MEASUREMENT, NOT SILENCE. *** With nothing
+        # logged unless a scalar is found, "no PRODUCER line" means EITHER the
+        # output path is clean OR the scan never ran -- and the version before
+        # this one genuinely never ran usefully, so the ambiguity is not
+        # hypothetical. The scan says when it arms and when its budget is
+        # spent, so absence is reportable.
+        check("*** the scan ANNOUNCES that it armed, so a later zero is a "
+              "measurement rather than silence ***",
+              any("producer scan ARMED" in w for w in _infoed), _infoed)
+
+        _infoed.clear()
+        _warned.clear()
+        _clk2 = _Clock()
+        _real_lim, reg3._SCAN_LIMIT = reg3._SCAN_LIMIT, 3
+
+        class _Enc5:
+            def enc_hook(self, obj):
+                raise TypeError("not serializable")
+
+            def encode_into(self, obj, buf, *a, **kw):
+                return b""
+
+        _su3.MsgpackEncoder = _Enc5
+        reg3._time = _clk2
+        try:
+            reg3._install_serializer_shim()
+            enc5 = _Enc5()
+            for _ in range(6):
+                _clk2.t += 6.0
+                enc5.encode_into(_Clean(), buf)
+            check("*** and it says so when the budget is SPENT with nothing "
+                  "found -- the scan ran, which is a different claim from "
+                  "nothing being there ***",
+                  any("producer scan EXHAUSTED" in w for w in _infoed), _infoed)
+            eq("...and found nothing, so no PRODUCER line", 
+               [w for w in _warned if "PRODUCER" in w], [])
+        finally:
+            reg3._SCAN_LIMIT = _real_lim
+            reg3._time = _clk
     finally:
         reg3._time, reg3.logger = _real_time, _real_log
 
@@ -606,6 +681,30 @@ try:
         check("*** 40 encodes inside one spacing interval cost ONE walk, not "
               "40 -- this runs in the engine's output thread ***",
               len(_scans) == 1, len(_scans))
+
+        # *** THE encode_into SIDE FAILS DIFFERENTLY, AND A WALK COUNT CANNOT
+        # *** SEE IT. *** Dropping its unwrap does not STACK anything: the
+        # re-wrap guard sees an already-wrapped function and skips, so the
+        # class silently keeps the OLD closure -- which is exactly the
+        # un-updatability this change exists to remove, and the walk count is
+        # 1 either way. Break-verification caught that the count assertion
+        # could not fail. The discriminator is IDENTITY: a real re-install
+        # leaves a different function object on the class.
+        _before = _Enc4.encode_into
+        reg3._install_serializer_shim()
+        check("*** a re-install REPLACES encode_into -- otherwise the class "
+              "keeps the old closure and the shim cannot be updated without a "
+              "restart, which is the whole point ***",
+              _Enc4.encode_into is not _before)
+        check("...and the replacement's original is upstream's own function, "
+              "not our previous wrapper",
+              not getattr(getattr(_Enc4.encode_into, "_kvmgr_original", None),
+                          "_kvmgr_wrapped", False))
+        _scans.clear()
+        _clk.t += 100.0
+        _Enc4().encode_into(_Clean(), buf)
+        check("...and one encode still costs one walk", len(_scans) == 1,
+              len(_scans))
     finally:
         reg3._numpy_paths = _real_walk
         reg3._time = _real_time2

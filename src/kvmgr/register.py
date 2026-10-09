@@ -367,9 +367,36 @@ def _install_serializer_shim() -> None:
         logger.info("kvmgr: no MsgpackEncoder to shim (upstream layout differs)")
         return
     try:
+        # *** A SHIM THAT CAN ONLY BE INSTALLED ONCE PER PROCESS IS A
+        # *** DIAGNOSTIC THAT NEEDS A RESTART TO CHANGE. ***
+        # The early return here was correct about idempotence and wrong about
+        # UPDATES: `importlib.reload` re-executes this module, but the class
+        # attribute still held the OLD closure, so every change to the shim or
+        # the producer scan cost a ~4-minute boot plus a cold prefill. That
+        # happened twice in one session -- once for the scan's window, once for
+        # its own observability. Same family as "a knob whose OFF state needs a
+        # boot is not a knob", and as "THE RELOADER IS ITSELF THE OLD VERSION".
+        #
+        # So UNWRAP FIRST, then wrap fresh. The original is carried on the
+        # wrapper itself, which is the only place that survives a reload --
+        # a module global would be reset by the very reload we are serving.
         original = cls.enc_hook
         if getattr(original, "_kvmgr_wrapped", False):
-            return
+            original = getattr(original, "_kvmgr_original", None)
+            if original is None:
+                # Wrapped by something that is not us, or by a version that
+                # did not record its original. Refuse rather than wrap a
+                # wrapper: stacking them would call the old scan as well.
+                logger.warning(
+                    "kvmgr: enc_hook is already wrapped and carries no "
+                    "original -- leaving it alone. The shim is live; a CHANGE "
+                    "to it needs a restart.")
+                return
+        _cur_enc = getattr(cls, "encode_into", None)
+        if getattr(_cur_enc, "_kvmgr_wrapped", False):
+            _prev_enc = getattr(_cur_enc, "_kvmgr_original", None)
+            if _prev_enc is not None:
+                cls.encode_into = _prev_enc
         seen: set = set()
         root: dict = {}
 
@@ -409,6 +436,20 @@ def _install_serializer_shim() -> None:
                     if now - root.get("last", 0.0) >= _SCAN_EVERY_S:
                         root["last"] = now
                         root["scan"] = root.get("scan", 0) + 1
+                        # *** SILENCE IS NOT SUCCESS, AND THE FIRST TWO
+                        # *** VERSIONS OF THIS SCAN OFFERED ONLY SILENCE. ***
+                        # With nothing logged unless a scalar is found, "no
+                        # PRODUCER line" means EITHER the output path is clean
+                        # OR the scan never ran -- and the previous version
+                        # genuinely never ran usefully, so that ambiguity is
+                        # not hypothetical. One line when it arms and one when
+                        # the budget is spent turn a zero into a MEASUREMENT.
+                        if root["scan"] == 1:
+                            logger.info(
+                                "kvmgr: producer scan ARMED -- sampling the "
+                                "encoded output object at most once every "
+                                "%.0fs, up to %d samples, stopping at the "
+                                "first find.", _SCAN_EVERY_S, _SCAN_LIMIT)
                         try:
                             paths = _numpy_paths(obj, limit=6, max_depth=6,
                                                  max_nodes=20000)
@@ -419,10 +460,26 @@ def _install_serializer_shim() -> None:
                                     "scanning encode sample #%d, before any "
                                     "coercion) -- %s",
                                     root["scan"], "; ".join(paths))
+                            elif root["scan"] >= _SCAN_LIMIT:
+                                logger.info(
+                                    "kvmgr: producer scan EXHAUSTED -- %d "
+                                    "samples of the encoded output, no numpy "
+                                    "scalar reachable by attribute from any "
+                                    "of them. That is a measurement, not an "
+                                    "absence: the scan ran. A scalar held by "
+                                    "a C extension, or one that only appears "
+                                    "in a window no sample landed in, would "
+                                    "still be invisible here -- the coercion "
+                                    "walk remains the backstop.",
+                                    root["scan"])
                         except Exception:
                             root["found"] = True  # never scan in a loop
+                            logger.exception(
+                                "kvmgr: the producer scan raised and is now "
+                                "off for this process")
                 return orig_encode(self, obj, buf, *a, **kw)
             encode_into._kvmgr_wrapped = True
+            encode_into._kvmgr_original = orig_encode
             cls.encode_into = encode_into
 
         def enc_hook(self, obj):
@@ -452,6 +509,7 @@ def _install_serializer_shim() -> None:
             return original(self, obj)
 
         enc_hook._kvmgr_wrapped = True
+        enc_hook._kvmgr_original = original
         cls.enc_hook = enc_hook
         logger.info(
             "kvmgr: serializer shim installed -- a numpy scalar in the output "
