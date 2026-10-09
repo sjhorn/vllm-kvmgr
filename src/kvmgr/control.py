@@ -480,6 +480,17 @@ def reload_modules() -> dict:
         # this repo's signature failure: a mechanism present, correct-looking
         # and producing nothing. Idempotent via _watchdog_started, which is in
         # _PRESERVE, so a reload on an already-watched process is a no-op.
+        # *** AND RE-INSTALL THE SERIALIZER SHIM, which was missing here and
+        # *** made the shim un-updatable without a restart. *** The shim is
+        # installed from `register()`, which a reload never calls, so a hot
+        # deploy of a change to it installed the code and changed nothing --
+        # the signature failure this file's own comment names three lines up,
+        # committed in the same function. It cost two four-minute restarts in
+        # one session. Safe to call repeatedly: the installer unwraps its own
+        # previous wrapper before re-wrapping, and the test that proves it
+        # replaced rather than stacked is in test_phase1d_disk.py.
+        _reg._install_serializer_shim()
+        report["serializer_shim_reinstalled"] = True
         _dio = _il2.import_module("kvmgr.diskio")
         _dio._start_watchdog()
         report["watchdog_armed"] = bool(_dio._watchdog_started)

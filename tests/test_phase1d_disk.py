@@ -716,6 +716,63 @@ finally:
             _s3.modules.pop(_k, None)
 
 
+print("== the reload must RE-ARM every installer, audited not listed ==")
+# *** A RELOAD NEVER CALLS `register()`, SO ANYTHING INSTALLED FROM THERE IS
+# *** CODE A HOT DEPLOY CANNOT UPDATE. ***
+# `_install_serializer_shim` was missing from control.py's re-arm block, so a
+# hot deploy of the shim installed the code and changed nothing -- the
+# signature failure of this project, in the same function whose own comment
+# names it for the watchdog. Two four-minute restarts in one session.
+#
+# *** AND A HAND-WRITTEN LIST IS WHAT LET IT HAPPEN, so this AUDITS the module
+# *** instead. *** Same lesson as the _PRESERVE table: a list of names passed
+# while three real ones were unprotected. Every `_install_*` / `_start_*` in
+# register.py must appear in control.py's reload path, or be named here WITH A
+# REASON -- so adding one and forgetting the re-arm is a NAMED failure rather
+# than a feature that silently needs a restart. The audit found two more the
+# moment it was written.
+import re as _re4
+import os as _os4
+
+_REPO4 = _os4.path.dirname(_os4.path.dirname(_os4.path.dirname(
+    _os4.path.abspath(__file__))))
+_reg_src = open(_os4.path.join(_REPO4, "patches", "kvmgr_plugin", "kvmgr",
+                               "register.py")).read()
+_ctl_src = open(_os4.path.join(_REPO4, "patches", "kvmgr_plugin", "kvmgr",
+                               "control.py")).read()
+
+_EXEMPT = {
+    # Wraps EngineCore.step one-shot to find the offload scheduler. The wrap
+    # lives on the class, which the reload keeps, and the one-shot flag is in
+    # _PRESERVE -- so re-arming would be a no-op at best.
+    "_install_offload_scheduler_hook",
+    # Attaches the HTTP routes to the app the API server built, plus the Worker
+    # and EngineCore wraps. Re-attaching would DUPLICATE routes on an app that
+    # already has them -- and it is the very surface serving the reload
+    # request. The wraps are already on their classes, which the reload keeps.
+    "_install_control_plane",
+    # Takes a `manager_cls` argument the reload has no business choosing, and
+    # wraps KVCacheCoordinator.__init__ -- which runs ONCE, at boot. The
+    # geometry it stamps is class state carried by _PRESERVE_CLASS, so there is
+    # nothing for a re-arm to recover.
+    "_install_group_geometry_hook",
+}
+
+_installers = sorted(set(_re4.findall(r"^def (_(?:install|start)_\w+)\(",
+                                      _reg_src, _re4.M)))
+check("the audit found installers to check at all -- a regex that matches "
+      "nothing is a lint that cannot fail", len(_installers) >= 2, _installers)
+
+_missing = [f for f in _installers
+            if f not in _EXEMPT and (f + "()") not in _ctl_src]
+eq("*** every installer in register.py is re-armed by the reload, or exempt "
+   "with a reason ***", _missing, [])
+
+# The exemptions must be real functions, so a rename cannot leave a stale
+# excuse behind that silently exempts nothing.
+_stale = [f for f in _EXEMPT if f not in _installers]
+eq("...and no exemption names a function that no longer exists", _stale, [])
+
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print("  FAILED:", f)
