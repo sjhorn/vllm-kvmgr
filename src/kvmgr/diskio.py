@@ -236,6 +236,26 @@ def staging_plan(pool_capacity: int, slots_knob: int, write_floor_knob: int,
     return size, _floor(write_floor_knob), _floor(read_floor_knob)
 
 
+def _load_batch_max() -> int:
+    """Max blocks in ONE staging->GPU `transfer_async`. Hot.
+
+    ~256 faults the worker with Xid 13; 224 and below are measured clean. The
+    default is deliberately below the measured-clean ceiling rather than at it,
+    because the threshold is only bracketed to (224, 256] and a limit sitting
+    exactly on the last value that happened to work is not a margin.
+
+    An unreadable knob must never stop a restore, so a bad value falls back to
+    the default rather than raising -- but 0 or negative would mean "no blocks
+    ever", so those fall back too.
+    """
+    try:
+        from kvmgr import flags as _f
+        v = int(_f.peek("load_batch_max") or 0)
+        return v if v > 0 else 192
+    except Exception:
+        return 192
+
+
 def staging_knobs(pool_capacity: int) -> tuple[int, int, int]:
     """`staging_plan` against the live flags. Imported locally, matching this
     file's style and keeping `flags` out of the module's import graph."""
@@ -1924,7 +1944,24 @@ class DiskLoadHandler:
                 # No reserve: see the store's _pump. This pool is the LOAD's
                 # alone now, so a write floor inside it would starve the load to
                 # protect a direction that cannot reach it.
-                slots = self._pool.take_upto(len(bids))
+                # *** BOUND THE BATCH, because ~256 blocks in ONE
+                # *** transfer_async FAULTS THE WORKER with Xid 13.
+                # Measured 2026-10-10 by walking the hot `staging_load_slots`
+                # knob up against a 327-key restore: 96, 128, 160, 192 and 224
+                # are all clean at 1-2s, and 256 faults on the first attempt
+                # (engine dead, worker or head Xid 13). Five clean arms then a
+                # hard failure at exactly 256 looks like a 256-entry limit
+                # somewhere in upstream's batch copy rather than gradual
+                # resource exhaustion.
+                #
+                # The working configuration before this was `staging_load_blocks
+                # = 64`, which was an arbitrary QUARTER of the store's pool and
+                # happened to be under the limit. That is not a safety property:
+                # a pool resize would have silently restored the fault. The cap
+                # is explicit and independent of the pool now, so the pool can
+                # be sized for throughput and this for correctness.
+                _cap = _load_batch_max()
+                slots = self._pool.take_upto(min(len(bids), _cap))
                 if not slots:
                     # COUNT IT. `saturations` was declared here and never
                     # incremented, so it read as a measured 0 for an event that
@@ -2143,6 +2180,14 @@ class DiskLoadHandler:
     def snapshot(self) -> dict:
         return dict(self.stats, jobs_open=len(self._jobs),
                     reads_open=len(self._reading),
+                    # *** THE LOAD'S POOL WAS UNOBSERVABLE. *** The store's
+                    # snapshot has carried `staging` all along and the load's
+                    # did not, so the batch-size bisection printed
+                    # "size=? cap=?" on every arm and could not verify that the
+                    # hot `staging_load_slots` knob had taken effect at all.
+                    # Third instance of the same shape in this file: two
+                    # near-identical handlers, one of them patched.
+                    staging=self._pool.snapshot(),
                     # *** THESE WERE MISSING AND I MISREAD THEIR ABSENCE. ***
                     # Only the store handler reported its bounds, so the load
                     # handler showed gpu_rows=None -- and I read "the key is

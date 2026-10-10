@@ -1620,11 +1620,17 @@ check("*** _collect reconciles the pool, so the knob lands on the next STEP ***"
 # not resize -- so it anchors on the take call itself rather than on the
 # vanished reserve argument. An index() on absent text raises, which is how
 # this was caught rather than silently passing.
-_take = "slots = self._pool.take_upto(len(bids))"
-check("the take call is present to anchor on", _dsrc.count(_take) == 2)
-for _i in [_dsrc.index(_take), _dsrc.index(_take, _dsrc.index(_take) + 1)]:
+# Anchored on the CALL, not on one spelling of its argument: the load's take is
+# now `take_upto(min(len(bids), _cap))` because ~256 blocks in one batch faults
+# the worker, and a lint pinned to the old literal raised ValueError rather than
+# failing with a name -- which is the abort-instead-of-fail trap again, this time
+# in a lint I wrote.
+_take = "self._pool.take_upto("
+_ti = [i for i in range(len(_dsrc)) if _dsrc.startswith(_take, i)]
+eq("both take sites are present to anchor on", len(_ti), 2)
+for _i in _ti:
     check("...and the take path no longer resizes (the idle-engine bug)",
-          "set_limit" not in _dsrc[_i - 400:_i])
+          "set_limit" not in _dsrc[max(0, _i - 400):_i])
 
 # and reconcile_pool must never raise into the step loop
 class _P:
@@ -2078,6 +2084,72 @@ for _name in ("DiskStoreHandler", "DiskLoadHandler"):
     _dead = sorted(_init - _used)
     eq("...and none is initialised that it never touches (a zero that cannot "
        "move reads as evidence) [%s]" % _name, _dead, [])
+
+
+
+# ===========================================================================
+# THE LOAD BATCH IS BOUNDED -- ~256 blocks in one transfer_async kills a worker
+# ===========================================================================
+# Measured 2026-10-10 by walking the hot staging_load_slots knob up against a
+# 327-key restore: 96, 128, 160, 192, 224 all clean at 1-2s; 256 faulted on the
+# first attempt with Xid 13 and a dead engine. Five clean arms then a hard
+# failure at exactly 256 reads as a 256-entry limit in upstream's batch copy,
+# not gradual exhaustion.
+#
+# The configuration that worked before this was staging_load_blocks=64 -- an
+# arbitrary quarter of the store's pool that happened to sit under the limit.
+# That is not a safety property, so the cap is explicit and independent now.
+_bsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                          "diskio.py")).read()
+_ns_cap = {}
+exec(compile(_bsrc[_bsrc.index("def _load_batch_max"):
+                   _bsrc.index("def staging_knobs")], "diskio.py", "exec"), _ns_cap)
+
+check("the cap default is BELOW the measured-clean ceiling of 224, not at it",
+      flags.DEFAULTS["load_batch_max"] == 192)
+# TWO SEPARATE 192s: the declared default and the function's own fallback for an
+# unreadable knob. They can drift apart silently, and then a box with a broken
+# flags file would run a different cap from one with a good file -- so assert
+# they agree rather than trusting two literals to stay equal.
+F.write(load_batch_max=0)
+flags.reset_for_tests()
+eq("*** the in-code fallback equals the declared default ***",
+   _ns_cap["_load_batch_max"](), flags.DEFAULTS["load_batch_max"])
+F.write(load_batch_max=192)
+flags.reset_for_tests()
+check("...and it is a declared knob so it is hot",
+      "load_batch_max" in flags.DEFAULTS)
+
+_bload = _bsrc[_bsrc.index("class DiskLoadHandler"):]
+check("*** the LOAD take is capped, not just pool-limited ***",
+      "take_upto(min(len(bids), _cap))" in _bload)
+check("...and the cap comes from the knob reader, not a literal",
+      "_cap = _load_batch_max()" in _bload)
+check("...and the STORE is NOT capped by it (its direction never faulted, and "
+      "a shared cap would be a coincidence not a reason)",
+      "_load_batch_max()" not in _bsrc[_bsrc.index("class DiskStoreHandler"):
+                                       _bsrc.index("class DiskLoadHandler")])
+# A bad or zero knob must fall back, never mean "no blocks ever".
+_ns = _ns_cap
+F.write(load_batch_max=0)
+flags.reset_for_tests()
+eq("a ZERO knob falls back to the default, it does not forbid every block",
+   _ns["_load_batch_max"](), 192)
+F.write(load_batch_max=-5)
+flags.reset_for_tests()
+eq("...and a negative one too", _ns["_load_batch_max"](), 192)
+F.write(load_batch_max=64)
+flags.reset_for_tests()
+eq("...and a real value is honoured", _ns["_load_batch_max"](), 64)
+F.write(load_batch_max=192)
+flags.reset_for_tests()
+
+# The load's pool must be OBSERVABLE, or a size knob cannot be verified -- the
+# bisection printed "size=? cap=?" on every arm because only the store's
+# snapshot carried `staging`.
+check("*** the LOAD snapshot exposes its staging pool ***",
+      "staging=self._pool.snapshot()" in _bload)
+eq("...and both handlers now do", _bsrc.count("staging=self._pool.snapshot()"), 2)
 
 
 print(f"{PASS} passed, {len(FAIL)} failed")

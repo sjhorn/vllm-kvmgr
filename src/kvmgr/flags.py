@@ -108,6 +108,12 @@ DEFAULTS: dict[str, Any] = {
     # limit or the knob surface would govern only half the staging.
     # 0 = the whole load allocation.
     "staging_load_slots": 0,
+    # Max blocks in ONE staging->GPU transfer_async. ~256 FAULTS the worker with
+    # Xid 13 (measured: 96/128/160/192/224 clean at 1-2s, 256 dead on the first
+    # attempt), so this is a CORRECTNESS limit, not a throughput tunable. It is
+    # separate from the pool size on purpose: the pool used to imply it by
+    # accident at 64, and a resize would silently have restored the fault.
+    "load_batch_max": 192,
     # -- the staging pool, hot ------------------------------------------------
     # *** THE ALLOCATION IS A BOOT CEILING; THESE MOVE WITHIN IT. *** The
     # pinned staging is 63 tensors shared by both handlers and two

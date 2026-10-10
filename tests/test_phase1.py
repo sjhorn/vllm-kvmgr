@@ -281,6 +281,7 @@ PROBE = {
     # (value to pin via env, value to write to the file).
     "disk_skip_present_before_copy": (0, 1),
     "staging_load_slots": (0, 4),
+    "load_batch_max": (0, 32),
     # The staging knobs. These ARE genuinely hot in both value and effect: the
     # live pool size is re-read from the flags on every transfer round and
     # `set_limit` only moves which already-allocated rows are handed out, so
