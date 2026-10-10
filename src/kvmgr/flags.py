@@ -114,6 +114,13 @@ DEFAULTS: dict[str, Any] = {
     # separate from the pool size on purpose: the pool used to imply it by
     # accident at 64, and a resize would silently have restored the fault.
     "load_batch_max": 192,
+    # Seconds of ZERO progress after which a stalled transfer job is FAILED.
+    # 0 = hang for ever, which is what this path did until 2026-10-10. Default
+    # 240, comfortably inside NCCL's 600s watchdog, because the entire point is
+    # to die before ProcessGroupNCCL::checkTimeout does -- that abort is C++,
+    # so it leaves no Python traceback and `grep -i traceback` cannot find it.
+    # This does NOT make a dead GPU survivable; it makes the death legible.
+    "stall_fail_after_s": 240.0,
     # -- the staging pool, hot ------------------------------------------------
     # *** THE ALLOCATION IS A BOOT CEILING; THESE MOVE WITHIN IT. *** The
     # pinned staging is 63 tensors shared by both handlers and two

@@ -724,6 +724,87 @@ def watchdog_verdict(outstanding, fingerprint, prev_fingerprint,
     return "waiting", since
 
 
+def stall_fail_after() -> float:
+    """Seconds of ZERO progress after which a stalled job is FAILED. Hot.
+
+    0 disables it, which is the behaviour this path had until 2026-10-10: hang
+    for ever. Default 240 -- comfortably inside NCCL's 600s watchdog, because
+    the whole point is to die before `ProcessGroupNCCL::checkTimeout` does.
+    """
+    try:
+        from kvmgr import flags as _f
+        v = float(_f.peek("stall_fail_after_s") or 0.0)
+        return v if v >= 0 else 240.0
+    except Exception:
+        return 240.0
+
+
+def stall_action(verdict, stalled_for, fail_after):
+    """"none" or "fail". PURE, so the deadline arithmetic is testable.
+
+    *** THIS IS NOT A RECOVERY. *** Upstream cannot express a failed transfer:
+    `offloading/worker.py:273` is a bare `assert transfer_result.success` under
+    the comment "we currently do not support job failures". So reporting
+    failure KILLS the worker. The choice this function makes is therefore not
+    "die or survive", it is:
+
+      hang    -> the engine goes deaf, NCCL's 600s watchdog fires, and the
+                 worker aborts in C++ with NO PYTHON TRACEBACK. Measured
+                 2026-10-10: Xid 32 at 14:58:49, the job's t0 at 14:58:47,
+                 `verdict=stalled` climbing for ten minutes, then
+                 `checkTimeout at ProcessGroupNCCL.cpp:692` and a dead worker
+                 at 15:09:49. Eleven minutes of silence and nothing greppable.
+      fail    -> the same death, immediately, with OUR line naming the job, its
+                 age and the remedy directly above the assertion.
+
+    A named death eleven minutes earlier is the entire win, and it is worth
+    having because the alternative is undiagnosable. Nothing here makes a dead
+    GPU survivable.
+    """
+    if verdict != "stalled":
+        return "none"
+    if not fail_after or fail_after <= 0:
+        return "none"
+    return "fail" if stalled_for >= fail_after else "none"
+
+
+# Set by the WATCHDOG THREAD, honoured on the step thread. The watchdog must
+# never touch `_jobs` itself: those dicts are mutated by `_collect` on the
+# worker's own thread, and a second writer would be a data race in the one
+# place that must not have one. A float assignment is atomic enough in CPython
+# for a cross-thread request flag; the thread that owns the data does the work.
+_STALL_FAIL_REQUEST = None
+
+
+def honour_stall_fail(handler) -> int:
+    """Mark this handler's outstanding jobs failed if the watchdog asked. Pure-ish.
+
+    Called at the TOP of `_collect`, which runs on the worker's own thread and
+    is the only writer of `_jobs` -- so the watchdog raises a request and this
+    acts on it, rather than two threads mutating the same dicts.
+
+    Returns how many jobs were marked, so the caller can log the effect rather
+    than the intent. Never raises: a watchdog that kills the transfer path it
+    was built to observe is worse than no watchdog, and this file already
+    carries that lesson from a debug monkeypatch and a boot-breaking snapshot.
+    """
+    try:
+        req = _STALL_FAIL_REQUEST
+        if req is None:
+            return 0
+        jobs = getattr(handler, "_jobs", None) or {}
+        if not jobs:
+            return 0
+        n = 0
+        for st in list(jobs.values()):
+            if not st.get("failed"):
+                st["failed"] = True
+                n += 1
+        return n
+    except Exception:
+        return 0
+
+
 def _handler_progress():
     """(outstanding jobs, oldest age in seconds, progress fingerprint).
 
@@ -790,6 +871,29 @@ def _watchdog_loop():
                                                 all_threads=True)
                 except Exception:
                     logger.exception("kvmgr: stack dump failed")
+            if verdict == "stalled":
+                # RAISE A REQUEST, do not act. `_collect` owns `_jobs` on the
+                # worker's thread; this thread writing them would be a race in
+                # the one structure that cannot afford one.
+                _fa = stall_fail_after()
+                if stall_action(verdict, now - stalled_since, _fa) == "fail":
+                    global _STALL_FAIL_REQUEST
+                    if _STALL_FAIL_REQUEST != stalled_since:
+                        _STALL_FAIL_REQUEST = stalled_since
+                        logger.error(
+                            "kvmgr: *** FAILING THE STALLED STORE JOB(S) *** "
+                            "%d outstanding, oldest %.0fs, zero progress for "
+                            "%.0fs, past the %.0fs deadline. This does NOT "
+                            "rescue the engine -- upstream's "
+                            "`assert transfer_result.success` has no failure "
+                            "path -- it converts an eleven-minute silent wedge "
+                            "ending in a C++ NCCL abort with no Python "
+                            "traceback into an immediate death with this line "
+                            "above it. If an Xid appeared just before the job "
+                            "started, the GPU is gone and the copy can never "
+                            "complete; check `journalctl -k`. Set "
+                            "stall_fail_after_s=0 to go back to hanging.",
+                            outstanding, oldest, now - stalled_since, _fa)
             elif now - last_beat >= _WATCHDOG_HEARTBEAT_S:
                 last_beat = now
                 logger.info(
@@ -1503,6 +1607,20 @@ class DiskStoreHandler:
         self.reconcile_pool()
         from vllm.v1.kv_offload.worker.worker import TransferResult
 
+        # *** THE FENCE FIX, and it is a LEGIBILITY fix rather than a recovery.
+        # A job whose copy will never complete (a dead GPU after an Xid is the
+        # measured case) otherwise hangs until NCCL's 600s watchdog aborts the
+        # worker in C++ with no Python traceback. Failing it here reports
+        # success=False, which upstream asserts on -- the same death, minutes
+        # earlier, with the watchdog's reason directly above it.
+        _nf = honour_stall_fail(self)
+        if _nf:
+            logger.error(
+                "kvmgr: marked %d STORE job(s) failed on the watchdog's "
+                "request. upstream's assert will now fire on the next "
+                "get_finished, which is the intended outcome: an attributed "
+                "death instead of a silent wedge.", _nf)
+
         if not _LIVE_CONN_WORKER:
             capture_conn_worker_from_caller()
 
@@ -2009,6 +2127,16 @@ class DiskLoadHandler:
         from vllm.v1.kv_offload.worker.worker import TransferResult
 
         self.reconcile_pool()
+
+        # Same deadline on the read side. A load that never completes fences
+        # nothing, but it holds staging slots for ever and the request behind
+        # it never returns -- so it is a hang with a different shape and the
+        # same remedy.
+        _nf = honour_stall_fail(self)
+        if _nf:
+            logger.error(
+                "kvmgr: marked %d LOAD job(s) failed on the watchdog's "
+                "request -- see the STORE note; the assert is upstream's.", _nf)
 
         if not _LIVE_CONN_WORKER:
             capture_conn_worker_from_caller()

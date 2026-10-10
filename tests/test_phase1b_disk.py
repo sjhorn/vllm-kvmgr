@@ -2152,6 +2152,95 @@ check("*** the LOAD snapshot exposes its staging pool ***",
 eq("...and both handlers now do", _bsrc.count("staging=self._pool.snapshot()"), 2)
 
 
+
+# ===========================================================================
+# THE FENCE: a stalled job dies ATTRIBUTABLY instead of hanging to an NCCL abort
+# ===========================================================================
+# *** AND THE DIAGNOSIS THIS REPLACES WAS MINE AND IT WAS WRONG. *** I had
+# recorded "the chunked store pump deadlocks against the fence, because it is
+# driven BY THE STEP IT IS BLOCKING -- the job needs a step and the step needs
+# the job". That is refuted by upstream's own code:
+#
+#   gpu_model_runner.py:  if not num_scheduled_tokens:
+#                             if not has_kv_transfer_group(): return EMPTY...
+#                             return self.kv_connector_no_forward(...)
+#   kv_connector_no_forward:  "# KV send/recv even if no work to do."
+#   EngineCore.step():        gates only on has_requests(), then ALWAYS calls
+#                             execute_model
+#
+# So with a deferred request present the scheduler returns zero tokens and the
+# connector is driven ANYWAY, every loop iteration -- our _collect and _pump
+# included. The pump is not starved of steps.
+#
+# What actually happened (measured 2026-10-10): Xid 32 at 14:58:49, the stalled
+# job's t0 at 14:58:47. The GPU broke two seconds before the job started, so its
+# completion event can never fire, and the pump ran thousands of times against a
+# copy that will never finish. Then NCCL's 600s watchdog aborted the worker in
+# C++ at 15:09:49 -- eleven minutes of `verdict=stalled` and no Python traceback.
+#
+# So the fix is NOT a recovery and must not be described as one. Upstream's
+# `assert transfer_result.success` has no failure path, so reporting failure
+# kills the worker. The choice is between an undiagnosable death in eleven
+# minutes and an attributed death now.
+check("stall_fail_after_s is a declared knob, so the deadline is hot",
+      "stall_fail_after_s" in flags.DEFAULTS)
+check("...and the default is INSIDE NCCL's 600s budget, which is the whole point",
+      0 < flags.DEFAULTS["stall_fail_after_s"] < 600)
+
+_fsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                          "diskio.py")).read()
+_fns = {}
+exec(compile(_fsrc[_fsrc.index("def stall_action"):
+                   _fsrc.index("# Set by the WATCHDOG THREAD")],
+             "diskio.py", "exec"), _fns)
+_sa = _fns["stall_action"]
+eq("a job that is PROGRESSING is never failed", _sa("progress", 9999, 240), "none")
+eq("...nor one merely WAITING", _sa("waiting", 9999, 240), "none")
+eq("...nor an IDLE path", _sa("idle", 9999, 240), "none")
+eq("a stall SHORT of the deadline is left alone", _sa("stalled", 239, 240), "none")
+eq("*** a stall PAST the deadline is failed ***", _sa("stalled", 240, 240), "fail")
+eq("...and well past", _sa("stalled", 10_000, 240), "fail")
+eq("deadline 0 means HANG FOR EVER, the old behaviour, switchable with no "
+   "restart", _sa("stalled", 10_000, 0), "none")
+eq("...and a negative deadline is treated as off, not as instant death",
+   _sa("stalled", 10_000, -5), "none")
+
+# The watchdog must NOT mutate `_jobs` itself: `_collect` owns them on the
+# worker's thread, and two writers in that one structure is a data race in the
+# place that can least afford one.
+_wd = _fsrc[_fsrc.index("def _watchdog_loop"):]
+_wd = _wd[:_wd.index("\ndef ")] if "\ndef " in _wd else _wd
+# COMMENTS STRIPPED FIRST. `_jobs` appears in the watchdog body only inside the
+# comment explaining that it must not touch them -- so a raw substring check
+# fails on its own documentation, which is this file's "a lint read the
+# stylesheet with comments left in" trap arriving a third time. And checking for
+# one SPELLING is not enough either: the mutation that beat the first version
+# wrote `st.update(failed=True)` rather than `st["failed"] = True`. The
+# structural property is that the watchdog never NAMES the job dicts at all --
+# it reads progress through _handler_progress() and nothing else.
+_wd_code = "\n".join(l.split("#", 1)[0] for l in _wd.splitlines())
+check("*** the watchdog raises a REQUEST and never names _jobs in CODE ***",
+      "_STALL_FAIL_REQUEST" in _wd_code and "_jobs" not in _wd_code)
+check("...nor reaches the handler list directly to mutate it",
+      "_LIVE_HANDLERS" not in _wd_code)
+check("...and the acting helper is called from _collect, which owns them",
+      _fsrc.count("honour_stall_fail(self)") == 2)
+check("...once per handler, store and load",
+      "def honour_stall_fail" in _fsrc)
+
+# And it must never raise into the transfer path.
+class _Boom:
+    @property
+    def _jobs(self):
+        raise RuntimeError("boom")
+_hsf = {}
+exec(compile(_fsrc[_fsrc.index("def honour_stall_fail"):
+                   _fsrc.index("def _handler_progress")], "diskio.py", "exec"),
+     {"_STALL_FAIL_REQUEST": 1.0, **_hsf}, _hsf)
+eq("*** a handler that raises while being marked returns 0, it does not "
+   "propagate into the transfer path ***", _hsf["honour_stall_fail"](_Boom()), 0)
+
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
     for f in FAIL:
