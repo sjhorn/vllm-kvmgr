@@ -1328,21 +1328,87 @@ class DiskStoreHandler:
                     self._pool.give(slots)
                     st["failed"] = True
                     return
-                self._ledger_note("store", g, bids[:n], slots)
+                # *** IF THE FILE ALREADY EXISTS, DO NOT COPY IT TO STAGING.
+                # *** AND DO THIS *AFTER* EVERY GUARD, NOT BEFORE. ***
+                # `_write_batch` has always skipped an existing path, but it
+                # runs in `_collect` AFTER the GPU->staging copy completed, so
+                # an already-stored block cost a full 63-tensor GPU->pinned
+                # copy that was then thrown away. This project's own record has
+                # the shape of that waste: a boot where "the store path wrote
+                # nothing, because every block it was asked to store was
+                # already on disk", reported as `stored: 92` against ZERO bytes
+                # written -- ninety-two pointless copies.
+                #
+                # It is not just waste, it is the Xid 13 hazard. The LOAD reads
+                # this same shared pinned pool under
+                # CU_MEMCPY_SRC_ACCESS_ORDER_ANY, whose precondition is that no
+                # concurrent GPU stream writes the source -- and these copies
+                # are exactly such a write. They are commonest during a
+                # restore, because a restore is by definition a scenario where
+                # the files exist, which is when the load is reading the pool.
+                #
+                # *** THE ORDER MATTERS AND MY FIRST VERSION GOT IT BACKWARDS.
+                # Skipping before check_bounds meant a present key was never
+                # bounds-checked -- and test_phase1b_disk caught it only
+                # because a SECOND assertion counted the refusal: the first,
+                # "nothing was submitted to the copy kernel", still PASSED,
+                # vacuously, because nothing was submitted for the wrong
+                # reason. The bounds guard exists to DETECT corruption, not
+                # only to prevent a submit, so it must run on every key.
+                # Slots are cheap bookkeeping; the COPY is what costs. So take
+                # slots, run every guard, and only then drop the keys whose
+                # bytes are already on disk, returning their slots.
+                from kvmgr import flags as _fl      # _f is local to staging_knobs
+                _sk = bkeys[:n]
+                _sb = bids[:n]
+                _ss = slots
+                if _fl.peek("disk_skip_present_before_copy"):
+                    _kk, _kb, _ks2, _drop = [], [], [], []
+                    for _k, _b, _sl in zip(_sk, _sb, _ss):
+                        try:
+                            _ex = os.path.exists(self._mapper.get_file_name(_k))
+                        except Exception:
+                            _ex = False               # cannot tell -> copy it
+                        if _ex:
+                            _drop.append(_sl)
+                            continue
+                        _kk.append(_k); _kb.append(_b); _ks2.append(_sl)
+                    if _drop:
+                        # COUNTED, because `_write_batch`'s skip is a bare
+                        # `continue` with no counter at all, so the waste it
+                        # stood for was invisible for the life of the path.
+                        self.stats["skipped_before_copy"] = self.stats.get(
+                            "skipped_before_copy", 0) + len(_drop)
+                        self._pool.give(_drop)
+                    if not _kk:
+                        # Nothing to copy. Advance the batch WITHOUT touching
+                        # `pending`: a job every one of whose blocks is already
+                        # on disk must still complete, and it completes on
+                        # `pending == 0 and not batches`.
+                        if n == len(bids):
+                            st["batches"].pop(0)
+                        else:
+                            st["batches"][0] = [g, bkeys[n:], bids[n:]]
+                        continue
+                    _sk, _sb, _ss = _kk, _kb, _ks2
+                    gs = [0] * ngroups
+                    gs[g] = len(_sb)
+
+                self._ledger_note("store", g, _sb, _ss)
                 try:
                     ok = self._inner.transfer_async(
                         inner,
-                        (GPULoadStoreSpec(bids[:n], group_sizes=gs,
+                        (GPULoadStoreSpec(_sb, group_sizes=gs,
                                           block_indices=[0] * ngroups),
-                         CPULoadStoreSpec(slots)))
+                         CPULoadStoreSpec(_ss)))
                 except Exception:
                     logger.exception("kvmgr: inner GPU->staging submit raised")
                     ok = False
                 if not ok:
-                    self._pool.give(slots)
+                    self._pool.give(_ss)
                     st["failed"] = True
                     return
-                self._inner_to_job[inner] = (job_id, bkeys[:n], slots, g)
+                self._inner_to_job[inner] = (job_id, _sk, _ss, g)
                 st["pending"] += 1
                 if n == len(bids):
                     st["batches"].pop(0)

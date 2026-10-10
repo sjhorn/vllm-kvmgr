@@ -89,6 +89,19 @@ DEFAULTS: dict[str, Any] = {
     # `prepare_store`, never in the handler -- see the note there for why the
     # obvious placement poisons the index.
     "disk_store_paused": False,
+    # Skip a store key whose FILE ALREADY EXISTS before the GPU->staging copy,
+    # not after. `_write_batch` has always skipped an existing path, but it runs
+    # once the copy has completed -- so an already-stored block cost a full
+    # 63-tensor GPU->pinned copy that was then discarded ("stored: 92" against
+    # zero bytes written, measured). Those copies are also the concurrent GPU
+    # write that breaks CU_MEMCPY_SRC_ACCESS_ORDER_ANY on the shared staging
+    # pool, which is the Xid 13 root cause -- and they are commonest during a
+    # restore, precisely when the load is reading that pool.
+    #
+    # Default ON, and that does NOT violate "an empty flags file behaves as
+    # today": the skipped copies were discarded anyway, so the bytes that reach
+    # disk are identical. Only the wasted copy disappears.
+    "disk_skip_present_before_copy": True,
     # -- the staging pool, hot ------------------------------------------------
     # *** THE ALLOCATION IS A BOOT CEILING; THESE MOVE WITHIN IT. *** The
     # pinned staging is 63 tensors shared by both handlers and two

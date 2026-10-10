@@ -1803,6 +1803,133 @@ check("...and group_file_sizes too",
 check("...and the test's own stand-in would have slipped past a loose check",
       isinstance(_NpLike(1), int) and type(_NpLike(1)) is not int)
 
+# *** THE SUMMARY AND THE EXIT LIVE AT THE END OF THE FILE. ***
+# They used to sit here, in the middle, and a block appended after them printed
+# its own FAIL lines while the suite still exited 0 -- so the new tests could
+# not fail the suite at all. That is "a lint that cannot fail reads as
+# coverage", created by appending in the wrong place, and it was found only by
+# mutating the code the new tests covered and seeing exit=0 with FAIL on screen.
+# Anything added below is therefore accounted for; anything added below the
+# summary would not be.
+
+
+# ===========================================================================
+# IF THE FILE EXISTS, DO NOT COPY IT TO STAGING -- and run every guard first
+# ===========================================================================
+# `_write_batch` has always skipped an existing path, but it runs in `_collect`
+# AFTER the GPU->staging copy has completed, so an already-stored block cost a
+# full 63-tensor GPU->pinned copy that was then discarded. The project's own
+# record carries the shape of that waste: a boot where the store path "wrote
+# nothing, because every block it was asked to store was already on disk",
+# reported as `stored: 92` against ZERO bytes written.
+#
+# It is also the Xid 13 hazard, not merely waste: the LOAD reads this same
+# shared pinned pool under CU_MEMCPY_SRC_ACCESS_ORDER_ANY, whose precondition
+# is that no concurrent GPU stream writes the source, and these copies are
+# exactly such a write -- commonest during a restore, which is when the load is
+# reading the pool.
+_ff = __import__("kvmgr.flags", fromlist=["peek"])
+
+
+def _mkjob(pool, keys, bids, group=0, bounds=None):
+    hh = mkhandler(pool)
+    if bounds is not None:
+        hh._bounds_cache = bounds
+    gs = [0] * 5
+    gs[group] = len(bids)
+    sp = base.GPULoadStoreSpec(list(bids), group_sizes=gs, block_indices=[0] * 5)
+    hh.transfer_async(1234, (sp, diskspec.DiskLoadStoreSpec(keys)))
+    return hh
+
+
+def _touch(h, keys):
+    for k in keys:
+        p = h._mapper.get_file_name(k)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "wb").write(b"x")
+
+
+# gkeys with a fresh salt gives keys whose files do NOT exist yet.
+_fresh = gkeys(0, 4, salt=201)
+_h1 = mkhandler(8)
+for _k in _fresh:                      # make sure they really are absent
+    _p = _h1._mapper.get_file_name(_k)
+    if os.path.exists(_p):
+        os.unlink(_p)
+_h1 = _mkjob(8, _fresh, range(10, 14))
+eq("a key whose file is ABSENT is still copied", len(_h1._inner.subs), 1)
+eq("...and nothing is counted as skipped",
+   _h1.stats.get("skipped_before_copy", 0), 0)
+
+# Now the same keys with their files present.
+_h2 = mkhandler(8)
+_touch(_h2, _fresh)
+_h2 = _mkjob(8, _fresh, range(10, 14))
+eq("*** a key whose file EXISTS is NOT copied to staging ***",
+   len(_h2._inner.subs), 0)
+eq("...and the skip is COUNTED (it was a bare `continue` with no counter)",
+   _h2.stats.get("skipped_before_copy", 0), 4)
+eq("...and its staging slots are RETURNED, not leaked",
+   _h2._pool.available, 8)
+check("...and the job does not hang pending for ever -- it COMPLETES",
+      1234 not in _h2._jobs or _h2._jobs[1234]["pending"] == 0)
+
+# A MIXED batch: present and absent together, pairing preserved.
+_mix_absent = gkeys(0, 2, salt=202)
+_h3 = mkhandler(8)
+for _k in _mix_absent:
+    _p = _h3._mapper.get_file_name(_k)
+    if os.path.exists(_p):
+        os.unlink(_p)
+_mixed = [_fresh[0], _mix_absent[0], _fresh[1], _mix_absent[1]]
+_h3 = _mkjob(8, _mixed, [20, 21, 22, 23])
+eq("a MIXED batch submits one round", len(_h3._inner.subs), 1)
+eq("...skipping exactly the present ones",
+   _h3.stats.get("skipped_before_copy", 0), 2)
+# The pairing is positional and load-bearing, so the surviving block ids must be
+# the ones belonging to the surviving keys -- 21 and 23, never 20 and 21.
+# FakeInner records (job_id, block_ids, group_sizes, slot_ids), so the block
+# ids are element 1 -- NOT a spec object. My first version guarded this behind
+# `hasattr(spec, "block_ids")` and the assertion never ran at all: it printed
+# nothing and the suite still said PASS, which is a skipped check masquerading
+# as coverage. Unconditional now, and it is the assertion that matters most
+# here, because the key->block pairing is positional and a desync writes one
+# block's KV under another block's name with nothing crashing.
+_sub = _h3._inner.subs[0]
+eq("*** and the SURVIVING block ids are the absent keys' own ***",
+   list(_sub[1]), [21, 23])
+eq("...and group_sizes was RECOUNTED for the filtered batch, not left at 4",
+   list(_sub[2]), [2, 0, 0, 0, 0])
+eq("...and exactly two slots were handed to the copy",
+   len(_sub[3]), 2)
+
+# *** THE REGRESSION DISCRIMINATOR. *** My first version skipped present keys
+# BEFORE check_bounds, so a present key was never bounds-checked. The existing
+# assertion "nothing was submitted to the copy kernel" still PASSED -- vacuously
+# -- and only a second assertion counting the refusal exposed it. The bounds
+# guard exists to DETECT corruption, not merely to prevent a submit, so it must
+# run on every key regardless of whether its bytes are already on disk.
+_hb2 = mkhandler(8)
+_touch(_hb2, _fresh)
+_hb2 = _mkjob(8, _fresh, [1000, 1001, 1002, 1003], bounds=(50, 8))
+eq("*** bounds are STILL refused for a key whose file exists ***",
+   _hb2.stats["refused_bounds"], 1)
+eq("...and nothing was submitted", len(_hb2._inner.subs), 0)
+eq("...and it is a REFUSAL, not a silent skip",
+   _hb2.stats.get("skipped_before_copy", 0), 0)
+
+# And the knob turns it off, restoring the old (wasteful) behaviour exactly.
+F.write(disk_skip_present_before_copy=0)
+flags.reset_for_tests()
+_h4 = mkhandler(8)
+_touch(_h4, _fresh)
+_h4 = _mkjob(8, _fresh, range(30, 34))
+eq("knob OFF: the present key is copied again, as before",
+   len(_h4._inner.subs), 1)
+F.write(disk_skip_present_before_copy=1)
+flags.reset_for_tests()
+
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
     for f in FAIL:
