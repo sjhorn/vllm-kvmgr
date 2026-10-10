@@ -114,6 +114,13 @@ DEFAULTS: dict[str, Any] = {
     # separate from the pool size on purpose: the pool used to imply it by
     # accident at 64, and a resize would silently have restored the fault.
     "load_batch_max": 192,
+    # Max load ROUNDS whose staging->GPU copy may be outstanding at once.
+    # The per-round cap above was NOT enough: the 700K scale test respected it
+    # throughout and still faulted at 861 keys, because a chunked prefill
+    # issues many prepare_load calls and nothing bounded how many rounds were
+    # in flight together. 0 = unbounded, which is the behaviour that faulted.
+    # 1 makes the path fully serial, which is how the hypothesis gets tested.
+    "load_inflight_max": 4,
     # Seconds of ZERO progress after which a stalled transfer job is FAILED.
     # 0 = hang for ever, which is what this path did until 2026-10-10. Default
     # 240, comfortably inside NCCL's 600s watchdog, because the entire point is

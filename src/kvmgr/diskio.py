@@ -236,6 +236,34 @@ def staging_plan(pool_capacity: int, slots_knob: int, write_floor_knob: int,
     return size, _floor(write_floor_knob), _floor(read_floor_knob)
 
 
+def _load_inflight_max() -> int:
+    """Max load ROUNDS whose GPU copy may be outstanding at once. Hot.
+
+    *** THE BATCH CAP WAS NOT ENOUGH, which is why this exists. ***
+    `load_batch_max=192` made a 327-key restore clean 3/3 where an uncapped
+    256-slot pool faulted 2/2 -- and at 861 keys (the 700K scale test,
+    2026-10-10) it faulted anyway, with the per-round cap respected throughout.
+    So what moved between clean and dead is not the size of any one batch.
+    It is how many are in flight TOGETHER: a 700K prompt is chunked prefill, so
+    the scheduler issues many `prepare_load` calls, `_pump` loops over EVERY
+    job, and each takes slots until the pool empties. Upstream's inner handler
+    then chains them all on one stream with an event per transfer, and nothing
+    anywhere bounds that queue.
+
+    0 means unbounded, which is the behaviour that faulted. The default is
+    deliberately small: a restore that is slightly less parallel is worth far
+    more than one that kills the worker, and the whole point of the measurement
+    this enables is that `1` makes the path fully serial and therefore a clean
+    test of the hypothesis.
+    """
+    try:
+        from kvmgr import flags as _f
+        v = int(_f.peek("load_inflight_max") or 0)
+        return v if v > 0 else 4
+    except Exception:
+        return 4
+
+
 def _load_batch_max() -> int:
     """Max blocks in ONE staging->GPU `transfer_async`. Hot.
 
@@ -2058,6 +2086,18 @@ class DiskLoadHandler:
     def _pump(self) -> None:
         for job_id, st in self._jobs.items():
             while st["batches"] and not st["failed"]:
+                # *** BOUND THE ROUNDS IN FLIGHT, not just each round's size.
+                # `_inner_to_job` holds every round whose staging->GPU copy is
+                # outstanding; upstream chains them on one stream with an event
+                # each and bounds nothing. The 700K test respected the 192
+                # per-round cap and still died at 861 keys, so the count is the
+                # variable the cap cannot reach. Returning here is safe and is
+                # not a refusal: `_pump` is called again from `_collect` on
+                # every scheduler step, and `kv_connector_no_forward` means
+                # those steps keep coming even with nothing scheduled -- so the
+                # work resumes as soon as a round completes.
+                if len(self._inner_to_job) >= _load_inflight_max():
+                    return
                 g, bkeys, bids = st["batches"][0]
                 # No reserve: see the store's _pump. This pool is the LOAD's
                 # alone now, so a write floor inside it would starve the load to
@@ -2316,6 +2356,13 @@ class DiskLoadHandler:
                     # Third instance of the same shape in this file: two
                     # near-identical handlers, one of them patched.
                     staging=self._pool.snapshot(),
+                    # Outstanding staging->GPU rounds, and the cap they are
+                    # bounded by. Both exposed because a knob whose effect
+                    # cannot be read back is a knob nobody can verify -- the
+                    # load's pool was unobservable for exactly one bisection
+                    # and every arm printed "size=?".
+                    inflight=len(self._inner_to_job),
+                    inflight_max=_load_inflight_max(),
                     # *** THESE WERE MISSING AND I MISREAD THEIR ABSENCE. ***
                     # Only the store handler reported its bounds, so the load
                     # handler showed gpu_rows=None -- and I read "the key is

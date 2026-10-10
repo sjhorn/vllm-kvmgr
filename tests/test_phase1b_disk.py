@@ -2241,6 +2241,71 @@ eq("*** a handler that raises while being marked returns 0, it does not "
    "propagate into the transfer path ***", _hsf["honour_stall_fail"](_Boom()), 0)
 
 
+
+# ===========================================================================
+# BOUND THE ROUNDS IN FLIGHT -- the per-round cap was not enough
+# ===========================================================================
+# load_batch_max=192 made a 327-key restore clean 3/3 where an uncapped 256
+# pool faulted 2/2. At 861 keys (the 700K scale test, 2026-10-10) it faulted
+# anyway WITH the per-round cap respected throughout -- Xid 13, worker dead one
+# second later, zero stall lines. So the size of any one batch is not what
+# moved between clean and dead; the number in flight TOGETHER is. A chunked
+# prefill issues many prepare_load calls, _pump loops over every job, each
+# takes slots until the pool empties, and upstream chains them all on one
+# stream with an event each and bounds nothing.
+#
+# This is the THIRD time this investigation has changed two things at once and
+# attributed the result to the wrong one (shared-vs-size, allocation-vs-limit,
+# batch-size-vs-rounds). The knob exists so the hypothesis can be tested rather
+# than assumed: 1 makes the path fully serial.
+check("load_inflight_max is a declared knob, so it is hot",
+      "load_inflight_max" in flags.DEFAULTS)
+check("...and the default is SMALL -- a less parallel restore beats a dead "
+      "worker", 0 < flags.DEFAULTS["load_inflight_max"] <= 8)
+
+_csrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                          "diskio.py")).read()
+_cload = _csrc[_csrc.index("class DiskLoadHandler"):]
+check("*** the LOAD pump bounds rounds in flight before taking slots ***",
+      "if len(self._inner_to_job) >= _load_inflight_max():" in _cload)
+check("...and the STORE pump does NOT -- its direction never faulted this way, "
+      "and a shared bound would be a coincidence not a reason",
+      "_load_inflight_max()" not in _csrc[_csrc.index("class DiskStoreHandler"):
+                                          _csrc.index("class DiskLoadHandler")])
+check("*** the count and its cap are OBSERVABLE, or the knob cannot be "
+      "verified ***",
+      "inflight=len(self._inner_to_job)," in _cload
+      and "inflight_max=_load_inflight_max()," in _cload)
+
+# the reader: 0 means unbounded-was-the-bug, so it must fall back, and a bad
+# value must not mean "never submit anything".
+_cns = {}
+exec(compile(_csrc[_csrc.index("def _load_inflight_max"):
+                   _csrc.index("def _load_batch_max")], "diskio.py", "exec"), _cns)
+_lim = _cns["_load_inflight_max"]
+F.write(load_inflight_max=0)
+flags.reset_for_tests()
+eq("a ZERO knob falls back to the default, it does not mean unbounded again",
+   _lim(), flags.DEFAULTS["load_inflight_max"])
+F.write(load_inflight_max=-3)
+flags.reset_for_tests()
+eq("...and a negative one too, it does not mean 'never submit'",
+   _lim(), flags.DEFAULTS["load_inflight_max"])
+F.write(load_inflight_max=1)
+flags.reset_for_tests()
+eq("...and 1 is honoured, which is the fully-serial test arm", _lim(), 1)
+F.write(load_inflight_max=4)
+flags.reset_for_tests()
+
+# Returning from _pump when the bound is hit must not be a REFUSAL: the work has
+# to resume. That is only safe because _pump is re-entered every step, and
+# kv_connector_no_forward means those steps keep coming with nothing scheduled.
+check("*** hitting the bound RETURNS rather than failing the job -- the work "
+      "resumes on the next step ***",
+      "if len(self._inner_to_job) >= _load_inflight_max():\n                    return"
+      in _cload)
+
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
     for f in FAIL:

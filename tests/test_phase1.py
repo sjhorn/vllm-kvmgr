@@ -282,6 +282,7 @@ PROBE = {
     "disk_skip_present_before_copy": (0, 1),
     "staging_load_slots": (0, 4),
     "load_batch_max": (0, 32),
+    "load_inflight_max": (0, 2),
     "stall_fail_after_s": (0, 90),
     # The staging knobs. These ARE genuinely hot in both value and effect: the
     # live pool size is re-read from the flags on every transfer round and
