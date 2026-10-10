@@ -186,6 +186,16 @@ def _derived(name: str) -> dict:
 # paying for in other costumes.
 _PRESERVE: tuple[tuple[str, str, str], ...] = (
     ("kvmgr.diskio", "_LIVE_HANDLERS", "the live store/load handler objects"),
+    # The watchdog's cross-thread fail request, and its DEDUPE. A reload
+    # resetting it to None would re-raise the loud "FAILING THE STALLED JOB"
+    # line for a stall already acted on -- self-healing within 5s rather than
+    # dangerous, but a duplicated fatal-looking log line is exactly the sort of
+    # noise that makes an incident harder to read. The audit in test_phase6
+    # caught this the moment the global was added, which is what the table is
+    # for; it is in here rather than exempted because preserving a float costs
+    # nothing and needs no argument.
+    ("kvmgr.diskio", "_STALL_FAIL_REQUEST",
+     "the watchdog's stall-fail request + its dedupe key"),
     ("kvmgr.flags", "_OVERRIDE", "every knob the control plane has set"),
     ("kvmgr.diskspec", "_LIVE_MANAGER", "the disk index, for GET /kv"),
     ("kvmgr.stats", "_groups", "all per-group counters -- the observability"),
