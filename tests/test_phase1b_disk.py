@@ -361,6 +361,9 @@ def mkhandler(pool_size, nrefs=REFS):
                "files": 0, "bytes": 0,
                "errors": 0, "wait_calls": 0, "wait_ours": 0,
                "wait_blocked_ms": 0, "wait_max_pending": 0, "wait_rounds": 0,
+               # Added when the real constructor gained them, which the
+               # fixture-parity assertion below is here to force.
+               "skipped_before_copy": 0, "delete_errors": 0, "deleted": 0,
                "saturations": 0}
     h._read_row = lambda t, s, n: b"\xab" * n
     # *** THE FIXTURE MUST DECLARE ITS TRANSFER BOUNDS. *** `_bounds()` derives
@@ -2014,6 +2017,67 @@ check("...reading its own knob, not the store's",
       'peek("staging_load_slots")' in _lsrc)
 check("...and staging_load_slots is a declared knob, not an invented name",
       "staging_load_slots" in flags.DEFAULTS)
+
+
+
+# ===========================================================================
+# EVERY stats COUNTER MUST BE INITIALISED IN THE CLASS THAT INCREMENTS IT
+# ===========================================================================
+# `skipped_before_copy` was incremented in DiskStoreHandler and initialised in
+# DiskLoadHandler. Two consequences, and the second is the worse one: the store
+# reported `ABSENT`, which reads as "no such counter" when the truth was "zero
+# skips"; and the load reported a permanent measured **0** for an event it
+# cannot have, which looks like evidence. The handlers' stats dicts are nearly
+# identical, so a `count(...) == 1` check over the whole FILE passed -- exactly
+# one matched, and it was the wrong one.
+#
+# So this audits per CLASS and enumerates from the declaration rather than from
+# a hand-written list, which is this project's stated rule for exactly this
+# shape of defect.
+import ast as _ast  # noqa: E402
+
+_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                         "diskio.py")).read()
+_tree = _ast.parse(_src)
+
+
+def _stats_keys(cls_node):
+    """(initialised, incremented) key sets for one class."""
+    init, used = set(), set()
+    for n in _ast.walk(cls_node):
+        # self.stats = {...}
+        if isinstance(n, _ast.Assign) and isinstance(n.value, _ast.Dict):
+            for t in n.targets:
+                if (isinstance(t, _ast.Attribute) and t.attr == "stats"
+                        and isinstance(t.value, _ast.Name) and t.value.id == "self"):
+                    for k in n.value.keys:
+                        if isinstance(k, _ast.Constant) and isinstance(k.value, str):
+                            init.add(k.value)
+        # self.stats["x"] ... anywhere it is written or read-modified
+        if (isinstance(n, _ast.Subscript) and isinstance(n.value, _ast.Attribute)
+                and n.value.attr == "stats"
+                and isinstance(n.value.value, _ast.Name)
+                and n.value.value.id == "self"
+                and isinstance(n.slice, _ast.Constant)
+                and isinstance(n.slice.value, str)):
+            used.add(n.slice.value)
+    return init, used
+
+
+_classes = {n.name: n for n in _tree.body if isinstance(n, _ast.ClassDef)}
+check("both handler classes were located",
+      {"DiskStoreHandler", "DiskLoadHandler"} <= set(_classes))
+for _name in ("DiskStoreHandler", "DiskLoadHandler"):
+    _init, _used = _stats_keys(_classes[_name])
+    check("%s initialises its stats dict at all" % _name, bool(_init))
+    _missing = sorted(_used - _init)
+    eq("*** %s: every counter it touches is initialised ***" % _name, _missing, [])
+    # And the mirror: a key initialised but never touched by this class is a
+    # measured zero for something that cannot happen -- how the load handler
+    # came to report skipped_before_copy=0 forever.
+    _dead = sorted(_init - _used)
+    eq("...and none is initialised that it never touches (a zero that cannot "
+       "move reads as evidence) [%s]" % _name, _dead, [])
 
 
 print(f"{PASS} passed, {len(FAIL)} failed")

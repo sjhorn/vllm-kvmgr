@@ -1041,6 +1041,22 @@ class DiskStoreHandler:
         self._ready: list = []
         self.stats = {"submitted": 0, "refused_pairing": 0, "refused_bounds": 0,
                       "files": 0, "bytes": 0, "errors": 0,
+                      # *** INITIALISED IN THE HANDLER THAT INCREMENTS IT, and
+                      # my first attempt put it in the LOAD handler, which never
+                      # touches it. So the STORE reported `ABSENT` -- which reads
+                      # as "no such counter" when the truth was "zero skips" --
+                      # while the LOAD reported a permanent measured 0 for an
+                      # event it cannot have, which is worse, because a zero
+                      # looks like evidence. The two handlers have near-identical
+                      # stats dicts and my `count(...) == 1` guard passed
+                      # because exactly one matched: the wrong one. Scope such a
+                      # search to the CLASS, never the file.
+                      "skipped_before_copy": 0,
+                      # `delete_errors` and `deleted` were INCREMENTED and never
+                      # declared, so both read ABSENT until the first eviction --
+                      # found by the per-class stats audit the moment it was
+                      # written, which is this project's pattern for audits.
+                      "delete_errors": 0, "deleted": 0,
                       # *** THE FENCE, MEASURED. *** `handle_preemptions`
                       # calls `worker.wait(jobs_to_flush)` SYNCHRONOUSLY on the
                       # worker's critical path, and our wait() blocks until the
@@ -1775,14 +1791,6 @@ class DiskLoadHandler:
         # bug the offline fixture-parity assertion caught before it shipped.
         self._ready: list = []
         self.stats = {"submitted": 0, "refused_pairing": 0, "files": 0,
-                      # Initialised so it reports a MEASURED ZERO rather than
-                      # ABSENT. `self.stats.get(k, 0) + 1` creates the key only
-                      # on first use, and snapshot() is `dict(self.stats, ...)`,
-                      # so a run with no skips reported `skipped_before_copy:
-                      # ABSENT` -- which reads as "no such counter" when the
-                      # truth was "zero skips". ZERO IS NOT ABSENT, this
-                      # project's own rule, mirrored.
-                      "skipped_before_copy": 0,
                       "refused_bounds": 0,
                       "bytes": 0, "errors": 0,
                       "wait_calls": 0, "wait_ours": 0, "wait_blocked_ms": 0,
@@ -1918,6 +1926,12 @@ class DiskLoadHandler:
                 # protect a direction that cannot reach it.
                 slots = self._pool.take_upto(len(bids))
                 if not slots:
+                    # COUNT IT. `saturations` was declared here and never
+                    # incremented, so it read as a measured 0 for an event that
+                    # could not be recorded -- worse than absent, because a zero
+                    # looks like evidence. A starved LOAD is the 574.9s-vs-3.3s
+                    # case, so it is the one worth seeing.
+                    self.stats["saturations"] = self.stats.get("saturations", 0) + 1
                     return
                 n = len(slots)
                 # Stage 1 for a LOAD is the FILE READ, on the thread pool.
