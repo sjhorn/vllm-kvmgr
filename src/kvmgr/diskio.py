@@ -1775,6 +1775,14 @@ class DiskLoadHandler:
         # bug the offline fixture-parity assertion caught before it shipped.
         self._ready: list = []
         self.stats = {"submitted": 0, "refused_pairing": 0, "files": 0,
+                      # Initialised so it reports a MEASURED ZERO rather than
+                      # ABSENT. `self.stats.get(k, 0) + 1` creates the key only
+                      # on first use, and snapshot() is `dict(self.stats, ...)`,
+                      # so a run with no skips reported `skipped_before_copy:
+                      # ABSENT` -- which reads as "no such counter" when the
+                      # truth was "zero skips". ZERO IS NOT ABSENT, this
+                      # project's own rule, mirrored.
+                      "skipped_before_copy": 0,
                       "refused_bounds": 0,
                       "bytes": 0, "errors": 0,
                       "wait_calls": 0, "wait_ours": 0, "wait_blocked_ms": 0,
