@@ -2123,8 +2123,18 @@ check("...and it is a declared knob so it is hot",
 _bload = _bsrc[_bsrc.index("class DiskLoadHandler"):]
 check("*** the LOAD take is capped, not just pool-limited ***",
       "take_upto(min(len(bids), _cap))" in _bload)
-check("...and the cap comes from the knob reader, not a literal",
-      "_cap = _load_batch_max()" in _bload)
+# Re-aimed when the cap gained a SECOND bound in a different unit. It pinned
+# the literal `_cap = _load_batch_max()`, which the op budget replaced -- so it
+# failed on a change that strengthened the thing it was guarding. The property
+# is that the cap is composed of knob READERS and contains no magic number.
+check("...and the cap comes from knob readers, not a literal",
+      "_cap = min(_load_batch_max()," in _bload
+      and "load_ops_budget(self._refs, g," in _bload)
+import re as _re6
+_capline = _bload[_bload.index("_cap = min("):]
+_capline = _capline[:_capline.index("\n                slots")]
+check("...and no bare integer is baked into the cap expression",
+      not _re6.search(r"\b\d{2,}\b", _capline))
 check("...and the STORE is NOT capped by it (its direction never faulted, and "
       "a shared cap would be a coincidence not a reason)",
       "_load_batch_max()" not in _bsrc[_bsrc.index("class DiskStoreHandler"):
@@ -2304,6 +2314,61 @@ check("*** hitting the bound RETURNS rather than failing the job -- the work "
       "resumes on the next step ***",
       "if len(self._inner_to_job) >= _load_inflight_max():\n                    return"
       in _cload)
+
+
+
+# ===========================================================================
+# THE REAL LIMIT IS COPY OPS, NOT BLOCKS -- read out of upstream, not guessed
+# ===========================================================================
+# `_custom_ops.swap_blocks_batch` "submit[s] all copies in a single driver
+# call" (cuMemcpyBatchAsync on CUDA 12.8+), and `cpu/gpu_worker.py` builds it as
+#
+#     num_copy_ops += group_size * len(group_data_refs)
+#
+# So one submit contains BLOCKS x REFS-FOR-THAT-GROUP descriptors. load_batch_max
+# caps blocks, which means a DIFFERENT descriptor count per group: 192 blocks is
+# 384 ops for a 2-ref group and 5,760 for a 30-ref one. Group 0 has the most
+# layers and the largest block size, so it reaches any descriptor limit first,
+# and a single cap in blocks cannot express that. My cap bounded the wrong unit.
+_osrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                          "diskio.py")).read()
+_ons = {}
+exec(compile(_osrc[_osrc.index("def load_ops_for"):
+                   _osrc.index("def _load_inflight_max")], "diskio.py", "exec"), _ons)
+_ops_for, _budget = _ons["load_ops_for"], _ons["load_ops_budget"]
+
+# refs shaped like the engine's: group 0 has many layers, the SWA groups few.
+_R = [[0]*30, [0]*8, [0]*8, [0]*2, [0]*4]
+eq("*** ops = blocks x refs for THAT group, group 0 ***", _ops_for(_R, 0, 192), 5760)
+eq("...and the same 192 blocks is far fewer ops in a 2-ref group",
+   _ops_for(_R, 3, 192), 384)
+eq("...which is exactly why one cap in BLOCKS cannot fit five groups",
+   _ops_for(_R, 0, 192) // _ops_for(_R, 3, 192), 15)
+eq("unknown geometry caps at nblocks rather than becoming unbounded",
+   _ops_for([], 9, 50), 50)
+
+eq("the budget converts ops back to a block count, group 0",
+   _budget(_R, 0, 192, 2048), 68)
+eq("...and lets a low-ref group take far more of the same budget",
+   _budget(_R, 3, 192, 2048), 192)
+eq("a budget of 0 means unbounded, the behaviour that faulted",
+   _budget(_R, 0, 192, 0), 192)
+eq("*** it NEVER returns 0 for a positive want -- a restore that can never "
+   "submit is worse than one that submits one block ***",
+   _budget(_R, 0, 192, 1), 1)
+eq("...and 0 blocks wanted is still 0, not 1", _budget(_R, 0, 0, 2048), 0)
+eq("unknown geometry falls back to one ref per block, so it still bounds",
+   _budget([], 9, 192, 64), 64)
+
+_oload = _osrc[_osrc.index("class DiskLoadHandler"):]
+check("*** the LOAD pump applies BOTH bounds, in different units ***",
+      "min(_load_batch_max()," in _oload and "load_ops_budget(self._refs, g," in _oload)
+check("...and refs_per_group is EXPOSED, or the op arithmetic checks against "
+      "nothing -- the engine log truncates the fingerprint that carries it",
+      "refs_per_group=[len(r) for r in (self._refs or [])]," in _oload)
+check("...with the live cap beside it", "ops_max=_load_ops_max()," in _oload)
+check("the inflight bound is applied ONCE, not duplicated by the edit",
+      _oload.count("if len(self._inner_to_job) >= _load_inflight_max():") == 1)
 
 
 print(f"{PASS} passed, {len(FAIL)} failed")

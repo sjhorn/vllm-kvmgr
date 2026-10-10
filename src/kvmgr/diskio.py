@@ -236,6 +236,75 @@ def staging_plan(pool_capacity: int, slots_knob: int, write_floor_knob: int,
     return size, _floor(write_floor_knob), _floor(read_floor_knob)
 
 
+def load_ops_for(refs, group_idx: int, nblocks: int) -> int:
+    """COPY OPS one submit will contain. PURE, because it is the real limit.
+
+    *** THE BLOCK CAP BOUNDS THE WRONG QUANTITY, and reading upstream is what
+    *** showed it. *** `_custom_ops.swap_blocks_batch` says it "submit[s] all
+    copies in a single driver call" -- `cuMemcpyBatchAsync` on CUDA 12.8+ -- and
+    `cpu/gpu_worker.py` builds that call as
+
+        num_copy_ops += group_size * len(group_data_refs)
+
+    So the descriptors in one driver call are **blocks x refs-for-that-group**,
+    not blocks. `load_batch_max=192` therefore means something different per
+    group: a group with 30 layer refs submits 5,760 descriptors for the same
+    192 blocks that a 2-ref group submits 384 for. Group 0 has the most layers
+    AND the largest block size, so it is the first to reach any descriptor
+    limit, and a single cap in BLOCKS cannot express that at all.
+
+    Pure and separate so the arithmetic can be tested without a GPU, and so the
+    number is derived from the engine's own refs rather than from a constant
+    somebody guessed.
+    """
+    try:
+        return int(nblocks) * len(refs[group_idx])
+    except Exception:
+        # Unknown geometry must not silently become "no limit". One ref per
+        # block is the most optimistic reading, so it caps at nblocks and the
+        # caller still bounds something.
+        return int(nblocks)
+
+
+def load_ops_budget(refs, group_idx: int, want_blocks: int, ops_max: int) -> int:
+    """How many blocks may go in ONE submit, bounded by the op budget. PURE.
+
+    Never returns 0 for a positive `want_blocks`: a round of one block is
+    always allowed, because refusing every round would be a restore that can
+    never make progress -- and upstream's connector cannot express a refusal
+    anyway, so "submit nothing, for ever" is worse than "submit one".
+    """
+    want = int(want_blocks)
+    if want <= 0:
+        return 0
+    if not ops_max or ops_max <= 0:
+        return want
+    try:
+        per_block = max(1, len(refs[group_idx]))
+    except Exception:
+        per_block = 1
+    return max(1, min(want, int(ops_max) // per_block))
+
+
+def _load_ops_max() -> int:
+    """Max copy-op descriptors in ONE staging->GPU submit. Hot. 0 = unbounded.
+
+    The DIMENSION here is read from upstream's code; the THRESHOLD is still
+    empirical and this comment should not pretend otherwise. What is known:
+    ~256 blocks in group 0 faults and ~224 does not, and group 0 carries the
+    most refs -- so the failing descriptor count is whatever 256 x refs[0]
+    comes to on this model. The default is deliberately well under that so the
+    bound is a margin rather than a boundary, and the first measurement with
+    `refs_per_group` exposed will let it be set from arithmetic instead.
+    """
+    try:
+        from kvmgr import flags as _f
+        v = int(_f.peek("load_ops_max") or 0)
+        return v if v > 0 else 2048
+    except Exception:
+        return 2048
+
+
 def _load_inflight_max() -> int:
     """Max load ROUNDS whose GPU copy may be outstanding at once. Hot.
 
@@ -2096,8 +2165,6 @@ class DiskLoadHandler:
                 # every scheduler step, and `kv_connector_no_forward` means
                 # those steps keep coming even with nothing scheduled -- so the
                 # work resumes as soon as a round completes.
-                if len(self._inner_to_job) >= _load_inflight_max():
-                    return
                 g, bkeys, bids = st["batches"][0]
                 # No reserve: see the store's _pump. This pool is the LOAD's
                 # alone now, so a write floor inside it would starve the load to
@@ -2118,7 +2185,17 @@ class DiskLoadHandler:
                 # a pool resize would have silently restored the fault. The cap
                 # is explicit and independent of the pool now, so the pool can
                 # be sized for throughput and this for correctness.
-                _cap = _load_batch_max()
+                # TWO bounds, and they are different units on purpose: the
+                # block cap is what was measured to fault, the OP budget is
+                # what upstream's single driver call actually contains
+                # (blocks x refs-for-this-group). A block cap alone means a
+                # different descriptor count per group, which is why one
+                # number could never fit all five.
+                _cap = min(_load_batch_max(),
+                           load_ops_budget(self._refs, g, len(bids),
+                                           _load_ops_max()))
+                if len(self._inner_to_job) >= _load_inflight_max():
+                    return
                 slots = self._pool.take_upto(min(len(bids), _cap))
                 if not slots:
                     # COUNT IT. `saturations` was declared here and never
@@ -2363,6 +2440,13 @@ class DiskLoadHandler:
                     # and every arm printed "size=?".
                     inflight=len(self._inner_to_job),
                     inflight_max=_load_inflight_max(),
+                    # *** THE GEOMETRY THAT SETS THE REAL LIMIT, and it was
+                    # invisible. *** One submit contains blocks x refs[group]
+                    # descriptors, so without these the op budget cannot be
+                    # checked against anything and the engine log TRUNCATES the
+                    # fingerprint that would otherwise carry them.
+                    refs_per_group=[len(r) for r in (self._refs or [])],
+                    ops_max=_load_ops_max(),
                     # *** THESE WERE MISSING AND I MISREAD THEIR ABSENCE. ***
                     # Only the store handler reported its bounds, so the load
                     # handler showed gpu_rows=None -- and I read "the key is

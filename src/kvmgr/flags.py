@@ -121,6 +121,13 @@ DEFAULTS: dict[str, Any] = {
     # in flight together. 0 = unbounded, which is the behaviour that faulted.
     # 1 makes the path fully serial, which is how the hypothesis gets tested.
     "load_inflight_max": 4,
+    # Max COPY-OP DESCRIPTORS in one staging->GPU submit. This is the quantity
+    # upstream's single `cuMemcpyBatchAsync` actually contains --
+    # `num_copy_ops += group_size * len(group_data_refs)` -- so a cap in BLOCKS
+    # means a different descriptor count per group, and group 0 (most layers,
+    # largest block size) reaches any limit first. 0 = unbounded.
+    # The DIMENSION is read from upstream; the threshold is still empirical.
+    "load_ops_max": 2048,
     # Seconds of ZERO progress after which a stalled transfer job is FAILED.
     # 0 = hang for ever, which is what this path did until 2026-10-10. Default
     # 240, comfortably inside NCCL's 600s watchdog, because the entire point is
