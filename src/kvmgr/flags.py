@@ -102,6 +102,12 @@ DEFAULTS: dict[str, Any] = {
     # today": the skipped copies were discarded anyway, so the bytes that reach
     # disk are identical. Only the wasted copy disappears.
     "disk_skip_present_before_copy": True,
+    # The LOAD pool's live size, mirroring `staging_slots` for the store. The
+    # load has its OWN pinned allocation now (sharing one buffer is what
+    # faulted the worker with Xid 13 five times), so it needs its own live
+    # limit or the knob surface would govern only half the staging.
+    # 0 = the whole load allocation.
+    "staging_load_slots": 0,
     # -- the staging pool, hot ------------------------------------------------
     # *** THE ALLOCATION IS A BOOT CEILING; THESE MOVE WITHIN IT. *** The
     # pinned staging is 63 tensors shared by both handlers and two
@@ -123,7 +129,17 @@ DEFAULTS: dict[str, Any] = {
     # is raised. A starved WRITE is not just slow -- its blocks stay in
     # jobs_to_flush fencing GPU blocks, which is the path that deferred a
     # request until NCCL's watchdog killed a worker.
+    # SUPERSEDED by the staging split: the floors existed to stop one
+    # direction draining a SHARED pool and starving the other. The load
+    # now has its own allocation, so each pool has exactly one user and a
+    # reserve inside it would shrink that user for nothing. Kept so an
+    # existing flags file still parses; read by nothing on the take path.
     "staging_write_floor": 0,
+    # SUPERSEDED by the staging split: the floors existed to stop one
+    # direction draining a SHARED pool and starving the other. The load
+    # now has its own allocation, so each pool has exactly one user and a
+    # reserve inside it would shrink that user for nothing. Kept so an
+    # existing flags file still parses; read by nothing on the take path.
     "staging_read_floor": 0,
     # *** THE ONE KNOB THAT GENUINELY CANNOT BE HOT, and it says so. *** A
     # route either exists in the FastAPI app or it does not, and the app is

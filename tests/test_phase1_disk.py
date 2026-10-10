@@ -288,7 +288,20 @@ _m = sp.get_manager()
 check("*** with restore off, lookup() still refuses -- the ONE gate, and it is "
       "structural ***", _m.lookup(k1, ctx) is False)
 
-eq("the handler is built with our staging size", _built.get("staging_blocks"), 32)
+# *** THE LOAD HAS ITS OWN ROW COUNT NOW, and this assertion caught the change
+# *** rather than being quietly updated to match it.
+# It used to read `== 32` and recorded only the LAST handler built, so it could
+# not tell the two apart at all. Sharing one pinned buffer is what faulted the
+# worker with Xid 13 five times (the load reads it under
+# CU_MEMCPY_SRC_ACCESS_ORDER_ANY, whose precondition is that no concurrent GPU
+# stream writes the source, and the store's copy is exactly such a write), so
+# the two sizes being DIFFERENT is now the property worth pinning.
+eq("the LOAD handler is built with its own staging size, a quarter of the "
+   "store's", _built.get("staging_blocks"), 8)
+eq("...and the spec derived it from the store's, not a constant",
+   sp.staging_load_blocks, max(1, sp.staging_blocks // 4))
+check("*** the two counts DIFFER, which is the whole point of the split ***",
+      sp.staging_load_blocks != sp.staging_blocks)
 check("...and gets the spec, so it can reach file_mapper()", _built.get("spec") is sp)
 
 # ...and with the flag ON, BOTH directions appear. This is the one knob that

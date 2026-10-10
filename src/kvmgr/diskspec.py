@@ -1623,6 +1623,16 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
         # retries unsubmitted store jobs, so transfer_async returning False is
         # an expected answer.
         self.staging_blocks: int = int(self.extra_config.get("staging_blocks", 32))
+        # The LOAD's own pinned rows. Separate from the store's because sharing
+        # one buffer is what faulted the worker with Xid 13 five times: the load
+        # reads it under CU_MEMCPY_SRC_ACCESS_ORDER_ANY, whose precondition is
+        # that no concurrent GPU stream writes the source, and the store's copy
+        # is exactly such a write. A quarter of the store's by default, so the
+        # added pinned memory is a quarter rather than a doubling -- and the way
+        # to hold the total flat is to lower `staging_blocks` by the same
+        # amount, which is a per-node KV_TRANSFER_CONFIG change and a restart.
+        self.staging_load_blocks: int = int(self.extra_config.get(
+            "staging_load_blocks", max(1, self.staging_blocks // 4)))
         self.write_threads: int = int(self.extra_config.get("write_threads", 4))
         self.disk_medium: str = DISK_MEDIUM
 
@@ -1920,7 +1930,8 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
         # right price for a knob that is now genuinely hot on both sides.
         self._load_handler = DiskLoadHandler(
             spec=self, kv_caches=kv_caches,
-            staging_blocks=self.staging_blocks,
+            # ITS OWN row count: the load no longer shares the store's buffer.
+            staging_blocks=self.staging_load_blocks,
             read_threads=self.write_threads, store=handler,
         )
         yield (DiskLoadStoreSpec, GPULoadStoreSpec, self._load_handler)

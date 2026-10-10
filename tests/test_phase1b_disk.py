@@ -316,6 +316,27 @@ class SyncWriters:
         pass
 
 
+def _dsrc_take():
+    """The two take_upto call sites, so a reserve creeping back in is caught.
+
+    Source-text rather than behaviour because a reserve of 0 behaves exactly
+    like no reserve, so no fixture could tell them apart -- and the thing worth
+    pinning is that the SPLIT made the argument meaningless, not that it
+    happens to be zero today.
+    """
+    import os as _os
+    src = open(_os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                             "diskio.py")).read()
+    out = []
+    for i in range(len(src)):
+        j = src.find("self._pool.take_upto(", i)
+        if j < 0:
+            break
+        out.append(src[j:src.index(")", j) + 1])
+        i = j + 1
+    return " ".join(dict.fromkeys(out))
+
+
 def mkhandler(pool_size, nrefs=REFS):
     h = DiskStoreHandler.__new__(DiskStoreHandler)
     h._spec = type("S", (), {"disk_medium": "DSPARK_DISK"})()
@@ -369,16 +390,22 @@ gpu = base.GPULoadStoreSpec(list(range(1000, 1100)), group_sizes=[100, 0, 0, 0, 
 check("*** a 100-block job against an 8-block pool is ACCEPTED, not refused ***",
       h.transfer_async(77, (gpu, diskspec.DiskLoadStoreSpec(ks))) is True)
 eq("...and only a pool's worth is submitted at first", len(h._inner.subs), 1)
-# *** THE FLOOR CHANGES THIS NUMBER ON PURPOSE, so the expectation is derived
-# rather than hardcoded. *** The store and load handlers share one pool, and
-# that sharing made the same restore take 574.9s with stores live against 3.3s
-# with them paused. A quarter of the pool is now reserved for the other
-# direction, so a store round gets `size - read_floor`, not `size`. Writing the
-# arithmetic out keeps the test honest about WHY the number moved.
+# *** THE FLOOR NO LONGER CHANGES THIS NUMBER, and that is the staging SPLIT.
+# The store and load used to share one pool, which is what made the same restore
+# take 574.9s with stores live against 3.3s with them paused -- and, far worse,
+# is what faulted the worker with Xid 13 five times, because the load reads that
+# buffer under CU_MEMCPY_SRC_ACCESS_ORDER_ANY whose precondition is that no
+# concurrent GPU stream writes the source. The load has its own allocation now,
+# so each pool has ONE user and a store round takes the whole live size.
+# `staging_plan` still computes the floors (it is a pure function with its own
+# tests) but the take path no longer passes them; flags.py marks them
+# superseded.
 _sz, _wf, _rf = diskio.staging_plan(8, 0, 0, 0)
-eq("the derived read floor for an 8-slot pool", _rf, 2)
-eq("...so a store round takes size - read_floor", len(h._inner.subs[0][1]),
-   _sz - _rf)
+eq("staging_plan still derives a floor for an 8-slot pool", _rf, 2)
+check("...but the take path does NOT use it -- one user per pool now",
+      "reserve=" not in _dsrc_take())
+eq("...so a store round takes the WHOLE live size", len(h._inner.subs[0][1]),
+   _sz)
 check("...with the job still queued", h._jobs[77]["batches"] != [])
 check("...and the saturation note said ONCE", h._saturated is True)
 
@@ -389,12 +416,15 @@ while not done and rounds < 100:
 eq("the job completes after pumping", len(done), 1)
 eq("...reporting OUR job id, not an inner one", done[0].job_id, 77)
 check("...as a success", done[0].success is True)
-# Derived too, for the same reason: with a floor the per-round batch is
-# size - read_floor, so the round count is ceil(100 / (size - floor)).
+# *** NO FLOOR IN THE ARITHMETIC ANY MORE. *** With the load on its own pinned
+# allocation each pool has exactly one user, so the store takes the WHOLE live
+# size per round and the count is ceil(100 / size), not ceil(100 / (size -
+# read_floor)). Derived from the knob rather than written as a constant, so it
+# still fails if the pool stops handing out what it has.
 import math as _math  # noqa: E402
-eq("...over ceil(100 / (size - read_floor)) rounds", len(h._inner.subs),
-   _math.ceil(100 / (_sz - _rf)))
-check("*** and every block still moves exactly once -- the floor must not "
+eq("...over ceil(100 / size) rounds, the floor no longer applying",
+   len(h._inner.subs), _math.ceil(100 / _sz))
+check("*** and every block still moves exactly once -- chunking must not "
       "drop or duplicate work ***",
       sorted(b for sub in h._inner.subs for b in sub[1]) == list(range(1000, 1100)))
 eq("...covering every block exactly once",
@@ -1581,9 +1611,17 @@ _collect_body = _dsrc[_dsrc.index("def _collect(self) -> None:"):]
 _collect_body = _collect_body[:_collect_body.index("\n    def ")]
 check("*** _collect reconciles the pool, so the knob lands on the next STEP ***",
       "self.reconcile_pool()" in _collect_body)
-check("...and the take path no longer resizes (that was the idle-engine bug)",
-      "set_limit" not in _dsrc[_dsrc.index("reserve=_rf)") - 400:
-                               _dsrc.index("reserve=_rf)")])
+# Re-aimed after the staging SPLIT removed `reserve=_rf)` from the take path:
+# each pool now has one user, so a cross-direction reserve would shrink that
+# user for nothing. The property under test is unchanged -- the take path must
+# not resize -- so it anchors on the take call itself rather than on the
+# vanished reserve argument. An index() on absent text raises, which is how
+# this was caught rather than silently passing.
+_take = "slots = self._pool.take_upto(len(bids))"
+check("the take call is present to anchor on", _dsrc.count(_take) == 2)
+for _i in [_dsrc.index(_take), _dsrc.index(_take, _dsrc.index(_take) + 1)]:
+    check("...and the take path no longer resizes (the idle-engine bug)",
+          "set_limit" not in _dsrc[_i - 400:_i])
 
 # and reconcile_pool must never raise into the step loop
 class _P:
@@ -1928,6 +1966,54 @@ eq("knob OFF: the present key is copied again, as before",
    len(_h4._inner.subs), 1)
 F.write(disk_skip_present_before_copy=1)
 flags.reset_for_tests()
+
+
+
+# ===========================================================================
+# THE LOAD'S STAGING MUST BE ITS OWN -- the Xid 13 root cause, structurally
+# ===========================================================================
+# Sharing one pinned buffer faulted the worker five times. Upstream's load path
+# sets `is_src_access_order_any = not gpu_to_cpu`, and its own comment gives the
+# precondition: CPU->GPU "reads from host pinned memory, which is never written
+# by a concurrent GPU stream". Our store writes that buffer FROM A GPU STREAM,
+# so the precondition was false for us -- structurally, not as a race.
+#
+# Pinned by SOURCE TEXT, and the reason is worth stating rather than hiding: the
+# harness stubs torch and `mkhandler` builds handlers with `__new__`, bypassing
+# `__init__` entirely, so no offline fixture can observe the allocation at all.
+# A lint is the only thing here that can fail if somebody restores the sharing,
+# and a revert is exactly the mistake to guard against, because sharing is the
+# cheaper-looking option and its comment argued for it persuasively for weeks.
+_lsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                          "diskio.py")).read()
+_load_init = _lsrc[_lsrc.index("class DiskLoadHandler"):]
+_load_init = _load_init[:_load_init.index("\n    def _write_row")]
+
+check("*** the load does NOT take the store's staging ***",
+      "self._staging = store._staging" not in _load_init)
+check("*** nor the store's slot pool ***",
+      "self._pool = store._pool" not in _load_init)
+check("...it allocates its own pinned rows", "torch.empty(" in _load_init)
+check("...and its own pool", "self._pool = SlotPool(" in _load_init)
+check("...with pin_memory requested, like the store's",
+      "pin_memory=pin" in _load_init)
+check("...using the SAME import path the store uses, not a guessed one "
+      "(torch_utils would be an ImportError at boot)",
+      "from vllm.utils.platform_utils import is_pin_memory_available"
+      in _load_init)
+check("...and the log line says WHY, so an operator sees the cost and the "
+      "reason together", "SEPARATE from the store's" in _load_init)
+
+# The live size must be reconcilable, or the split would hand the load a pool
+# whose knob silently did nothing -- this project's most repeated defect.
+check("*** the load has its OWN reconcile_pool ***",
+      "def reconcile_pool" in _lsrc[_lsrc.index("class DiskLoadHandler"):])
+check("...driven from its _collect, the once-per-step edge",
+      "self.reconcile_pool()" in _lsrc[_lsrc.index("class DiskLoadHandler"):])
+check("...reading its own knob, not the store's",
+      'peek("staging_load_slots")' in _lsrc)
+check("...and staging_load_slots is a declared knob, not an invented name",
+      "staging_load_slots" in flags.DEFAULTS)
 
 
 print(f"{PASS} passed, {len(FAIL)} failed")

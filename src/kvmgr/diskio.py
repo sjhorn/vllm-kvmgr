@@ -1288,10 +1288,15 @@ class DiskStoreHandler:
         for job_id, st in self._jobs.items():
             while st["batches"] and not st["failed"]:
                 g, bkeys, bids = st["batches"][0]
-                _sz, _wf, _rf = staging_knobs(self._pool.capacity)
-                # Leave the READ floor free: a load starved of slots makes the
-                # RESTORE the slow half, which is the 574.9s-against-3.3s case.
-                slots = self._pool.take_upto(len(bids), reserve=_rf)
+                # *** NO RESERVE ANY MORE, and that is a consequence of the
+                # split, not an oversight. *** The read floor existed to stop a
+                # store draining the shared pool and starving a restore (the
+                # 574.9s-against-3.3s case). With separate allocations this pool
+                # has exactly one user, so reserving part of it for the other
+                # direction would simply shrink the store for nothing.
+                # `staging_write_floor` / `staging_read_floor` are superseded;
+                # flags.py says so where they are declared.
+                slots = self._pool.take_upto(len(bids))
                 if not slots:
                     if not self._saturated:
                         # Said ONCE: a saturated pool is now a throughput note,
@@ -1682,17 +1687,78 @@ class DiskLoadHandler:
         self._spec = spec
         self._mapper = spec.file_mapper()
         self._refs = store._refs
-        # SHARE the store handler's staging and pool. Two pools would double the
-        # pinned memory for no reason, and a load and a store never need the same
-        # slot at once -- the pool is what serialises them.
-        self._staging = store._staging
-        self._pool = store._pool
+
+        # *** THE LOAD GETS ITS OWN PINNED STAGING, AND SHARING IT WAS THE
+        # *** ROOT CAUSE OF ALL FIVE Xid 13 EVENTS. ***
+        #
+        # The comment that used to be here said: "SHARE the store handler's
+        # staging and pool. Two pools would double the pinned memory for no
+        # reason, and a load and a store never need the same slot at once --
+        # the pool is what serialises them."
+        #
+        # Every clause of that is true except the conclusion. The pool does
+        # serialise OWNERSHIP of a slot. What it cannot do is order the
+        # DRIVER's reads of one slot against another stream's writes to a
+        # different slot in the SAME ALLOCATION -- and upstream's load path
+        # gives exactly that ordering up. `cpu/gpu_worker.py`'s
+        # `transfer_async` sets
+        #
+        #     is_src_access_order_any = not self.gpu_to_cpu
+        #
+        # and says why: "CPU->GPU reads from host pinned memory, which is never
+        # written by a concurrent GPU stream, so CU_MEMCPY_SRC_ACCESS_ORDER_ANY
+        # is safe and lets the driver pipeline source reads."
+        #
+        # Our load is CPU->GPU (`gpu_to_cpu=False`), so it inherits ANY-order
+        # access -- while our store writes that very buffer FROM A GPU STREAM.
+        # The precondition upstream states is therefore false for us, and it is
+        # false structurally, not as a race in our bookkeeping. Measured at the
+        # 2026-10-10 07:41 fault: `store path busy -- 1 job(s) outstanding` on
+        # BOTH ranks while the load read the shared pool. The store direction
+        # keeps STREAM ordering (`gpu_to_cpu=True`) and has never faulted this
+        # way, which is the asymmetry the evidence shows.
+        #
+        # So the load allocates its OWN rows. A separate allocation is what
+        # restores upstream's precondition: no GPU stream writes it, ever.
+        # The memory is NOT doubled -- `staging_load_blocks` defaults to a
+        # quarter of the store's, and the honest way to hold total pinned
+        # memory flat is to lower `staging_blocks` by the same amount, which is
+        # a per-node KV_TRANSFER_CONFIG decision and a restart. The allocation
+        # is a boot ceiling either way; the LIVE size stays hot, via
+        # `staging_load_slots`, exactly as the store's does via `staging_slots`.
+        # The SAME import path the store uses -- `vllm.utils.platform_utils`,
+        # not `torch_utils`. My first version guessed the latter, which is an
+        # ImportError at boot: a change that cannot even load is worse than the
+        # bug it fixes, and this file already carries that lesson from a
+        # diagnostic that broke a boot.
+        import torch
+        from vllm.utils.platform_utils import is_pin_memory_available
+
+        pin = is_pin_memory_available()
+        self._staging = []
+        for t in kv_caches.tensors:
+            self._staging.append(torch.empty(
+                (staging_blocks, t.page_size_bytes * spec.block_size_factor),
+                dtype=torch.int8, device="cpu", pin_memory=pin))
+        self._pool = SlotPool(staging_blocks)
+        _per_block = sum(t.page_size_bytes * spec.block_size_factor
+                         for t in kv_caches.tensors)
+        logger.info(
+            "kvmgr: LOAD staging allocation -- %d blocks x %d tensors = %.1f MB "
+            "(pinned=%s), SEPARATE from the store's. Sharing one buffer is what "
+            "faulted the worker with Xid 13: the load reads it under "
+            "CU_MEMCPY_SRC_ACCESS_ORDER_ANY, whose precondition is that no "
+            "concurrent GPU stream writes the source, and the store's copy is "
+            "exactly such a write.",
+            staging_blocks, len(kv_caches.tensors),
+            staging_blocks * _per_block / 1e6, pin)
         # Kept so _bounds() can find the row count without reaching through
         # the inner handler, whose attribute name is upstream's to change.
         self._gpu_tensors = getattr(store, "_gpu_tensors", None) or []
         self._inner = SingleDirectionOffloadingHandler(
             gpu_tensors=store._inner.gpu_tensors
             if hasattr(store._inner, "gpu_tensors") else store._gpu_tensors,
+            # Our own rows, so no GPU stream ever writes this buffer.
             cpu_tensors=self._staging,
             block_size_factor=spec.block_size_factor,
             kv_cache_groups_data_refs=self._refs,
@@ -1839,12 +1905,10 @@ class DiskLoadHandler:
         for job_id, st in self._jobs.items():
             while st["batches"] and not st["failed"]:
                 g, bkeys, bids = st["batches"][0]
-                _sz, _wf, _rf = staging_knobs(self._pool.capacity)
-                # Leave the WRITE floor free. A starved write is not merely
-                # slow: its blocks stay in jobs_to_flush fencing GPU blocks,
-                # which is the path that deferred a request until NCCL's
-                # watchdog killed a worker.
-                slots = self._pool.take_upto(len(bids), reserve=_wf)
+                # No reserve: see the store's _pump. This pool is the LOAD's
+                # alone now, so a write floor inside it would starve the load to
+                # protect a direction that cannot reach it.
+                slots = self._pool.take_upto(len(bids))
                 if not slots:
                     return
                 n = len(slots)
@@ -1857,10 +1921,35 @@ class DiskLoadHandler:
                 else:
                     st["batches"][0] = [g, bkeys[n:], bids[n:]]
 
+    def reconcile_pool(self) -> None:
+        """Apply the hot `staging_load_slots` knob to the LOAD's own pool.
+
+        The load used to share the store's pool, so the store's reconcile
+        governed both. With separate allocations it governs only its own, and a
+        load pool with no reconcile would be a knob that silently did nothing --
+        which is this project's most repeated defect. Called once per scheduler
+        step from `_collect`, the same edge the store uses.
+        """
+        try:
+            from kvmgr import flags as _fl
+            want = staging_plan(self._pool.capacity,
+                                _fl.peek("staging_load_slots"), 0, 0)[0]
+            if want != self._pool.size:
+                logger.info(
+                    "kvmgr: LOAD staging pool live size %d -> %d of %d "
+                    "allocated (hot; the allocation itself is a boot ceiling)",
+                    self._pool.size, want, self._pool.capacity)
+                self._pool.set_limit(want)
+        except Exception:
+            # A resize that cannot be computed must never stop a restore.
+            pass
+
     def _collect(self) -> None:
         from vllm.v1.kv_offload.base import GPULoadStoreSpec
         from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
         from vllm.v1.kv_offload.worker.worker import TransferResult
+
+        self.reconcile_pool()
 
         if not _LIVE_CONN_WORKER:
             capture_conn_worker_from_caller()

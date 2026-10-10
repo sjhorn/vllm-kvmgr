@@ -280,6 +280,7 @@ PROBE = {
     # so the probe pair is inverted relative to the off-by-default knobs:
     # (value to pin via env, value to write to the file).
     "disk_skip_present_before_copy": (0, 1),
+    "staging_load_slots": (0, 4),
     # The staging knobs. These ARE genuinely hot in both value and effect: the
     # live pool size is re-read from the flags on every transfer round and
     # `set_limit` only moves which already-allocated rows are handed out, so
