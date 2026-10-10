@@ -2371,6 +2371,37 @@ check("the inflight bound is applied ONCE, not duplicated by the edit",
       _oload.count("if len(self._inner_to_job) >= _load_inflight_max():") == 1)
 
 
+# ---------------------------------------------------------------------------
+# *** EVERY IMPORT-FAILED LITERAL MUST AGREE WITH ITS DECLARATION. ***
+# Each of the three knob readers falls back to flags.DEFAULTS, with a bare
+# literal behind it for the one case where flags cannot be imported at all.
+# That literal is the second copy of the number this fix exists to remove, so
+# it is only safe while it matches. It did NOT match once: DEFAULTS was lowered
+# to load_inflight_max=1 after 4 was measured to kill the engine (Xid 32 x2,
+# 2026-10-10) and the reader still said 4, so a zero or unparseable knob
+# reinstated the fatal value through the safety path.
+#
+# ENUMERATED FROM THE SOURCE, not from a hand-written list -- this project's own
+# rule, because a hand-written table of 6 of 24 knobs is how the last one hid.
+import re as _re_lit
+_litsrc = open(_DISKIO).read() if "_DISKIO" in dir() else _csrc
+_found = {}
+for _m in _re_lit.finditer(
+        r'int\(_f\.DEFAULTS\["(\w+)"\]\)\s*or\s*(\d+)', _litsrc):
+    _found[_m.group(1)] = int(_m.group(2))
+check("every knob reader derives its default from flags.DEFAULTS",
+      len(_found) >= 3, f"found {sorted(_found)}")
+for _n, _lit in sorted(_found.items()):
+    eq(f"...and {_n}'s import-failed literal agrees with the declaration",
+       _lit, flags.DEFAULTS[_n])
+# and the trailing `except Exception: return <literal>` of each reader too --
+# a different line, the same hazard
+for _m in _re_lit.finditer(
+        r'int\(_f\.DEFAULTS\["(\w+)"\]\)\s*or\s*(\d+)\s*\n\s*except Exception:\s*\n\s*return (\d+)',
+        _litsrc):
+    eq(f"...and {_m.group(1)}'s except-path literal matches it too",
+       int(_m.group(3)), flags.DEFAULTS[_m.group(1)])
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
     for f in FAIL:

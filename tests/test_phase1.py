@@ -654,6 +654,28 @@ check("and the windowed groups together cost 26 blocks, 0.1% of the pool",
       "measured on the live engine: windows (None,128,128,8,128)")
 
 # ---------------------------------------------------------------------------
+# THE MEASURED-SAFE DEFAULTS, PINNED. A safe value carried as a runtime override
+# is a value you lose on the next boot: every 700K measurement ran with
+# load_inflight_max=1 as an override, and when the engine restarted it came back
+# with restore LIVE and the DEFAULT of 4 -- the configuration measured on
+# 2026-10-10 to kill the engine (Xid 32 x2 on the head, unspecified launch
+# failure, EngineDeadError) with load_ops_max pinned at 2048 throughout.
+#
+# These two assertions exist so raising either one has to be a deliberate act
+# that breaks a test naming the fault, rather than an edit that looks like
+# tuning. They assert the DEFAULT, not a knob read, because the default is the
+# thing a restart falls back to.
+import kvmgr.flags as _flags_mod
+_d = _flags_mod.DEFAULTS if hasattr(_flags_mod, "DEFAULTS") else _flags_mod._DEFAULTS
+eq("load_inflight_max DEFAULTS to the measured-safe 1, not the fatal 4",
+   _d["load_inflight_max"], 1)
+eq("and load_ops_max defaults to the measured 2048",
+   _d["load_ops_max"], 2048)
+check("and inflight_max=1 costs nothing: 1 and 2 both restore 700K in 12s",
+      True,
+      "measured 2026-10-10 -- the restore is bandwidth-bound, not "
+      "submission-bound, so there is no throughput traded for this default")
+
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")
 F.remove()

@@ -300,7 +300,13 @@ def _load_ops_max() -> int:
     try:
         from kvmgr import flags as _f
         v = int(_f.peek("load_ops_max") or 0)
-        return v if v > 0 else 2048
+        if v > 0:
+            return v
+        # the DECLARED default, never a second copy: this fallback and
+        # flags.DEFAULTS drifted once (4 here against 1 there, after 4 was
+        # measured to kill the engine), so a zero knob reinstated the fatal
+        # value through the safety path. The literal is the import-failed case.
+        return int(_f.DEFAULTS["load_ops_max"]) or 2048
     except Exception:
         return 2048
 
@@ -328,9 +334,15 @@ def _load_inflight_max() -> int:
     try:
         from kvmgr import flags as _f
         v = int(_f.peek("load_inflight_max") or 0)
-        return v if v > 0 else 4
+        if v > 0:
+            return v
+        # the DECLARED default, never a second copy: this fallback and
+        # flags.DEFAULTS drifted once (4 here against 1 there, after 4 was
+        # measured to kill the engine), so a zero knob reinstated the fatal
+        # value through the safety path. The literal is the import-failed case.
+        return int(_f.DEFAULTS["load_inflight_max"]) or 1
     except Exception:
-        return 4
+        return 1
 
 
 def _load_batch_max() -> int:
@@ -348,7 +360,13 @@ def _load_batch_max() -> int:
     try:
         from kvmgr import flags as _f
         v = int(_f.peek("load_batch_max") or 0)
-        return v if v > 0 else 192
+        if v > 0:
+            return v
+        # the DECLARED default, never a second copy: this fallback and
+        # flags.DEFAULTS drifted once (4 here against 1 there, after 4 was
+        # measured to kill the engine), so a zero knob reinstated the fatal
+        # value through the safety path. The literal is the import-failed case.
+        return int(_f.DEFAULTS["load_batch_max"]) or 192
     except Exception:
         return 192
 
@@ -2031,7 +2049,22 @@ class DiskLoadHandler:
                       "wait_calls": 0, "wait_ours": 0, "wait_blocked_ms": 0,
                       "wait_max_pending": 0, "wait_rounds": 0,
                       "saturations": 0}
-        logger.info("kvmgr: disk LOAD handler installed (restore is live)")
+        # REPORT THE FACT, NOT THE ASK. This said "(restore is live)"
+        # unconditionally, from __init__, with no gate on the flag -- so a boot
+        # whose flags file had disk_restore=False still announced a live
+        # restore, and I trusted it over /kv, which was correct. Installing the
+        # handler and being permitted to load are different things: lookup()
+        # refuses while the flag is off, so the handler can exist and restore
+        # still be impossible.
+        try:
+            from kvmgr import flags as _f0
+            _live = bool(_f0.peek("disk_restore"))
+        except Exception:
+            _live = None
+        logger.info(
+            "kvmgr: disk LOAD handler installed -- disk_restore=%s (the handler "
+            "exists either way; lookup() refuses while it is off)",
+            "UNREADABLE" if _live is None else _live)
         _LIVE_HANDLERS.append(self)
         _start_watchdog()
 

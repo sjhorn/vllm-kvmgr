@@ -120,7 +120,33 @@ DEFAULTS: dict[str, Any] = {
     # issues many prepare_load calls and nothing bounded how many rounds were
     # in flight together. 0 = unbounded, which is the behaviour that faulted.
     # 1 makes the path fully serial, which is how the hypothesis gets tested.
-    "load_inflight_max": 4,
+    #
+    # *** THE HYPOTHESIS IS TESTED AND THE DEFAULT IS NOW 1. *** Measured
+    # 2026-10-10 with load_ops_max PINNED at 2048 (~33 blocks, a SEVENTH of the
+    # smallest per-call value ever seen to fault): inflight 1 and 2 restore a
+    # 700K prefix in 12s each, and inflight 4 KILLED THE ENGINE -- Xid 32 twice
+    # on the head, `CUDA error: unspecified launch failure`, EngineDeadError.
+    # So concurrency is load-bearing INDEPENDENTLY of the per-call bound, and 4
+    # is not a conservative default, it is the lethal one.
+    #
+    # AND IT COSTS NOTHING TO BE SAFE HERE: 1 and 2 are indistinguishable,
+    # because the restore is bounded by device and link bandwidth rather than by
+    # outstanding submissions. There is no throughput being traded away.
+    #
+    # The reason this matters as a DEFAULT and not just a knob: the safe value
+    # was carried as a runtime override through every 700K measurement, and a
+    # restart discards overrides. The engine came back up reading
+    # `load_inflight_max 4 (default)` from /kv -- the value measured to be
+    # fatal -- while the file still had disk_restore=False.
+    #
+    # SO THE HAZARD WAS LATENT, NOT LIVE, and the distinction is the point: with
+    # restore off no load can fire, so nothing was in danger that minute. What
+    # was true is that enabling disk_restore -- one hot knob, the obvious next
+    # step, and the whole reason this tier exists -- would have armed the fatal
+    # pair without anyone touching concurrency at all. A safe value that exists
+    # only as an override is not a safe default; it is a safe value you lose on
+    # the next boot, silently, because a default is not a change.
+    "load_inflight_max": 1,
     # Max COPY-OP DESCRIPTORS in one staging->GPU submit. This is the quantity
     # upstream's single `cuMemcpyBatchAsync` actually contains --
     # `num_copy_ops += group_size * len(group_data_refs)` -- so a cap in BLOCKS
