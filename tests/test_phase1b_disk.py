@@ -1161,10 +1161,13 @@ _real_write = mt_a._write_manifest
 _slow = {"n": 0}
 
 
-def _slow_write():
+def _slow_write(snap):
+    # takes the snapshot the real writer now takes -- a no-arg stand-in raised
+    # TypeError inside the thread, where nothing was watching, and the only
+    # symptom was "writer started 0 time(s)"
     _slow["n"] += 1
     _t_async.sleep(1.5)
-    _real_write()
+    _real_write(snap)
 
 
 mt_a._write_manifest = _slow_write
@@ -1187,6 +1190,48 @@ check("...and the skipped one did NOT start a second writer",
 check("...and it lands once joined", mt_a.flush_wait(30.0) is True)
 check("...leaving the file on disk", os.path.exists(mpath2 + ".async"))
 eq("...counted as exactly one write", mt_a._stats["manifest_writes"], 1)
+
+# *** AND IT MUST STILL WRITE WHILE THE INDEX IS MUTATING, which the first
+# *** version did not -- it wrote NOTHING. *** That version iterated the live
+# `_present` on the writer thread and retried on RuntimeError, reasoning that a
+# missed key is picked up next time. Measured on the box with a live store:
+#     12:38:41 kvmgr: manifest flush gave up after 3 attempts against a
+#              mutating index; the next trigger will try again
+#     12:39:53 (again)
+# A live store mutates continuously, so the iteration never completed and the
+# manifest was never written -- strictly worse than the 0.78s stall it
+# replaced, because that cost a second of stream and this costs
+# restore-after-restart. The fix is a `list()` snapshot on the caller's thread,
+# atomic under the GIL, so there is no race to survive.
+mt_m = diskspec.DiskPresenceManager(FakeMapper2, num_workers=2,
+                                    manifest_path=mpath2 + ".mutating")
+mt_m.complete_store(mkkeys(4, g=1, salt=123), ctx3)
+_mreal = mt_m._write_manifest
+_mseen = {}
+
+
+def _mutating_write(snap):
+    # mutate the index WHILE the writer runs -- the shape that broke it
+    _mseen["len_at_write"] = len(snap)
+    for _k in mkkeys(6, g=1, salt=250):
+        mt_m._present[bytes(_k)] = (1, 0)
+    _mreal(snap)
+
+
+mt_m._write_manifest = _mutating_write
+mt_m._last_flush -= diskspec.DiskPresenceManager.MANIFEST_FLUSH_S + 1
+mt_m._unflushed = 1
+mt_m.flush_manifest()
+mt_m.flush_wait(30.0)
+check("*** the manifest IS written while the index mutates under it ***",
+      os.path.exists(mpath2 + ".mutating"),
+      "the retry-on-RuntimeError version wrote nothing at all here")
+eq("...and it is counted as a write", mt_m._stats["manifest_writes"], 1)
+_got = json.loads(open(mpath2 + ".mutating").read())["keys"]
+eq("...holding exactly the SNAPSHOT's keys, not a torn half-mutated view",
+   len(_got), _mseen.get("len_at_write"))
+check("...and the keys added mid-write are simply in the NEXT flush, not lost",
+      len(mt_m._present) > len(_got))
 
 # And shutdown, which is what makes the loss window ZERO on a clean restart.
 mt3 = diskspec.DiskPresenceManager(FakeMapper2, num_workers=2,

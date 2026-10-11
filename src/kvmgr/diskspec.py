@@ -803,7 +803,7 @@ class DiskPresenceManager(OffloadingManager):
                        # that can go wrong need to be visible: a trigger
                        # skipped because one was already running, and a retry
                        # forced by a concurrent store.
-                       "manifest_skipped_busy": 0, "manifest_retries": 0}
+                       "manifest_skipped_busy": 0}
         # offered / to_store / completed, keyed by group index. A plain dict of
         # dicts rather than a list, because the group count is not known here
         # and a missing group must read as ABSENT rather than as 0.
@@ -1101,10 +1101,36 @@ class DiskPresenceManager(OffloadingManager):
         # starts another.
         self._unflushed = 0
         self._last_flush = _now()
+        # *** THE SNAPSHOT IS NOT OPTIONAL, AND LEAVING IT OUT BROKE THE
+        # *** MANIFEST COMPLETELY. *** The first version iterated the live
+        # `_present` on the writer thread and retried on the RuntimeError a
+        # concurrent mutation raises, on the reasoning that a missed key is
+        # picked up by the next flush. Measured on the box with the store live:
+        #
+        #   12:38:41 kvmgr: manifest flush gave up after 3 attempts against a
+        #            mutating index; the next trigger will try again
+        #   12:39:53 (again)
+        #
+        # With a live store the index mutates CONTINUOUSLY, so a full-index
+        # iteration essentially never completes and the manifest is never
+        # written at all. That is strictly worse than the stall it replaced:
+        # the stall cost a second of stream, this costs restore-after-restart,
+        # which is the entire point of the index. "A few keys wait a cycle" was
+        # true of one racing mutation and false of a stream of them.
+        #
+        # So: one `list()` call, which is atomic under the GIL and therefore
+        # consistent by construction, and the expensive part (hex, json, 63 MB
+        # of I/O -- 0.55s of the 0.78s) happens on the writer thread off it.
+        # The snapshot costs 0.153s measured against 771,775 keys, which is a
+        # real hiccup and is accepted deliberately: it is rate-limited to once
+        # per 512 keys or 30s, it is a fifth of what it replaces, and it is the
+        # price of the manifest existing at all. Making it cheap needs the
+        # append-only journal, which is O(changes) rather than O(index).
+        snap = list(self._present.items())
         if force:
-            self._write_manifest()
+            self._write_manifest(snap)
         else:
-            self._flush_async()
+            self._flush_async(snap)
 
     # -- the manifest writer ----------------------------------------------
     def flush_wait(self, timeout: float = 30.0) -> bool:
@@ -1129,11 +1155,11 @@ class DiskPresenceManager(OffloadingManager):
         t = getattr(self, "_flush_thread", None)
         return bool(t is not None and t.is_alive())
 
-    def _flush_async(self) -> None:
+    def _flush_async(self, snap) -> None:
         """Start the manifest write on a background thread. Never raises."""
         import threading
         try:
-            t = threading.Thread(target=self._write_manifest,
+            t = threading.Thread(target=self._write_manifest, args=(snap,),
                                  name="kvmgr-manifest", daemon=True)
             # daemon: an unclean kill is the normal way this process ends, and
             # a half-written .part is harmless because the rename is atomic.
@@ -1143,9 +1169,9 @@ class DiskPresenceManager(OffloadingManager):
             # could not start a thread -- do it inline rather than never
             logger.exception("kvmgr: could not start the manifest thread; "
                              "writing inline")
-            self._write_manifest()
+            self._write_manifest(snap)
 
-    def _write_manifest(self) -> None:
+    def _write_manifest(self, snap) -> None:
         """Serialise the index to disk, atomically. Never raises.
 
         *** THE IMPORTS ARE LOCAL AND THAT IS NOT STYLE. *** `flush_manifest`
@@ -1159,34 +1185,26 @@ class DiskPresenceManager(OffloadingManager):
         """
         import json
         import os as _os
-        for _attempt in range(3):
-            try:
-                _os.makedirs(_os.path.dirname(self._manifest), exist_ok=True)
-                tmp = self._manifest + ".part"
-                with open(tmp, "w") as f:
-                    # [hex, pos] pairs, UNSORTED -- see the note above. The LRU
-                    # order is deliberately not persisted either: a restart's
-                    # recency is meaningless and pretending otherwise would
-                    # evict by the age of a previous boot.
-                    json.dump({"keys": [[k.hex(), p]
-                                        for k, (nb, p) in self._present.items()]}, f)
-                _os.replace(tmp, self._manifest)
-                self._stats["manifest_writes"] += 1
-                return
-            except RuntimeError:
-                # "dictionary changed size during iteration" -- a store
-                # completed while we were serialising. Counted, because a retry
-                # loop that is silently always retrying is a performance bug
-                # nobody can see.
-                self._stats["manifest_retries"] = self._stats.get(
-                    "manifest_retries", 0) + 1
-                continue
-            except Exception:
-                logger.exception("kvmgr: manifest flush failed (presence kept "
-                                 "in memory; a restart will simply forget it)")
-                return
-        logger.warning("kvmgr: manifest flush gave up after 3 attempts against "
-                       "a mutating index; the next trigger will try again")
+        try:
+            _os.makedirs(_os.path.dirname(self._manifest), exist_ok=True)
+            tmp = self._manifest + ".part"
+            with open(tmp, "w") as f:
+                # [hex, pos] pairs, UNSORTED. The sort was 0.227s of CONTIGUOUS
+                # GIL and existed only so a diff of two manifests reads nicely;
+                # `sort_keys` on a reader's own copy gets that back for free.
+                # The LRU order is deliberately not persisted either: a
+                # restart's recency is meaningless and pretending otherwise
+                # would evict by the age of a previous boot.
+                json.dump({"keys": [[k.hex(), p] for k, (nb, p) in snap]}, f)
+            _os.replace(tmp, self._manifest)
+            self._stats["manifest_writes"] += 1
+        except Exception:
+            # NO RETRY LOOP ANY MORE: it existed to survive a mutating index,
+            # and the snapshot means there is no longer one to survive. A retry
+            # here would be retrying a real I/O error, which is not something
+            # to paper over.
+            logger.exception("kvmgr: manifest flush failed (presence kept "
+                             "in memory; a restart will simply forget it)")
 
     # -- reads ------------------------------------------------------------
     def lookup(self, key: "OffloadKey", req_context: "ReqContext") -> bool | None:
