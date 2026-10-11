@@ -327,6 +327,13 @@ PROBE = {
     # be added without somebody verifying its hot-config behaviour.
     "head_pin_partial": (0, 1),
     "gpu_cache_drop_allowed": (0, 1),
+    # The presence journal. Added 2026-10-11, and this table is why: the audit
+    # below raised KeyError on the first run after they were declared, which is
+    # the third time it has caught a knob nobody had proved hot.
+    "journal_enabled": (0, 1),
+    "journal_max_records": (100, 50000),
+    "journal_max_bytes": (65536, 67108864),
+    "journal_fsync": (0, 1),
 }
 # *** THIS ASSERTION IS WHY A NEW KNOB CANNOT SHIP UNPROVEN, and it caught one
 # on 2026-10-08. *** `disk_store_paused` was added to DEFAULTS and not here, and

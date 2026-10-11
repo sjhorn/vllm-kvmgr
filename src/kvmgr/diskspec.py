@@ -1121,25 +1121,41 @@ class DiskPresenceManager(OffloadingManager):
         import json
         import os as _os
 
-        if not self._manifest or not _os.path.exists(self._manifest):
+        if not self._manifest:
             return
+        # *** THE SNAPSHOT MAY NOT EXIST AND THAT IS NOT AN EARLY RETURN. ***
+        # It used to be, and the journal then could not be read at all without
+        # one -- which is precisely the state the journal exists to cover: keys
+        # stored and appended, no snapshot yet, process killed. Six assertions
+        # caught this the first time they ran. An absent snapshot is an empty
+        # base, not a reason to skip the replay.
+        raw = []
+        if _os.path.exists(self._manifest):
+            try:
+                with open(self._manifest) as f:
+                    raw = json.load(f).get("keys", [])
+            except Exception:
+                logger.exception(
+                    "kvmgr: manifest %s is unreadable -- continuing with an "
+                    "EMPTY base. The journal beside it is still replayed, so "
+                    "this costs recompute and never correctness",
+                    self._manifest)
+                raw = []
+        # *** BOTH FORMATS, AND THE OLD ONE IS 520,446 KEYS ON DISK RIGHT
+        # *** NOW. *** Phase 5 needs a block POSITION per key, so entries
+        # became `[hex, pos]`. A reader that only understood the new shape
+        # would throw away the entire existing index -- 518 GB of files
+        # that are still perfectly restorable -- and the loss would look
+        # like a cache that simply went cold. So a bare string is still
+        # accepted and given pos=-1, meaning "position unknown".
+        #
+        # pos=-1 sorts BEFORE 0 under the `-pos` tail-first tie-break,
+        # which makes unknown-position keys the LAST victims within their
+        # age rather than the first. That is the conservative direction: a
+        # key we cannot place in a prefix might be a head, and evicting a
+        # head orphans everything behind it.
+        keys, poss = [], []
         try:
-            with open(self._manifest) as f:
-                raw = json.load(f).get("keys", [])
-            # *** BOTH FORMATS, AND THE OLD ONE IS 520,446 KEYS ON DISK RIGHT
-            # *** NOW. *** Phase 5 needs a block POSITION per key, so entries
-            # became `[hex, pos]`. A reader that only understood the new shape
-            # would throw away the entire existing index -- 518 GB of files
-            # that are still perfectly restorable -- and the loss would look
-            # like a cache that simply went cold. So a bare string is still
-            # accepted and given pos=-1, meaning "position unknown".
-            #
-            # pos=-1 sorts BEFORE 0 under the `-pos` tail-first tie-break,
-            # which makes unknown-position keys the LAST victims within their
-            # age rather than the first. That is the conservative direction: a
-            # key we cannot place in a prefix might be a head, and evicting a
-            # head orphans everything behind it.
-            keys, poss = [], []
             for item in raw:
                 if isinstance(item, str):
                     keys.append(bytes.fromhex(item)); poss.append(-1)
@@ -1147,10 +1163,16 @@ class DiskPresenceManager(OffloadingManager):
                     keys.append(bytes.fromhex(item[0])); poss.append(int(item[1]))
         except Exception:
             logger.exception(
-                "kvmgr: manifest %s is unreadable -- starting with an EMPTY "
-                "index, which costs recompute and never correctness",
-                self._manifest)
-            return
+                "kvmgr: manifest %s has an unreadable ENTRY -- continuing with "
+                "what parsed, plus the journal", self._manifest)
+        # *** THE JOURNAL IS REPLAYED HERE, BEFORE THE PRUNE. *** The prune is
+        # what makes a stale claim safe -- upstream asserts on a failed load --
+        # so a replayed key whose file has gone must still meet it. Replaying
+        # after the prune would smuggle unverified keys into the index.
+        _base = self._journal_load(list(zip(keys, poss)))
+        keys = [k for k, _p in _base]
+        poss = [p for _k, p in _base]
+
         kept = []
         for k in keys:
             try:
@@ -1171,6 +1193,223 @@ class DiskPresenceManager(OffloadingManager):
             "FILE: it is a claim about both nodes and can only be checked "
             "against this one.",
             self._manifest, len(kept), len(keys) - len(kept))
+
+    # -- the presence journal: the I/O shell over the pure functions -------
+    #
+    # Every piece of state here is created LAZILY ON THE INSTANCE and read with
+    # getattr. *** THAT IS NOT STYLE, IT IS A FATAL BUG THIS REPO HAS ALREADY
+    # SHIPPED. *** `rebind` re-points a live manager with `obj.__class__ = new`,
+    # so the instance gets every new METHOD and never the new constructor -- an
+    # attribute added in __init__ and read on a hot path raises AttributeError
+    # inside the scheduler, which kills the engine core. `_gcounts` in
+    # prepare_store cost exactly that. Never a class-level dict either, which
+    # every instance would share.
+
+    def _jstate(self) -> dict:
+        """Journal state, created on first use."""
+        st = getattr(self, "_jst", None)
+        if st is None:
+            st = {"fh": None, "records": 0, "bytes": 0}
+            self._jst = st
+        return st
+
+    def _journal_names(self):
+        """`(journal, compacting)` beside the snapshot, or `(None, None)`."""
+        if not self._manifest:
+            return (None, None)
+        return (self._manifest + ".journal", self._manifest + ".compacting")
+
+    def _journal_on(self) -> bool:
+        """Does the journal get WRITTEN? Replay does not consult this -- see
+        `_journal_load`."""
+        try:
+            from . import flags as _f
+            return bool(_f.peek("journal_enabled"))
+        except Exception:
+            return False
+
+    def _journal_bound(self, name: str) -> int:
+        try:
+            from . import flags as _f
+            v = _f.peek(name)
+            return int(v) if v is not None else int(_f.DEFAULTS[name])
+        except Exception:
+            try:
+                from . import flags as _f
+                return int(_f.DEFAULTS[name])
+            except Exception:
+                return 0
+
+    def _journal_append(self, kind, items) -> None:
+        """Append one record. *** NEVER RAISES. ***
+
+        It sits on `complete_store`'s path, which is the scheduler's thread, so
+        an exception here is an engine outage. A journal that cannot be written
+        degrades to exactly today's behaviour -- the index is still in memory
+        and the snapshot is still the backstop -- so the honest response is to
+        count it, say so once, and carry on.
+        """
+        if not items and kind != JOURNAL_CLEAR:
+            return
+        if not self._journal_on():
+            return
+        jpath, _c = self._journal_names()
+        if not jpath:
+            return
+        st = self._jstate()
+        try:
+            line = journal_encode(kind, items)
+        except Exception:
+            self._stats["journal_errors"] = self._stats.get("journal_errors", 0) + 1
+            return
+        fh = st.get("fh")
+        try:
+            if fh is None:
+                import os as _os
+                _os.makedirs(_os.path.dirname(jpath), exist_ok=True)
+                fh = open(jpath, "a")
+                st["fh"] = fh
+                try:
+                    st["bytes"] = _os.path.getsize(jpath)
+                except Exception:
+                    st["bytes"] = 0
+            fh.write(line)
+            # *** flush() AND NOT fsync, AND THE THREAT MODEL IS THE ARGUMENT.
+            # *** The failure this mechanism exists to prevent is the ENGINE
+            # dying with stored keys unnamed. A write plus flush puts the bytes
+            # in the OS page cache, which survives the process being killed --
+            # and being killed is the normal way this process ends. fsync only
+            # adds cover for machine power loss, and costs a sync per store
+            # round on the scheduler's own thread. It is a knob, default off.
+            fh.flush()
+            if self._journal_fsync():
+                import os as _os
+                _os.fsync(fh.fileno())
+            st["records"] += 1
+            st["bytes"] += len(line)
+            self._stats["journal_appends"] = (
+                self._stats.get("journal_appends", 0) + 1)
+        except Exception:
+            self._stats["journal_errors"] = self._stats.get("journal_errors", 0) + 1
+            try:
+                st["fh"] = None
+                if fh is not None:
+                    fh.close()
+            except Exception:
+                pass
+            logger.exception(
+                "kvmgr: journal append failed -- the index is still in memory "
+                "and presence.json is still the backstop, so this costs "
+                "durability between snapshots and never correctness")
+
+    def _journal_fsync(self) -> bool:
+        try:
+            from . import flags as _f
+            return bool(_f.peek("journal_fsync"))
+        except Exception:
+            return False
+
+    def _journal_rotate(self) -> None:
+        """`journal` -> `compacting`, and begin a fresh journal. Never raises.
+
+        *** CALLED IMMEDIATELY AFTER THE SNAPSHOT IS TAKEN, NEVER BEFORE. ***
+        A record appended between the two lands in `compacting` and is replayed
+        at load, which is harmless because replay is idempotent. Rotate first
+        and that record is simply lost -- the orphan this whole mechanism
+        exists to prevent, reintroduced by an ordering.
+        """
+        jpath, cpath = self._journal_names()
+        if not jpath:
+            return
+        st = self._jstate()
+        try:
+            fh = st.get("fh")
+            if fh is not None:
+                try:
+                    fh.flush()
+                    fh.close()
+                except Exception:
+                    pass
+                st["fh"] = None
+            import os as _os
+            if _os.path.exists(jpath):
+                _os.replace(jpath, cpath)
+            st["records"] = 0
+            st["bytes"] = 0
+            self._stats["journal_rotations"] = (
+                self._stats.get("journal_rotations", 0) + 1)
+        except Exception:
+            logger.exception("kvmgr: journal rotate failed")
+
+    def _journal_drop_compacting(self) -> None:
+        """Discard `compacting` -- ONLY ever after the snapshot is durable.
+
+        That ordering is the crash-safety contract: snapshot first, discard
+        second. Die in between and the next boot replays records the snapshot
+        already holds, which replay is built to absorb. Discard first and a
+        crash loses them.
+        """
+        _j, cpath = self._journal_names()
+        if not cpath:
+            return
+        try:
+            import os as _os
+            if _os.path.exists(cpath):
+                _os.unlink(cpath)
+        except Exception:
+            logger.exception("kvmgr: could not discard the compacted journal")
+
+    def _journal_load(self, base):
+        """Replay the journal over `base`. Returns the new `(key, pos)` list.
+
+        *** REPLAY DOES NOT CONSULT `journal_enabled`. *** The knob gates
+        WRITING. If the journal was on and is now off, the records on disk are
+        still NEWER than the snapshot, so ignoring them would silently discard
+        real presence. The recovery from a journal you distrust is to delete the
+        files, exactly as `_load_manifest` says of presence.json itself.
+
+        `compacting` is replayed first: it was frozen before the snapshot it is
+        paired with, so its records are older than anything in `journal`.
+        """
+        jpath, cpath = self._journal_names()
+        if not jpath:
+            return base
+        total = {"records": 0, "adds": 0, "removes": 0, "clears": 0, "torn": 0}
+        for path in (cpath, jpath):
+            try:
+                import os as _os
+                if not path or not _os.path.exists(path):
+                    continue
+                with open(path) as f:
+                    lines = f.readlines()
+            except Exception:
+                logger.exception("kvmgr: journal %s is unreadable -- skipped", path)
+                continue
+            try:
+                base, st = journal_replay(base, lines)
+            except Exception:
+                logger.exception("kvmgr: journal %s failed to replay -- skipped", path)
+                continue
+            for k in total:
+                total[k] += st.get(k, 0)
+            if st.get("torn"):
+                logger.warning(
+                    "kvmgr: journal %s has a TORN final record -- %d record(s) "
+                    "applied and the remainder discarded. This is the expected "
+                    "shape of an unclean kill mid-append, not corruption: the "
+                    "lost records are keys whose files are on disk and which "
+                    "will simply be re-stored.", path, st.get("records", 0))
+        for k, v in total.items():
+            self._stats["journal_" + k] = v
+        if total["records"]:
+            logger.info(
+                "kvmgr: journal replayed -- %d record(s): %d add(s), %d "
+                "remove(s), %d clear(s), torn=%d. The snapshot is pruned "
+                "against the filesystem AFTER this, so a replayed key whose "
+                "file has gone is still dropped.",
+                total["records"], total["adds"], total["removes"],
+                total["clears"], total["torn"])
+        return base
 
     def flush_manifest(self, force: bool = False) -> None:
         import json
@@ -1194,9 +1433,27 @@ class DiskPresenceManager(OffloadingManager):
         if not force:
             if not self._unflushed:
                 return
-            stale = (_now() - self._last_flush) >= self.MANIFEST_FLUSH_S
-            if self._unflushed < self.MANIFEST_FLUSH_KEYS and not stale:
-                return
+            if self._journal_on():
+                # *** WITH THE JOURNAL ON, THE SNAPSHOT IS NO LONGER THE
+                # DURABILITY MECHANISM -- it is the compaction of one. *** Every
+                # presence edge is already an append, so the 512-key / 30s
+                # trigger above would keep paying the O(index) cost it exists
+                # to remove, and keep refusing 81% of its own attempts. The
+                # snapshot now fires only when the journal has grown enough
+                # that replaying it at boot would cost more than rewriting the
+                # index once.
+                _st = self._jstate()
+                if not compaction_due(
+                        _st["records"], _st["bytes"],
+                        self._journal_bound("journal_max_records"),
+                        self._journal_bound("journal_max_bytes")):
+                    return
+                self._stats["journal_compactions"] = (
+                    self._stats.get("journal_compactions", 0) + 1)
+            else:
+                stale = (_now() - self._last_flush) >= self.MANIFEST_FLUSH_S
+                if self._unflushed < self.MANIFEST_FLUSH_KEYS and not stale:
+                    return
         # *** THIS FLUSH WAS A ~0.8s HOLE IN THE ENGINE'S THREAD, and the
         # *** comment above justified it with a figure three orders of
         # *** magnitude stale: "the manifest is tens of KB". It is 63 MB.
@@ -1276,6 +1533,10 @@ class DiskPresenceManager(OffloadingManager):
         # price of the manifest existing at all. Making it cheap needs the
         # append-only journal, which is O(changes) rather than O(index).
         snap = list(self._present.items())
+        # Snapshot first, THEN rotate -- never the other way round. See
+        # _journal_rotate: a record landing between the two is replayed and
+        # harmless, whereas rotating first loses it.
+        self._journal_rotate()
         if force:
             self._write_manifest(snap)
         else:
@@ -1347,6 +1608,9 @@ class DiskPresenceManager(OffloadingManager):
                 json.dump({"keys": [[k.hex(), p] for k, (nb, p) in snap]}, f)
             _os.replace(tmp, self._manifest)
             self._stats["manifest_writes"] += 1
+            # The snapshot is durable, so the records it absorbed may go. This
+            # ordering is the crash-safety contract and must not be inverted.
+            self._journal_drop_compacting()
         except Exception:
             # NO RETRY LOOP ANY MORE: it existed to survive a mutating index,
             # and the snapshot means there is no longer one to survive. A retry
@@ -1589,6 +1853,11 @@ class DiskPresenceManager(OffloadingManager):
         freed = 0
         for v in victims:
             freed += self._forget(v)
+        # Journalled BEFORE the delete rides out to the workers: a remove
+        # recorded for a file that then survives is a key we will simply
+        # re-store, while a delete that happened with no record is a file no
+        # future boot can name -- the orphan. Err toward the recoverable one.
+        self._journal_append(JOURNAL_REMOVE, [bytes(v) for v in victims])
         if victims:
             self._stats["evicted"] = self._stats.get("evicted", 0) + len(victims)
             self._stats["evicted_bytes"] = (
@@ -1635,12 +1904,21 @@ class DiskPresenceManager(OffloadingManager):
     ) -> None:
         self._ensure_index()
         new = [k for k in keys if bytes(k) not in self._present]
+        _jadds = []
         for k in new:
             # The position was recorded when the key was OFFERED, because that
             # is the only moment it is known: the scheduler hands keys in block
             # order within a group, which is the same invariant check_pairing
             # relies on. By completion time that ordering is gone.
-            self._remember(bytes(k), self._pos_hint.pop(bytes(k), -1))
+            _p = self._pos_hint.pop(bytes(k), -1)
+            self._remember(bytes(k), _p)
+            _jadds.append((bytes(k), _p))
+        # The journal's add edge is THIS one and only this one, for the same
+        # reason the manifest's is: complete_store fires if and only if every
+        # rank reported the job done, so a key recorded here was written
+        # everywhere. Appending anywhere earlier would claim a key rank 1 may
+        # still be writing.
+        self._journal_append(JOURNAL_ADD, _jadds)
         self._stats["stored"] += len(new)
         # The all-ranks edge. Counted per group so `offered - completed` is
         # readable: a gap here is a job that never finished, not a key nobody

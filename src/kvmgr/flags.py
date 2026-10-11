@@ -171,6 +171,42 @@ DEFAULTS: dict[str, Any] = {
     "store_batch_max": 32,
     "store_ops_max": 2048,
     "store_inflight_max": 1,
+    # -- the presence journal ------------------------------------------
+    # OFF BY DEFAULT, and that is this module's own invariant rather than
+    # timidity: an empty flags file must behave exactly as today, so a new
+    # mechanism arrives inert and `local-ops/flags.reference.json` turns it on.
+    #
+    # WHAT IT FIXES. The manifest is O(index) to persist O(changes) -- 772,561
+    # keys rewritten for the ~71 a response adds -- and under a real store load
+    # that saturates: manifest_writes 109 against manifest_skipped_busy 462, so
+    # 81% of flush attempts were refused as already busy. A refused flush is a
+    # window in which a key is on disk with nothing able to NAME it, which is
+    # how 155 GiB of unreachable orphans accumulated. With the journal on, the
+    # snapshot fires only on compaction and every presence edge is one append.
+    #
+    # IT DOES NOT SHRINK THE BOOT WALK. Every key's file is still stat'ed
+    # because offloading/worker.py:273 asserts on a failed load, and that is
+    # independent of the index's file format.
+    "journal_enabled": False,
+    # Compaction bounds. Records bound the REPLAY cost at boot; bytes bound the
+    # disk cost of a pathological run of tiny records. Either trips it, and a
+    # ZERO OR NEGATIVE value disables that half rather than meaning "always" --
+    # a knob somebody zeroed must not turn compaction into a whole-index
+    # rewrite per record, which is the exact cost this mechanism removes. That
+    # fail-safe direction is the load_inflight_max lesson applied to a bound.
+    #
+    # 20,000 records is ~70 responses' worth of adds at the measured ~71 keys
+    # each, so a snapshot every few minutes under sustained store rather than
+    # the 109-plus-462-refused seen without it.
+    "journal_max_records": 20000,
+    "journal_max_bytes": 33554432,
+    # fsync EVERY RECORD. Off, deliberately, and the threat model is the whole
+    # argument: the failure this exists to prevent is the ENGINE dying with
+    # stored keys unnamed, and a plain write plus flush() already survives
+    # process death because the bytes are in the OS page cache. fsync only adds
+    # cover for machine power loss, at a sync per store round on the engine
+    # core's own thread. Turn it on to trade that latency for that cover.
+    "journal_fsync": False,
     # Seconds of ZERO progress after which a stalled transfer job is FAILED.
     # 0 = hang for ever, which is what this path did until 2026-10-10. Default
     # 240, comfortably inside NCCL's 600s watchdog, because the entire point is
