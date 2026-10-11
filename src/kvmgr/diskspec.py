@@ -575,6 +575,155 @@ def live_manager_snapshot() -> dict | None:
         return {"error": "snapshot raised"}
 
 
+# ---------------------------------------------------------------------------
+# THE PRESENCE JOURNAL -- the pure half
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS. The manifest is O(index) to persist O(changes): 772,561 keys
+# rewritten for the ~71 a single response adds. Measured on the live box under
+# a real store load, that saturates: `manifest_writes 109` against
+# `manifest_skipped_busy 462`, so 81% of flush attempts were refused because a
+# write was already in flight. A refused flush is not merely slow -- it is a
+# window in which a key is on disk with nothing able to NAME it, which is
+# precisely how 155 GiB of unreachable orphans accumulated before anybody was
+# counting. So this is a durability fix that happens to also be a cost fix,
+# and not the other way round.
+#
+# WHAT IT IS NOT. It does NOT shrink the boot walk. Every key's file is still
+# `stat`ed at startup because `offloading/worker.py:273` asserts on a failed
+# load, and that is independent of the index's file FORMAT. Anybody sizing the
+# 256s boot against this is sizing against nothing.
+#
+# These four functions are pure on purpose: this repo's rule is that anything
+# which could silently corrupt KV must be testable with no GPU and no torch.
+# The manager's I/O is a thin shell over them.
+
+JOURNAL_ADD = "a"
+JOURNAL_REMOVE = "r"
+JOURNAL_CLEAR = "c"
+
+_JMISSING = object()
+
+
+def journal_encode(kind: str, items) -> str:
+    """One journal record, newline-terminated.
+
+    *** NEWLINE-DELIMITED RATHER THAN ONE JSON DOCUMENT, and that is the whole
+    design. *** The point of a journal is that a reader can still use the
+    PREFIX of a file whose tail was lost to an unclean kill. `json.load` of a
+    truncated array yields nothing at all -- it would turn a partial loss into
+    a total one, which is the failure the manifest already has.
+    """
+    import json
+    if kind == JOURNAL_ADD:
+        payload = [[bytes(k).hex(), int(p)] for k, p in items]
+    elif kind == JOURNAL_REMOVE:
+        payload = [bytes(k).hex() for k in items]
+    elif kind == JOURNAL_CLEAR:
+        payload = 1
+    else:
+        raise ValueError("unknown journal record kind: %r" % (kind,))
+    return json.dumps({kind: payload}, separators=(",", ":")) + "\n"
+
+
+def journal_decode(line):
+    """`(kind, payload)`, or None when the line cannot be trusted.
+
+    None covers the torn final record -- the EXPECTED shape of a kill
+    mid-append -- and anything else unparseable. The caller must STOP on None
+    rather than skip it: a record that did not land completely means the writer
+    was interrupted, so nothing after it is evidence about anything. Skipping
+    would silently apply changes from the far side of a gap.
+    """
+    import json
+    s = line.strip()
+    if not s:
+        return None
+    try:
+        d = json.loads(s)
+    except Exception:
+        return None
+    if not isinstance(d, dict) or len(d) != 1:
+        return None
+    kind, payload = next(iter(d.items()))
+    if kind == JOURNAL_ADD:
+        out = []
+        try:
+            for item in payload:
+                out.append((bytes.fromhex(item[0]), int(item[1])))
+        except Exception:
+            return None
+        return (kind, out)
+    if kind == JOURNAL_REMOVE:
+        try:
+            return (kind, [bytes.fromhex(h) for h in payload])
+        except Exception:
+            return None
+    if kind == JOURNAL_CLEAR:
+        return (kind, [])
+    return None
+
+
+def journal_replay(base, lines):
+    """Replay a journal over a snapshot. Returns `(entries, stats)`.
+
+    *** IDEMPOTENT BY CONSTRUCTION, AND THAT IS WHAT MAKES COMPACTION
+    CRASH-SAFE. *** Compaction writes the new snapshot and only THEN truncates
+    the journal, so a crash in between leaves records the snapshot already
+    contains. An add of a present key is a no-op (mirroring `_remember`'s early
+    return) and a remove of an absent key is a no-op (mirroring `_forget`'s
+    `pop` default), so replaying them a second time cannot change the answer.
+    Reverse that order -- truncate, then write -- and a crash there loses the
+    index entirely.
+
+    `base` is `(key, pos)` pairs from the snapshot. Order is append order,
+    which is all that is wanted: `_write_manifest` already records that LRU
+    recency is deliberately NOT persisted, because a previous boot's recency is
+    meaningless and evicting by it would be worse than evicting by nothing.
+    """
+    entries = OrderedDict()
+    for k, p in base:
+        entries[bytes(k)] = int(p)
+    stats = {"adds": 0, "removes": 0, "clears": 0, "torn": 0, "records": 0}
+    for line in lines:
+        rec = journal_decode(line)
+        if rec is None:
+            stats["torn"] = 1
+            break
+        kind, payload = rec
+        stats["records"] += 1
+        if kind == JOURNAL_ADD:
+            for k, p in payload:
+                if k not in entries:
+                    entries[k] = p
+                    stats["adds"] += 1
+        elif kind == JOURNAL_REMOVE:
+            for k in payload:
+                if entries.pop(k, _JMISSING) is not _JMISSING:
+                    stats["removes"] += 1
+        elif kind == JOURNAL_CLEAR:
+            entries.clear()
+            stats["clears"] += 1
+    return list(entries.items()), stats
+
+
+def compaction_due(records: int, journal_bytes: int,
+                   max_records: int, max_bytes: int) -> bool:
+    """Should the journal be folded back into a snapshot? Either bound trips.
+
+    Records bound the REPLAY cost at boot; bytes bound the disk cost of a
+    pathological run of tiny records. A zero or negative bound DISABLES that
+    half rather than meaning "always" -- a knob somebody zeroed must not turn
+    compaction into a whole-index rewrite per record, which is the exact cost
+    this mechanism exists to remove. That is this repo's rule that a knob's
+    degenerate value must fail safe, learnt from `load_inflight_max`.
+    """
+    if max_records and max_records > 0 and records >= max_records:
+        return True
+    if max_bytes and max_bytes > 0 and journal_bytes >= max_bytes:
+        return True
+    return False
+
+
 def _now() -> float:
     """Monotonic seconds. A helper so the manifest's time floor cannot be
     accidentally written against the wall clock, which a clock step would
