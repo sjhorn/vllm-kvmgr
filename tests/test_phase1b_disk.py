@@ -1111,6 +1111,14 @@ check("*** a handful of keys does NOT flush immediately -- that is the design,"
 # moves the recorded time rather than sleeping 30 seconds.
 mt._last_flush -= diskspec.DiskPresenceManager.MANIFEST_FLUSH_S + 1
 mt.flush_manifest()
+# *** THE WRITE IS ASYNCHRONOUS NOW, so "I triggered it" and "it is on disk"
+# are different statements and the test has to say which it means. *** The
+# flush moved off the engine's thread because serialising the live 771,775-key
+# index costs 0.779s measured (hex+sorted 0.227s, json.dump 0.552s) and that was
+# the ~1.1s mid-stream stall test-meter.sh section 1 failed on. `flush_wait`
+# exists so this is a deadline rather than a sleep-and-hope.
+check("the manifest write is joinable, not a race the test has to sleep on",
+      mt.flush_wait(30.0) is True)
 check("*** ...but ENOUGH TIME does, with the same three keys ***",
       os.path.exists(mpath2))
 eq("...writing all of them", len(json.loads(open(mpath2).read())["keys"]), 3)
@@ -1130,8 +1138,55 @@ mt2 = diskspec.DiskPresenceManager(FakeMapper2, num_workers=2,
 w0 = mt2._stats["manifest_writes"]
 mt2.complete_store(mkkeys(diskspec.DiskPresenceManager.MANIFEST_FLUSH_KEYS + 1,
                           g=1, salt=78), ctx3)
+# the counter is incremented by the WRITER, which now runs on its own thread,
+# so join before reading it -- see flush_wait
+mt2.flush_wait(30.0)
 check("*** enough KEYS still flushes on its own, clock untouched ***",
       mt2._stats["manifest_writes"] > w0)
+
+# ---------------------------------------------------------------------------
+# *** THE FLUSH MUST NOT RUN ON THE CALLER'S THREAD, and that is the whole
+# *** point of the change -- so it is asserted directly. *** Serialising the
+# live 771,775-key index costs 0.779s measured on spark-45ea (hex+sorted
+# 0.227s, json.dump 0.552s), which is the ~1.1s mid-stream stall
+# scripts/test-meter.sh section 1 failed on (max gap 1.137s vs a 0.102s
+# baseline). Every other manifest assertion here would stay green if somebody
+# moved the write back inline, because they all check the FILE and an inline
+# write produces the same file -- just a second later, on the engine's thread.
+import time as _t_async
+mt_a = diskspec.DiskPresenceManager(FakeMapper2, num_workers=2,
+                                    manifest_path=mpath2 + ".async")
+mt_a.complete_store(mkkeys(3, g=1, salt=91), ctx3)
+_real_write = mt_a._write_manifest
+_slow = {"n": 0}
+
+
+def _slow_write():
+    _slow["n"] += 1
+    _t_async.sleep(1.5)
+    _real_write()
+
+
+mt_a._write_manifest = _slow_write
+mt_a._last_flush -= diskspec.DiskPresenceManager.MANIFEST_FLUSH_S + 1
+_t0 = _t_async.monotonic()
+mt_a.flush_manifest()
+_took = _t_async.monotonic() - _t0
+check("*** flush_manifest RETURNS while the write is still going ***",
+      _took < 0.5,
+      "took %.3fs against a 1.5s write -- if this is ~1.5s the flush is back "
+      "on the caller's thread and every stream pays for it" % _took)
+# ...and a second trigger while it is in flight is SKIPPED, not queued
+mt_a._last_flush -= diskspec.DiskPresenceManager.MANIFEST_FLUSH_S + 1
+mt_a._unflushed = 1
+mt_a.flush_manifest()
+eq("...and a trigger while one is in flight is skipped, and COUNTED",
+   mt_a._stats["manifest_skipped_busy"], 1)
+check("...and the skipped one did NOT start a second writer",
+      _slow["n"] == 1, "writer started %d time(s)" % _slow["n"])
+check("...and it lands once joined", mt_a.flush_wait(30.0) is True)
+check("...leaving the file on disk", os.path.exists(mpath2 + ".async"))
+eq("...counted as exactly one write", mt_a._stats["manifest_writes"], 1)
 
 # And shutdown, which is what makes the loss window ZERO on a clean restart.
 mt3 = diskspec.DiskPresenceManager(FakeMapper2, num_workers=2,
