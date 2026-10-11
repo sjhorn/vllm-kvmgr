@@ -1954,8 +1954,13 @@ eq("the ledger counts transfers", _ls["transfers"], 2)
 eq("...and keeps the RANGE of block ids handed to the kernel",
    _ls["block_id_range"], [5, 40])
 eq("...and of staging slots", _ls["slot_range"], [0, 3])
+# the 8th field is the wall-clock stamp added 2026-10-11 so the ring can be
+# lined up against journalctl -k's Xid timestamp; the first seven are the shape
+_ring_e = _ls["recent"][-1]
 eq("...and the recent ring records shape, not data",
-   _ls["recent"][-1], ("load", 0, 1, 40, 40, 3, 3))
+   tuple(_ring_e[:7]), ("load", 0, 1, 40, 40, 3, 3))
+check("...with a wall-clock stamp as the 8th field, for Xid attribution",
+      len(_ring_e) == 8 and abs(_ring_e[7] - __import__("time").time()) < 60)
 check("the ring is bounded, so a 180K prefill cannot grow it without limit",
       diskio._LEDGER_RING <= 64)
 for _i in range(diskio._LEDGER_RING * 3):
@@ -2533,6 +2538,116 @@ check("...with the live cap beside it", "ops_max=_load_ops_max()," in _oload)
 check("the inflight bound is applied ONCE, not duplicated by the edit",
       _oload.count("if len(self._inner_to_job) >= _load_inflight_max():") == 1)
 
+
+# ---------------------------------------------------------------------------
+print("\n== (b16) the LEDGER, which was silent on the one fault that mattered ==")
+# On 2026-10-11 the engine died of Xid 11 four seconds into its first request
+# and `grep "transfer ledger"` over the whole boot returned NOTHING: the ring
+# emitted only every 2,000 transfers. An instrument that cannot fire reads as a
+# clean run, which is this project's "a lint that cannot fail reads as
+# coverage" wearing the other hat.
+import time as _lt15
+
+
+class _CapLog:
+    """Collects log calls so the tests can assert what reached the LOG --
+    which is the only place a ring survives the worker's death."""
+
+    def __init__(self):
+        self.lines = []
+
+    def _rec(self, fmt, *a):
+        try:
+            self.lines.append(fmt % a if a else fmt)
+        except Exception:
+            self.lines.append(repr((fmt, a)))
+
+    info = warning = error = exception = _rec
+
+    def __getattr__(self, _n):
+        return self._rec
+
+
+_cap = _CapLog()
+_real_logger = diskio.logger
+diskio.logger = _cap
+
+# 1. THE TIME FLOOR: a handful of transfers must still produce a line
+_hl = mkhandler(8)
+_hl._ledger_note("store", 0, [1, 2, 3], [0, 1, 2])
+_n_after_first = len([l for l in _cap.lines if "transfer ledger" in l])
+check("one transfer emits a ledger line (the count threshold is 2000)",
+      _n_after_first >= 1,
+      "the Xid 11 boot had far fewer than 2000 transfers and logged nothing")
+# ...and it does NOT emit again immediately, or a 700K store floods the log
+_cap.lines.clear()
+for _i in range(20):
+    _hl._ledger_note("store", 0, [_i], [0])
+eq("...but it does not emit per transfer -- 15s floor, not a line each",
+   len([l for l in _cap.lines if "transfer ledger" in l]), 0)
+# ...and it emits again once the floor has passed
+_hl._ledger["last_log"] = _hl._ledger.get("last_log", 0.0) - (
+    diskio._LEDGER_EVERY_S + 1)
+_hl._ledger_note("store", 0, [7], [1])
+check("...and emits again once 15s have passed",
+      len([l for l in _cap.lines if "transfer ledger" in l]) >= 1)
+
+# 2. EVERY ENTRY CARRIES A WALL-CLOCK STAMP, or it cannot be lined up against
+#    journalctl -k's Xid timestamp, which is the whole point of attribution
+_e = _hl._ledger["recent"][-1]
+eq("a ring entry has 8 fields -- the 8th is the wall-clock time", len(_e), 8)
+check("...and it is a plausible wall-clock time, not a monotonic counter",
+      abs(_e[7] - _lt15.time()) < 60,
+      "got %r; time.monotonic() cannot be compared to the kernel log" % (_e[7],))
+
+# 3. THE DUMP REACHES THE LOG, with the ring, newest last
+_cap.lines.clear()
+diskio.ledger_dump(_hl, "unit test")
+_dump = [l for l in _cap.lines if "LEDGER DUMP" in l]
+eq("ledger_dump logs a header naming the reason", len(_dump), 1)
+check("...naming the reason", "unit test" in _dump[0])
+check("...and the class, because store and load have separate rings",
+      "DiskStoreHandler" in _dump[0])
+_rows = [l for l in _cap.lines if "ledger " in l and "DUMP" not in l]
+check("...and the ring ROWS reach the log, not just the min/max",
+      len(_rows) >= 2, "got %d rows" % len(_rows))
+check("...with block id ranges in them", "block_ids=[" in "".join(_rows))
+
+# 4. IT MUST NEVER RAISE -- it runs on a post-mortem path, where a second
+#    failure destroys the evidence it exists to preserve
+_cap.lines.clear()
+
+
+class _Broken:
+    _ledger = {"n": 1, "bid_min": 0, "bid_max": 1, "slot_min": 0,
+               "slot_max": 1, "recent": [("store", 0, 1, 0, 1, 0, 1)]}
+
+    def _bounds(self):
+        raise RuntimeError("geometry unavailable")
+
+
+diskio.ledger_dump(_Broken(), "broken bounds")
+check("a dump survives _bounds() raising", True)
+check("...and still logged something", len(_cap.lines) >= 1)
+check("...and tolerates the OLD 7-field ring shape",
+      "block_ids=[" in "".join(_cap.lines))
+diskio.ledger_dump(None, "no handler at all")
+check("a dump survives being handed nothing", True)
+
+# 5. AND BOTH HANDLERS MUST DUMP ON FAILURE -- enumerated from the source,
+#    because the two rings are duplicated per class and this project's record
+#    is that duplicated pairs drift. A post-mortem path that exists on one
+#    direction only is the half-instrumented case that is worst to debug.
+_lsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+                          "diskio.py")).read()
+_lsrc_nc = _strip_comments(_lsrc) if "_strip_comments" in dir() else _lsrc
+for _want in ("store transfer reported FAILURE", "load transfer reported FAILURE",
+              "store REFUSED on bounds", "load REFUSED on bounds"):
+    check("a ledger dump is wired to: %s" % _want, _want in _lsrc_nc)
+eq("...and the watchdog dumps in BOTH handlers, not one",
+   _lsrc_nc.count("watchdog failed %d stalled job(s)"), 2)
+
+diskio.logger = _real_logger
 
 # ---------------------------------------------------------------------------
 # *** EVERY IMPORT-FAILED LITERAL MUST AGREE WITH ITS DECLARATION. ***

@@ -893,6 +893,75 @@ def conn_worker_snapshot() -> dict:
 #     alone would cry wolf on exactly the workload this is for.
 _LEDGER_RING = 24
 _LEDGER_EVERY = 2000
+# *** AND A TIME FLOOR, BECAUSE THE COUNT ALONE LEFT THE ONE FAULT THAT
+# *** MATTERED WITH NO RECORD AT ALL. *** Measured 2026-10-11: the engine died
+# of Xid 11 at 12:25:47, four seconds into its first real request, and
+# `grep "transfer ledger"` over the whole boot returned NOTHING -- the ring had
+# nowhere near 2,000 transfers in it. The instrument built specifically so an
+# asynchronous fault could be attributed produced silence on the only occasion
+# it was needed, which is this project's "a lint that cannot fail reads as
+# coverage" wearing the other hat: an instrument that cannot fire reads as a
+# clean run.
+#
+# 15s is chosen against the two things it has to beat: the fault arrived 4s
+# after the first transfer, and the stall watchdog already logs every 30s, so
+# this is the same order of noise for a strictly more useful line.
+_LEDGER_EVERY_S = 15.0
+
+
+def ledger_dump(h, reason: str) -> None:
+    """Log the ledger ring at WARNING. Never raises. Module-level on purpose.
+
+    *** THE RING IS THE FORENSIC PAYLOAD AND IT ONLY EXISTED IN MEMORY. ***
+    `/kv/workers` serves it, which is useless in the case it was built for: a
+    GPU fault kills the worker, so by the time anybody asks, the process that
+    held the ring is gone. The ring has to reach the LOG, where `docker logs`
+    keeps it after the container dies -- and this repo already learned to stream
+    that log to a file from before an experiment for exactly this reason.
+
+    Module-level so the store and load handlers share one implementation; their
+    `_ledger_note` is duplicated per class and the two drifting apart on a
+    post-mortem path is not a risk worth taking for symmetry.
+    """
+    try:
+        led = getattr(h, "_ledger", None)
+        cls = type(h).__name__
+        if led is None:
+            logger.warning("kvmgr: ledger dump (%s) -- %s has transferred "
+                           "NOTHING. That is an absence, not a range of 0.",
+                           reason, cls)
+            return
+        try:
+            rows, slots = h._bounds()
+        except Exception:
+            rows, slots = -1, -1
+        logger.warning(
+            "kvmgr: LEDGER DUMP (%s) -- %s, %d transfers, block ids seen in "
+            "[%s, %s] of %d rows, slots in [%s, %s] of %d. An index at or past "
+            "a bound is the illegal access an Xid reports.",
+            reason, cls, led["n"], led["bid_min"], led["bid_max"], rows,
+            led["slot_min"], led["slot_max"], slots)
+        # newest LAST, with wall-clock times, so the tail can be lined up
+        # against the kernel's own Xid timestamp from journalctl -k
+        for e in led["recent"][-_LEDGER_RING:]:
+            logger.warning("kvmgr:   ledger %s", _ledger_fmt(e))
+    except Exception:
+        return
+
+
+def _ledger_fmt(e) -> str:
+    """One ring entry as text. Tolerates the older 7-field shape."""
+    try:
+        kind, group, n, lo, hi, slo, shi = e[:7]
+        ts = e[7] if len(e) > 7 else None
+        when = "-"
+        if ts:
+            import time as _t
+            when = _t.strftime("%H:%M:%S", _t.localtime(ts)) + ("%.3f" % (ts % 1))[1:]
+        return ("%s %s group=%d n=%d block_ids=[%s..%s] slots=[%s..%s]"
+                % (when, kind, group, n, lo, hi, slo, shi))
+    except Exception:
+        return repr(e)
 _WATCHDOG_HEARTBEAT_S = 30.0
 _WATCHDOG_STALL_S = 120.0
 _watchdog_started = False
@@ -1500,10 +1569,21 @@ class DiskStoreHandler:
                             ("slot_min", slo, min), ("slot_max", shi, max)):
                 if v is not None:
                     led[k] = v if led[k] is None else f(led[k], v)
-            led["recent"].append((kind, group, len(bids), lo, hi, slo, shi))
+            # a WALL-CLOCK stamp per entry, because attribution means lining
+            # the ring up against `journalctl -k`'s Xid timestamp, and a
+            # monotonic clock cannot be compared to the kernel's log
+            import time as _lt
+            _now_w = _lt.time()
+            led["recent"].append((kind, group, len(bids), lo, hi, slo, shi,
+                                  _now_w))
             if len(led["recent"]) > _LEDGER_RING:
                 del led["recent"][:-_LEDGER_RING]
-            if led["n"] % _LEDGER_EVERY == 0:
+            # EITHER enough transfers OR enough time -- the count alone left
+            # the 2026-10-11 Xid 11 with no ledger line at all, four seconds
+            # into the boot's first request.
+            _stale = (_now_w - led.get("last_log", 0.0)) >= _LEDGER_EVERY_S
+            if led["n"] % _LEDGER_EVERY == 0 or _stale:
+                led["last_log"] = _now_w
                 logger.info(
                     "kvmgr: transfer ledger -- %d transfers, block ids seen in "
                     "[%s, %s] of %d rows, slots in [%s, %s] of %d. Any index "
@@ -1688,6 +1768,7 @@ class DiskStoreHandler:
                     # reload trap as _gcounts and _ready, now in a dict.
                     self.stats["refused_bounds"] = self.stats.get(
                         "refused_bounds", 0) + 1
+                    ledger_dump(self, "store REFUSED on bounds: " + str(why))
                     logger.error(
                         "kvmgr: REFUSING a store round -- %s. job=%s group=%s "
                         "n=%d. Refused rather than submitted: handing these to "
@@ -1839,6 +1920,7 @@ class DiskStoreHandler:
         # earlier, with the watchdog's reason directly above it.
         _nf = honour_stall_fail(self)
         if _nf:
+            ledger_dump(self, "watchdog failed %d stalled job(s)" % _nf)
             logger.error(
                 "kvmgr: marked %d STORE job(s) failed on the watchdog's "
                 "request. upstream's assert will now fire on the next "
@@ -1859,6 +1941,12 @@ class DiskStoreHandler:
                 self._pool.give(slots)
                 continue
             if not res.success:
+                # *** THE RING, AT THE ONE MOMENT IT IS WORTH HAVING. *** The
+                # GPU has reported a failed copy; an Xid usually follows or has
+                # just preceded it. Dumping here is what makes the fault
+                # attributable to a block-id range instead of to "something in
+                # the transfer path".
+                ledger_dump(self, "store transfer reported FAILURE")
                 self._pool.give(slots)
                 st["failed"] = True
                 st["pending"] -= 1
@@ -2263,10 +2351,21 @@ class DiskLoadHandler:
                             ("slot_min", slo, min), ("slot_max", shi, max)):
                 if v is not None:
                     led[k] = v if led[k] is None else f(led[k], v)
-            led["recent"].append((kind, group, len(bids), lo, hi, slo, shi))
+            # a WALL-CLOCK stamp per entry, because attribution means lining
+            # the ring up against `journalctl -k`'s Xid timestamp, and a
+            # monotonic clock cannot be compared to the kernel's log
+            import time as _lt
+            _now_w = _lt.time()
+            led["recent"].append((kind, group, len(bids), lo, hi, slo, shi,
+                                  _now_w))
             if len(led["recent"]) > _LEDGER_RING:
                 del led["recent"][:-_LEDGER_RING]
-            if led["n"] % _LEDGER_EVERY == 0:
+            # EITHER enough transfers OR enough time -- the count alone left
+            # the 2026-10-11 Xid 11 with no ledger line at all, four seconds
+            # into the boot's first request.
+            _stale = (_now_w - led.get("last_log", 0.0)) >= _LEDGER_EVERY_S
+            if led["n"] % _LEDGER_EVERY == 0 or _stale:
+                led["last_log"] = _now_w
                 logger.info(
                     "kvmgr: transfer ledger -- %d transfers, block ids seen in "
                     "[%s, %s] of %d rows, slots in [%s, %s] of %d. Any index "
@@ -2400,6 +2499,7 @@ class DiskLoadHandler:
         # same remedy.
         _nf = honour_stall_fail(self)
         if _nf:
+            ledger_dump(self, "watchdog failed %d stalled job(s)" % _nf)
             logger.error(
                 "kvmgr: marked %d LOAD job(s) failed on the watchdog's "
                 "request -- see the STORE note; the assert is upstream's.", _nf)
@@ -2443,6 +2543,7 @@ class DiskLoadHandler:
             if why is not None:
                 self.stats["refused_bounds"] = self.stats.get(
                     "refused_bounds", 0) + 1
+                ledger_dump(self, "load REFUSED on bounds: " + str(why))
                 logger.error(
                     "kvmgr: REFUSING a restore round -- %s. job=%s group=%s. "
                     "A bad index here would write off the end of the KV tensor, "
@@ -2476,6 +2577,7 @@ class DiskLoadHandler:
             if st is None:
                 continue
             if not res.success:
+                ledger_dump(self, "load transfer reported FAILURE")
                 st["failed"] = True
             st["pending"] -= 1
 
