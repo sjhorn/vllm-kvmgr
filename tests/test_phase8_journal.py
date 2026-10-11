@@ -441,6 +441,36 @@ eq("*** THE RECORDS ARE STILL REPLAYED WITH THE KNOB OFF ***",
    len(m16._present), 2)
 eq("...and counted", m16._stats.get("journal_adds"), 2)
 
+print()
+print("== (8q) a rotate must NEVER overwrite an existing compacting ==")
+# flush_manifest's busy guard is `not force and _flush_busy()`, so a FORCED
+# flush -- shutdown() and reset_cache() both force -- can rotate while an async
+# write still holds its compacting. os.replace there would destroy records the
+# on-disk snapshot does not yet contain, and a subsequent failed write would
+# lose them for good: this journal defeated by its own compaction.
+tmpA = tempfile.mkdtemp(prefix="kv8-rotate-")
+FJ.write(journal_enabled=1)
+KF.reset_for_tests()
+mA = mkmgr(tmpA)
+for k in (K1, K2):
+    touchfile(tmpA, k)
+mA.complete_store([K1], ctx)
+mA._journal_rotate()                       # compacting now holds K1's add
+cpath = os.path.join(tmpA, "presence.json.compacting")
+check("compacting exists after the first rotate", os.path.exists(cpath))
+first = open(cpath).read()
+mA.complete_store([K2], ctx)               # a fresh journal with K2's add
+mA._journal_rotate()                       # the dangerous second rotate
+eq("*** THE FIRST COMPACTING IS NOT OVERWRITTEN ***", open(cpath).read(), first)
+eq("...and the deferral is counted",
+   mA._stats.get("journal_rotate_deferred"), 1)
+check("...and the live journal still holds the newer record",
+      os.path.exists(os.path.join(tmpA, "presence.json.journal")))
+# Nothing may be lost: both keys must come back.
+mB = mkmgr(tmpA)
+mB.lookup(K1, ctx)
+eq("...so BOTH keys survive the deferred rotate", len(mB._present), 2)
+
 FJ.write(journal_enabled=0)
 KF.reset_for_tests()
 

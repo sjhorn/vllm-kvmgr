@@ -1332,6 +1332,30 @@ class DiskPresenceManager(OffloadingManager):
                     pass
                 st["fh"] = None
             import os as _os
+            # *** NEVER OVERWRITE AN EXISTING `compacting`. ***
+            # The busy check in flush_manifest is `not force and _flush_busy()`,
+            # so a FORCED flush -- which `shutdown` and `reset_cache` both do --
+            # bypasses it and can land here while an async write still holds its
+            # own `compacting`. `os.replace` would then destroy records that the
+            # on-disk snapshot does not yet contain, and if the forced write
+            # went on to fail they would be gone for good: the exact loss this
+            # journal exists to prevent, caused by its own compaction.
+            #
+            # Skipping the rotate is safe and the asymmetry is why. The caller's
+            # snapshot is taken from the live index, so it is a SUPERSET of
+            # whatever `compacting` holds -- writing it loses nothing. The only
+            # cost is that the journal is not truncated this round, so its
+            # records are replayed next boot; replay is idempotent, so that is
+            # wasted work rather than a wrong answer.
+            if cpath and _os.path.exists(cpath):
+                self._stats["journal_rotate_deferred"] = (
+                    self._stats.get("journal_rotate_deferred", 0) + 1)
+                logger.warning(
+                    "kvmgr: journal rotate DEFERRED -- %s already exists, so a "
+                    "compaction is still in flight. The snapshot about to be "
+                    "written is a superset of it, so nothing is lost; the "
+                    "journal simply is not truncated this round.", cpath)
+                return
             if _os.path.exists(jpath):
                 _os.replace(jpath, cpath)
             st["records"] = 0
