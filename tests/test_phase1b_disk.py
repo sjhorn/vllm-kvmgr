@@ -364,7 +364,7 @@ def mkhandler(pool_size, nrefs=REFS):
                # Added when the real constructor gained them, which the
                # fixture-parity assertion below is here to force.
                "skipped_before_copy": 0, "delete_errors": 0, "deleted": 0,
-               "saturations": 0}
+               "saturations": 0, "capped": 0}
     h._read_row = lambda t, s, n: b"\xab" * n
     # *** THE FIXTURE MUST DECLARE ITS TRANSFER BOUNDS. *** `_bounds()` derives
     # them from the real tensors, which this shell does not have -- so without
@@ -386,6 +386,17 @@ def gkeys(group, n, salt=0):
 
 
 # 100 blocks in group 0 against a pool of 8: the shape that killed the engine.
+#
+# *** THE PER-ROUND BUDGET MADE THIS SCENARIO UNREACHABLE, which is why the
+# knobs are raised for it. *** With store_inflight_max=1 the pump returns after
+# one round is outstanding, so it never reaches an empty pool and
+# `saturations` -- the one existing signal for "disk writes are falling
+# behind" -- could not fire at all. This block is about the POOL being the
+# limiter, so the budget is lifted out of the way here and tested on its own
+# below. Had the test simply been relaxed to match the new behaviour, a real
+# signal would have gone quiet with every assertion green.
+F.write(store_inflight_max=64, store_batch_max=4096, store_ops_max=0)
+flags.reset_for_tests()
 h = mkhandler(8)
 ks = gkeys(0, 100)
 gpu = base.GPULoadStoreSpec(list(range(1000, 1100)), group_sizes=[100, 0, 0, 0, 0],
@@ -411,6 +422,49 @@ eq("...so a store round takes the WHOLE live size", len(h._inner.subs[0][1]),
    _sz)
 check("...with the job still queued", h._jobs[77]["batches"] != [])
 check("...and the saturation note said ONCE", h._saturated is True)
+
+# ---------------------------------------------------------------------------
+# *** THE PER-ROUND BUDGET, where the BUDGET is the limiter rather than the
+# pool. *** A big pool and a small cap: one scheduler step must carry the cap,
+# not the pool, because what stalled the stream was a step that submitted ~256
+# blocks x 62 refs at once (test-meter.sh section 1: one 1.052s stall, max gap
+# 1.137s against a 0.102s baseline).
+F.write(store_inflight_max=1, store_batch_max=5, store_ops_max=0)
+flags.reset_for_tests()
+_hb = mkhandler(256)
+_kb = gkeys(0, 100, salt=9)
+_gb = base.GPULoadStoreSpec(list(range(2000, 2100)), group_sizes=[100, 0, 0, 0, 0],
+                            block_indices=[0] * 5)
+check("a 100-block job is accepted against a 256-slot pool",
+      _hb.transfer_async(91, (_gb, diskspec.DiskLoadStoreSpec(_kb))) is True)
+eq("*** ONE round is submitted, not eight ***", len(_hb._inner.subs), 1)
+eq("...and it carries the BATCH CAP, not the pool's 256", len(_hb._inner.subs[0][1]), 5)
+eq("...and the shrink is COUNTED, so a binding cap is visible",
+   _hb.stats["capped"], 1)
+check("...and the job is still queued, to be pumped over later steps",
+      _hb._jobs[91]["batches"] != [])
+# the inflight gate is what bounds the STEP: pumping again while the round is
+# open must add nothing
+_before = len(_hb._inner.subs)
+_hb._pump()
+eq("a second pump while a round is open submits NOTHING (the step is bounded)",
+   len(_hb._inner.subs), _before)
+# and the ops budget must be able to bind on its own, below the block cap
+F.write(store_inflight_max=1, store_batch_max=4096, store_ops_max=3)
+flags.reset_for_tests()
+_ho = mkhandler(256)
+_ko = gkeys(0, 100, salt=11)
+_go = base.GPULoadStoreSpec(list(range(3000, 3100)), group_sizes=[100, 0, 0, 0, 0],
+                            block_indices=[0] * 5)
+_ho.transfer_async(92, (_go, diskspec.DiskLoadStoreSpec(_ko)))
+_refs0 = len(_ho._refs[0])
+_want = max(1, min(100, 3 // max(1, _refs0)))
+eq("the OPS budget binds below the block cap, in descriptors not blocks "
+   "(group 0 has %d refs/block, so 3 descriptors buys %d)" % (_refs0, _want),
+   len(_ho._inner.subs[0][1]), _want)
+# restore the shipped defaults for anything after this block
+F.write(store_inflight_max=1, store_batch_max=32, store_ops_max=2048)
+flags.reset_for_tests()
 
 rounds, done = 0, []
 while not done and rounds < 100:
@@ -1196,7 +1250,14 @@ _fix_keys = set(mkhandler(4).stats)
 eq("*** the fixture carries every counter the real constructor sets ***",
    sorted(_real_keys - _fix_keys), [])
 
-# and the fence counters must actually MOVE, or they measure nothing
+# and the fence counters must actually MOVE, or they measure nothing.
+# The per-round budget is lifted here for the same reason as the (b2) block:
+# with store_inflight_max=1 the pump returns before it can drain the pool, so
+# `saturations` -- the signal for "disk writes are falling behind" -- cannot
+# fire at all. This block is about the POOL being the limiter; the budget has
+# its own block above.
+F.write(store_inflight_max=64, store_batch_max=4096, store_ops_max=0)
+flags.reset_for_tests()
 hf = mkhandler(8)
 kf = gkeys(0, 40, salt=66)
 gf = base.GPULoadStoreSpec(list(range(7000, 7040)),
@@ -1208,6 +1269,8 @@ eq("...and the saturation is counted", hf.stats["saturations"], 1)
 hf.wait({4242})
 eq("*** wait() counts the fence firing ***", hf.stats["wait_calls"], 1)
 eq("...and how many of OUR jobs it blocked on", hf.stats["wait_ours"], 1)
+F.write(store_inflight_max=1, store_batch_max=32, store_ops_max=2048)
+flags.reset_for_tests()
 check("...and how long it blocked, which is the 2x question",
       hf.stats["wait_blocked_ms"] >= 0, hf.stats["wait_blocked_ms"])
 check("...and how many pump rounds it took", hf.stats["wait_rounds"] >= 1,

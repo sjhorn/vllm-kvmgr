@@ -154,6 +154,23 @@ DEFAULTS: dict[str, Any] = {
     # largest block size) reaches any limit first. 0 = unbounded.
     # The DIMENSION is read from upstream; the threshold is still empirical.
     "load_ops_max": 2048,
+    # --- the STORE's per-round budget. ---------------------------------
+    # *** THE STORE PATH HAD NO CAP AND IT STALLED THE STREAM BY ~1.1s. ***
+    # Measured 2026-10-11 by scripts/test-meter.sh section 1 (vllm-proxy):
+    # max inter-event gap 1.137s against a 0.102s baseline, A/B/A on
+    # disk_store_paused (1.109 live / 0.111 paused / 1.067 live), and located as
+    # ONE 1.052s stall 72% of the way through a 103-event stream. The disk
+    # writes are not the cause -- they are already on a thread pool and
+    # _collect only polls them. What lands on the engine's step is the submit.
+    #
+    # Three knobs because the load needed three, for reasons that apply
+    # unchanged here: blocks are the granularity, DESCRIPTORS are what one
+    # driver call contains (blocks x refs-for-the-group, so group 0 reaches any
+    # limit first), and the INFLIGHT count is the only one that bounds a step --
+    # a per-round cap alone just turns one big round into eight small ones.
+    "store_batch_max": 32,
+    "store_ops_max": 2048,
+    "store_inflight_max": 1,
     # Seconds of ZERO progress after which a stalled transfer job is FAILED.
     # 0 = hang for ever, which is what this path did until 2026-10-10. Default
     # 240, comfortably inside NCCL's 600s watchdog, because the entire point is

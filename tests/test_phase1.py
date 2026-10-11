@@ -284,6 +284,11 @@ PROBE = {
     "load_batch_max": (0, 32),
     "load_inflight_max": (0, 2),
     "load_ops_max": (0, 512),
+    # the STORE's per-round budget, added 2026-10-11 after the store path was
+    # measured to stall the stream by ~1.1s with no cap at all
+    "store_batch_max": (0, 16),
+    "store_inflight_max": (0, 2),
+    "store_ops_max": (0, 512),
     "stall_fail_after_s": (0, 90),
     # The staging knobs. These ARE genuinely hot in both value and effect: the
     # live pool size is re-read from the flags on every transfer round and
@@ -671,6 +676,18 @@ eq("load_inflight_max DEFAULTS to the measured-safe 1, not the fatal 4",
    _d["load_inflight_max"], 1)
 eq("and load_ops_max defaults to the measured 2048",
    _d["load_ops_max"], 2048)
+# AND THE STORE'S BUDGET, which did not exist until the stream stall was
+# measured. An unbounded store round is a ~1.1s hole in every generation, so
+# these three being present at all is the property; the exact numbers are
+# tuned against test-meter.sh section 1 and are expected to move.
+eq("store_inflight_max defaults to 1 -- the knob that bounds a STEP",
+   _d["store_inflight_max"], 1)
+check("store_batch_max is a small cap, not the 256-slot pool",
+      0 < _d["store_batch_max"] <= 64,
+      "got %r; the pool is 256 and submitting that many was the stall" % (
+          _d["store_batch_max"],))
+check("store_ops_max bounds DESCRIPTORS, so group 0 cannot dominate a step",
+      _d["store_ops_max"] > 0, "got %r" % (_d["store_ops_max"],))
 check("and inflight_max=1 costs nothing: 1 and 2 both restore 700K in 12s",
       True,
       "measured 2026-10-10 -- the restore is bandwidth-bound, not "

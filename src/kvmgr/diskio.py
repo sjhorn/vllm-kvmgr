@@ -286,6 +286,89 @@ def load_ops_budget(refs, group_idx: int, want_blocks: int, ops_max: int) -> int
     return max(1, min(want, int(ops_max) // per_block))
 
 
+# THE SAME ARITHMETIC, FOR THE OTHER DIRECTION. `load_ops_for` /
+# `load_ops_budget` compute descriptors-per-submit from the engine's own refs,
+# and nothing in them is specific to reading: `num_copy_ops += group_size *
+# len(group_data_refs)` is how upstream builds the driver call in BOTH
+# directions. The `load_` names are kept because the load's tests and source
+# lints name them; the store calls these neutral ones so a reader of the store
+# path is not left wondering why it asks a load function.
+ops_for = load_ops_for
+ops_budget = load_ops_budget
+
+
+def _store_batch_max() -> int:
+    """Max blocks in ONE store round. Hot.
+
+    *** THE STORE HAD NO CAP AT ALL, and that is what stalled the stream. ***
+    The load got `load_batch_max` and `load_ops_max` because an unbounded round
+    FAULTED the GPU; the store was left taking `take_upto(len(bids))`, which is
+    the whole 256-slot pool, and its `while` loop then kept submitting until the
+    pool drained. So one scheduler step could carry ~256 blocks x 62 refs of
+    group 0.
+
+    Measured 2026-10-11 by `scripts/test-meter.sh` section 1 in the vllm-proxy
+    repo: a single 1.052s stall 72% of the way through a stream, max inter-event
+    gap 1.137s against a 0.102s baseline, and A/B/A against `disk_store_paused`
+    (1.109 live / 0.111 paused / 1.067 live). The writes themselves are NOT the
+    cause -- they are already on a ThreadPoolExecutor and `_collect` only polls
+    `fut.done()`. What runs on the engine's step is the submit: building that
+    many descriptors, plus the GIL the writer threads then contend for.
+    """
+    try:
+        from kvmgr import flags as _f
+        v = int(_f.peek("store_batch_max") or 0)
+        if v > 0:
+            return v
+        return int(_f.DEFAULTS["store_batch_max"]) or 32
+    except Exception:
+        return 32
+
+
+def _store_ops_max() -> int:
+    """Max COPY-OP DESCRIPTORS in one store round. Hot.
+
+    The block cap bounds the wrong quantity on a hybrid layout -- see
+    `load_ops_for`. Group 0 has the most layer refs and the largest block, so it
+    reaches any descriptor limit first, and a cap in blocks alone means a
+    different submit size per group.
+    """
+    try:
+        from kvmgr import flags as _f
+        v = int(_f.peek("store_ops_max") or 0)
+        if v > 0:
+            return v
+        return int(_f.DEFAULTS["store_ops_max"]) or 2048
+    except Exception:
+        return 2048
+
+
+def _store_inflight_max() -> int:
+    """Max store rounds whose GPU->staging copy may be outstanding at once. Hot.
+
+    *** THE PER-ROUND CAP ALONE DOES NOT BOUND THE STEP. *** `_pump`'s `while`
+    submits round after round until the pool is empty, so capping each round at
+    32 blocks against a 256-slot pool just means eight rounds instead of one and
+    the same work per step. This is the knob that actually bounds what a single
+    scheduler step carries, exactly as `load_inflight_max` is for the read side
+    -- where the per-round cap was respected throughout and the engine died
+    anyway at 861 keys.
+
+    Returning early is safe and is not a refusal: `_pump` is called again from
+    `_collect` on every step, and `kv_connector_no_forward` means those steps
+    arrive even with nothing scheduled, so the work resumes the moment a round
+    completes.
+    """
+    try:
+        from kvmgr import flags as _f
+        v = int(_f.peek("store_inflight_max") or 0)
+        if v > 0:
+            return v
+        return int(_f.DEFAULTS["store_inflight_max"]) or 1
+    except Exception:
+        return 1
+
+
 def _load_ops_max() -> int:
     """Max copy-op descriptors in ONE staging->GPU submit. Hot. 0 = unbounded.
 
@@ -1309,7 +1392,19 @@ class DiskStoreHandler:
                       # 2026-10-08 is what they have to account for.
                       "wait_calls": 0, "wait_ours": 0,
                       "wait_blocked_ms": 0, "wait_max_pending": 0,
-                      "wait_rounds": 0, "saturations": 0}
+                      "wait_rounds": 0, "saturations": 0,
+                      # *** THE NEW BOUND MUST BE VISIBLE WHEN IT BINDS. ***
+                      # The per-round budget made `saturations` nearly
+                      # unreachable: with inflight_max=1 the pump returns before
+                      # it can ever drain the pool, so the one existing signal
+                      # for "the store is behind" stopped being able to fire.
+                      # Replacing a visible limit with an invisible one is this
+                      # project's "refusal nobody can see", so `capped` counts
+                      # the rounds the budget actually SHRANK. It is not
+                      # incremented by the inflight gate, which fires on every
+                      # step while a round is open and would say nothing; that
+                      # state is already readable as inflight/inflight_max.
+                      "capped": 0}
         logger.info(
             "kvmgr: disk store handler -- staging %d blocks x %d tensors "
             "(pinned=%s), per-group file sizes %s, sum %d B (the per-rank page; "
@@ -1551,7 +1646,21 @@ class DiskStoreHandler:
                 # direction would simply shrink the store for nothing.
                 # `staging_write_floor` / `staging_read_floor` are superseded;
                 # flags.py says so where they are declared.
-                slots = self._pool.take_upto(len(bids))
+                # *** BOUND WHAT ONE SCHEDULER STEP CARRIES. *** Two units
+                # on purpose, mirroring the load: the block cap is the
+                # granularity, the OP budget is what upstream's single driver
+                # call actually contains (blocks x refs-for-this-group), and the
+                # inflight cap is the one that bounds the STEP rather than the
+                # round. Without the third, `while` submits eight 32-block
+                # rounds and the step costs exactly what it did before.
+                if len(self._inner_to_job) >= _store_inflight_max():
+                    return
+                _cap = min(_store_batch_max(),
+                           ops_budget(self._refs, g, len(bids),
+                                      _store_ops_max()))
+                if _cap < len(bids):
+                    self.stats["capped"] = self.stats.get("capped", 0) + 1
+                slots = self._pool.take_upto(min(len(bids), _cap))
                 if not slots:
                     if not self._saturated:
                         # Said ONCE: a saturated pool is now a throughput note,
@@ -1920,6 +2029,13 @@ class DiskStoreHandler:
         return dict(self.stats, staging=self._pool.snapshot(),
                     group_file_sizes=self._sizes,
                     jobs_open=len(self._jobs), writes_open=len(self._writing),
+                    # the bound, readable per rank -- a cap nobody can see is a
+                    # cap nobody can confirm took effect
+                    inflight=len(self._inner_to_job),
+                    inflight_max=_store_inflight_max(),
+                    batch_max=_store_batch_max(),
+                    ops_max=_store_ops_max(),
+                    refs_per_group=[len(r) for r in (self._refs or [])],
                     gpu_rows=self._bounds()[0],
                     staging_rows=self._bounds()[1],
                     ledger=self._ledger_snapshot(),
