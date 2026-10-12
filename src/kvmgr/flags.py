@@ -115,16 +115,36 @@ DEFAULTS: dict[str, Any] = {
     # a load whose file is gone on ONE node kills the engine core. The 371s we
     # pay at every boot protects against exactly half of what it is for.
     #
-    # *** DEFAULT ON, AND IT IS THE ONE CASE WHERE THAT IS THE SAFE
-    # *** DIRECTION. *** It breaks this table's own rule ("the default is
-    # today's behaviour") knowingly, on the same reasoning as
-    # load_inflight_max=1: the state in which this knob changes anything is a
-    # state where today's behaviour is a DEAD ENGINE. The honest cost is
-    # stated rather than hidden -- the first lookup of a key restored from the
-    # manifest DEFERS (see disk_verify_defer_s), so a restore pays about a
-    # second before it hits. A fault refuses presence, which costs a cold
-    # cache and never correctness, and the knob is hot either way.
-    "disk_verify_enabled": True,
+    # *** IT SHIPPED DEFAULTING ON AND THE BOX SAID NO. DEFAULT OFF UNTIL THE
+    # *** TRIGGER MOVES TO BOOT. *** Measured 2026-10-12 on the live engine:
+    # with this on, the 700K restore that costs 11s warm returned
+    # **0 tokens off disk** and took a full cold prefill. The mechanism is
+    # right and the TRIGGER is wrong, and the counters say exactly why --
+    # `lookup 500,720` against the 2,758 a normal run costs, 79,328 deferrals,
+    # 5,470 of them EXPIRING, and 2,300 RPCs.
+    #
+    # The cause is upstream's scan shape, not our check:
+    # `_sliding_window_lookup` treats a DEFERRED key as a non-hit and keeps
+    # scanning ("continue lookup ... until a hit is detected"), so ONE
+    # deferring pass walks the WHOLE sliding-window key list. A 700K prompt has
+    # ~2,736 keys in group 0 and ~175,000 in a 4-token SWA group, so deferring
+    # turns a 2,758-lookup request into a ~287,000-key verification job -- past
+    # any sane deferral budget, so keys expire to a miss, so the prefix answer
+    # collapses and the restore never fires.
+    #
+    # *** THE FIX IS A DIFFERENT TRIGGER, NOT A BIGGER BUDGET: verify at BOOT,
+    # *** ALL RANKS, IN PARALLEL. *** The head already stats all 922,992 keys in
+    # 365s; having each rank stat its OWN files at the same time costs the same
+    # WALL TIME and checks both nodes AND the sizes. Then no lookup ever
+    # defers, every key is vouched for before the API opens, and the prize is
+    # intact. The blocker is that `DiskPresenceManager.__init__` holds no
+    # executor reference -- the same problem `capture_offload_sched_from_caller`
+    # already solves off the call stack.
+    #
+    # Until then this is OFF, which is this table's ordinary rule after all:
+    # the default is today's behaviour. The mechanism is built, has 113 offline
+    # assertions behind it, and is one hot knob away.
+    "disk_verify_enabled": False,
     # Keys per `collective_rpc`. Bounds the MESSAGE, and must stay ~100x
     # smaller than the RPC timeout's worth of work so the bound below is never
     # approached in healthy operation. 4,000 stats is tens of milliseconds on a
@@ -143,7 +163,21 @@ DEFAULTS: dict[str, Any] = {
     # no worker involved -- tiering's own docstring calls it "transparent
     # retry". Expiry answers False, which is always safe: a miss costs
     # recompute, and recompute is what we are comparing against.
-    "disk_verify_defer_s": 5.0,
+    #
+    # *** AND THE DEFAULT IS NOW 0, WHICH MEANS NEVER DEFER. *** Measured on
+    # the box (see disk_verify_enabled): deferring is cheap for a request whose
+    # candidate set is small and catastrophic for one whose sliding-window
+    # groups hold ~175,000 keys, because upstream keeps scanning past a
+    # deferred key. At 0 an unverified key answers MISS immediately -- SAFE by
+    # construction, since a miss costs recompute -- and costs nothing on the
+    # scheduler's thread. The verified portion of the index still restores
+    # normally, so with the background sweep running the cache CONVERGES
+    # rather than stalling.
+    #
+    # So there are two sane settings: 0 (safe, converging, what ships) and a
+    # value large enough for a request to wait out its own verification, which
+    # is only reasonable once a boot-time all-ranks pass makes that wait empty.
+    "disk_verify_defer_s": 0.0,
     # *** GENEROUS AND FATAL. NEVER ZERO, WHICH WOULD MEAN FOREVER. ***
     # Read off the image (patches/pristine/vllm/v1/executor/
     # multiproc_executor.py): a TimeoutError does NOT set the executor's

@@ -562,12 +562,24 @@ for n in ("disk_verify_enabled", "disk_verify_chunk", "disk_verify_defer_s",
           "disk_free_hysteresis_gb", "disk_free_evict_step_gb",
           "disk_free_check_s", "disk_free_rpc_s"):
     check(f"{n} is declared", n in KF.DEFAULTS)
-# *** THE TWO DELIBERATE EXCEPTIONS TO "AN EMPTY FLAGS FILE IS A NO-OP". ***
-# Same reasoning as load_inflight_max=1: the only state in which these change
-# behaviour is one where today's behaviour is a DEAD ENGINE.
-check("*** disk_verify_enabled defaults ON, as the safety-bound exception ***",
-      KF.DEFAULTS["disk_verify_enabled"] is True)
-check("*** the free-space floor defaults NON-ZERO, for the same reason ***",
+# *** disk_verify_enabled SHIPPED DEFAULTING ON AND THE BOX SAID NO. ***
+# Measured 2026-10-12: with it on, the 700K restore that costs 11s warm
+# returned ZERO tokens off disk. The mechanism is right and the TRIGGER is
+# wrong -- `_sliding_window_lookup` keeps scanning past a DEFERRED key, so one
+# deferring pass walks a ~175,000-key sliding-window group and the request's
+# verification job never finishes inside its budget. This assertion is pinned
+# the other way round now, so flipping the default back cannot happen by
+# accident: it needs the boot-time all-ranks pass first.
+check("*** disk_verify_enabled defaults OFF -- the trigger is not ready ***",
+      KF.DEFAULTS["disk_verify_enabled"] is False)
+check("*** and the deferral budget defaults to 0, meaning NEVER DEFER ***",
+      float(KF.DEFAULTS["disk_verify_defer_s"]) == 0.0)
+# The FLOOR, by contrast, remains the documented safety-bound exception and is
+# verified live: band `ok` at 2.42 TB free, inert, with both nodes' free space
+# published. Same reasoning as load_inflight_max=1 -- the only state in which a
+# non-zero floor changes behaviour is one where today's behaviour is ENOSPC and
+# a dead engine.
+check("*** the free-space floor defaults NON-ZERO, as the safety exception ***",
       float(KF.DEFAULTS["disk_free_floor_gb"]) > 0
       and float(KF.DEFAULTS["disk_free_hard_gb"]) > 0)
 check("...and the floor is above the hard stop, not below it",

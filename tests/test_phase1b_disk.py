@@ -711,7 +711,14 @@ check("the manifest file is written", os.path.exists(mpath))
 check("...and left no .part", not os.path.exists(mpath + ".part"))
 
 # A FRESH manager -- i.e. a restarted engine -- recovers the claim.
-F.write(disk_restore=1)
+#
+# *** VERIFICATION IS TURNED ON EXPLICITLY HERE, NOT INHERITED FROM A
+# *** DEFAULT. *** It defaulted ON when this block was written and defaults OFF
+# now (the trigger is not ready at this key volume -- see
+# flags.DEFAULTS["disk_verify_enabled"]), and these assertions are ABOUT the
+# defer contract, so they must state the configuration they test rather than
+# silently pass or fail with a default somebody moves.
+F.write(disk_restore=1, disk_verify_enabled=1, disk_verify_defer_s=5)
 flags.reset_for_tests()
 m2 = diskspec.DiskPresenceManager(FakeMapper, num_workers=2, manifest_path=mpath)
 eq("*** a restarted engine RECOVERS presence from disk -- the whole prize ***",
@@ -739,6 +746,8 @@ eq("*** and THEN lookup hits -- the prize still survives the restart ***",
 eq("...the queue is drained", list(m2._wanted_map()), [])
 
 # ...and an entry whose own file has gone is PRUNED, not trusted.
+F.write(disk_restore=1, disk_verify_enabled=1, disk_verify_defer_s=5)
+flags.reset_for_tests()
 os.unlink(FakeMapper.get_file_name(k_b))
 m3 = diskspec.DiskPresenceManager(FakeMapper, num_workers=2, manifest_path=mpath)
 eq("*** an entry whose file is gone is PRUNED ***", m3._stats["manifest_pruned"], 1)
