@@ -315,6 +315,66 @@ def capture_offload_sched_from_caller(depth: int = 5) -> bool:
     return False
 
 
+def capture_engine_core_from_caller(depth: int = 30) -> "Any | None":
+    """Grab the EngineCore off the CALL STACK, at manager construction.
+
+    *** THIS IS WHAT MAKES BOOT-TIME CROSS-RANK VERIFICATION POSSIBLE, and the
+    *** absence of it is why the first design verified lazily and broke the
+    *** restore. *** `DiskPresenceManager.__init__` holds no executor
+    reference, which was read as "the executor is not reachable there". It is:
+    `EngineCore.__init__` assigns `self.model_executor` at core.py:121 and only
+    then builds the Scheduler at :148, which is what constructs the connector
+    and therefore us. So the engine core is sitting in a caller frame with a
+    live executor on it, exactly as the connector scheduler is for
+    `capture_offload_sched_from_caller`.
+
+    *** MATCHED ON CAPABILITY, NOT ON A CLASS NAME. *** `EngineCoreProc`
+    subclasses `EngineCore`, so a name match needs a list that an upstream
+    rename or a new subclass silently invalidates. What this needs is
+    `collective_rpc` and a `model_executor`, so that is what it asks for -- and
+    anything with both is, by definition, something it can verify through.
+
+    The frame is deeper than the offload scheduler's: core -> Scheduler ->
+    KVConnectorFactory -> connector -> spec.get_manager -> our __init__ ->
+    _load_manifest. Hence depth 30 rather than 5.
+    """
+    f = None
+    try:
+        import inspect
+        f = inspect.currentframe()
+        for _ in range(depth):
+            if f is None:
+                break
+            f = f.f_back
+            if f is None:
+                break
+            cand = f.f_locals.get("self")
+            if cand is None:
+                continue
+            if callable(getattr(cand, "collective_rpc", None)) and \
+                    getattr(cand, "model_executor", None) is not None:
+                return cand
+    except Exception:
+        return None
+    finally:
+        # Frames pin their locals; holding one would keep the whole boot's
+        # object graph alive.
+        del f
+    return None
+
+
+# *** THE BOOT RPC'S TIMEOUT IS A CODE CONSTANT AND IT IS GENEROUS. ***
+# A collective_rpc timeout is unrecoverable at any time -- it leaves the reply
+# unclaimed on an ordered response queue -- and at BOOT it is unrecoverable at
+# the worst possible moment, because the engine has not served a request yet
+# and the desync would land on the first one. Measured: a 4,000-key chunk is
+# ~1.6s even with the start script dropping the dentry cache every 2s, so this
+# is ~190x headroom. It is not a knob because there is no operational reason to
+# lower it: a chunk that takes five minutes means a rank is gone, which is what
+# the number exists to detect.
+BOOT_VERIFY_TIMEOUT_S = 300.0
+
+
 # Counters for upstream's completion ARRIVAL point. Module-level so a reload
 # preserves them (and so the wrap is idempotent against the class).
 # `installed` is the field that keeps the zeros honest: without it, "nobody is
@@ -1279,13 +1339,11 @@ class DiskPresenceManager(OffloadingManager):
         keys = [k for k, _p in _base]
         poss = [p for _k, p in _base]
 
-        kept = []
-        for k in keys:
-            try:
-                if _os.path.exists(self._mapper.get_file_name(k)):
-                    kept.append(k)
-            except Exception:
-                pass
+        kept, how = self._boot_verify(keys)
+        # Published, because "how was the index checked" is the difference
+        # between a guarantee and a hope, and a log line is not something a
+        # script can gate on.
+        self._boot_how = how
         self._present = OrderedDict()
         self._bytes = 0
         _pos_by_key = dict(zip(keys, poss))
@@ -1293,12 +1351,145 @@ class DiskPresenceManager(OffloadingManager):
             self._remember(k, _pos_by_key.get(k, -1))
         self._stats["manifest_loaded"] = len(kept)
         self._stats["manifest_pruned"] = len(keys) - len(kept)
+        # *** THE LOG LINE SAYS *HOW* IT WAS CHECKED, because the two answers
+        # *** have different strengths and the old text asserted the weaker one
+        # *** as if it were the only possibility. *** It used to end "it is a
+        # claim about both nodes and can only be checked against this one",
+        # which is true of the head-only walk and FALSE once the ranks are
+        # asked. A reader must be able to tell which boot they are looking at.
         logger.info(
-            "kvmgr: manifest %s -- %d keys restored, %d pruned (their own file "
-            "is gone). If a load ever asserts on a missing file, DELETE THIS "
-            "FILE: it is a claim about both nodes and can only be checked "
-            "against this one.",
-            self._manifest, len(kept), len(keys) - len(kept))
+            "kvmgr: manifest %s -- %d keys restored, %d pruned. CHECKED: %s. "
+            "%s",
+            self._manifest, len(kept), len(keys) - len(kept), how,
+            ("Every surviving key was vouched for by EVERY rank, including its "
+             "SIZE, so a load cannot hit a missing or foreign file -- which is "
+             "upstream's bare assert and a dead engine core."
+             if how.startswith("all-ranks") else
+             "This is a claim about both nodes and was checked against ONE. If "
+             "a load ever asserts on a missing file, DELETE THIS FILE."))
+
+    # -- the boot check ----------------------------------------------------
+
+    def _head_only_prune(self, keys) -> list:
+        """Today's walk: does the file exist ON THIS NODE? Rank-local."""
+        import os as _os
+        kept = []
+        for k in keys:
+            try:
+                if _os.path.exists(self._mapper.get_file_name(k)):
+                    kept.append(k)
+            except Exception:
+                pass
+        return kept
+
+    def _boot_verify(self, keys) -> tuple:
+        """Prune the index at boot. Returns `(kept, how)`. NEVER raises.
+
+        *** THE HEAD-ONLY WALK PROTECTS AGAINST HALF OF WHAT IT IS FOR, and it
+        *** costs 365s to do it. *** `get_file_name` is rank-dependent, so a
+        walk in the engine core checks the engine core's node; a file lost on
+        the other one survives the gate and becomes upstream's bare assert on
+        the first load. The docstring above has always admitted this.
+
+        *** AND ASKING EVERY RANK IS *CHEAPER* THAN THE WALK IT REPLACES.
+        *** Measured 2026-10-12 by driving the background sweep: all 922,992
+        keys verified on BOTH nodes in ~200s of busy engine (~4,600 keys/s,
+        ~170 RPCs) against the head-only walk's 365s at 2,528 keys/s -- because
+        the two ranks `stat` in parallel and the work is batched. So this is
+        not a cost traded for safety; it is faster, it covers both nodes, and
+        it checks the SIZE, which existence cannot.
+        
+        *** IT ALSO REMOVES THE DEFERRAL ENTIRELY, which is the whole reason it
+        *** exists. *** The first design verified on demand, from `lookup`, and
+        the box refuted it: `_sliding_window_lookup` keeps scanning past a
+        deferred key, so one pass walked a ~175,000-key SWA group and the 700K
+        restore returned ZERO tokens. Verifying before the API opens means no
+        lookup ever defers, because every key in the index is already vouched
+        for.
+
+        *** THE FALLBACK IS THE OLD WALK, AND IT IS NAMED IN THE RETURN VALUE.
+        *** If the engine core cannot be reached off the stack, or a rank
+        cannot answer, this degrades to the rank-local walk rather than to
+        trusting the index -- a weaker check, never no check -- and `how` says
+        which happened so the log cannot imply a guarantee it did not make.
+        """
+        if not keys:
+            return ([], "nothing to check")
+        try:
+            if not flags.peek("disk_verify_enabled"):
+                return (self._head_only_prune(keys),
+                        "head-only (disk_verify_enabled is off)")
+        except Exception:
+            return (self._head_only_prune(keys), "head-only (knob unreadable)")
+
+        core = capture_engine_core_from_caller()
+        if core is None:
+            logger.warning(
+                "kvmgr: boot verification could not find the engine core on "
+                "the call stack, so the index is pruned against THIS NODE "
+                "ONLY -- the weaker check, which is what every boot before "
+                "2026-10-12 did. A file lost on the other node will not be "
+                "caught here; the background sweep will still find it once "
+                "the engine is busy.")
+            return (self._head_only_prune(keys), "head-only (no engine core)")
+
+        try:
+            cap = max(1, int(flags.peek("disk_verify_chunk") or 1))
+        except Exception:
+            cap = int(flags.DEFAULTS["disk_verify_chunk"])
+        kept: list = []
+        bad_total = 0
+        t0 = _now()
+        for i in range(0, len(keys), cap):
+            chunk = [bytes(k) for k in keys[i:i + cap]]
+            try:
+                results = core.collective_rpc(
+                    "kvmgr_verify_presence", timeout=BOOT_VERIFY_TIMEOUT_S,
+                    kwargs={"keys": [k.hex() for k in chunk]})
+                if not isinstance(results, list):
+                    results = [results]
+                v = verify_verdict(results, self._num_workers)
+                if v["fault"]:
+                    raise RuntimeError(v["fault"])
+            except Exception as e:
+                # *** FALL BACK FOR THE REST, DO NOT GIVE UP ON WHAT IS DONE.
+                # *** The chunks already verified are verified; redoing them
+                # with the weaker check would throw away a strictly better
+                # answer. Everything from here on gets the rank-local walk.
+                logger.exception(
+                    "kvmgr: boot verification failed on chunk %d of %d (%r) -- "
+                    "the %d key(s) already checked keep their ALL-RANKS "
+                    "verdict, and the remaining %d are pruned against THIS "
+                    "NODE ONLY. That is the weaker check, never no check.",
+                    i // cap + 1, (len(keys) + cap - 1) // cap, e,
+                    len(kept), len(keys) - i)
+                # *** `kept[:i]` WOULD BE WRONG HERE, and it was. *** `i`
+                # indexes the INPUT keys and `kept` is the survivors, which is
+                # a shorter and differently-aligned list once anything has
+                # been dropped. The vouched-for set is exactly what `kept`
+                # held BEFORE the fallback appended to it.
+                n_allranks = len(kept)
+                self._verified_set().update(kept)
+                kept.extend(self._head_only_prune(keys[i:]))
+                self._stats["boot_verify_fell_back"] = 1
+                return (kept, "all-ranks for %d key(s), then head-only for the "
+                              "remaining %d after a failure"
+                              % (n_allranks, len(keys) - i))
+            bad = {bytes(b) for b in v["bad"]}
+            bad_total += len(bad)
+            kept.extend(k for k in chunk if k not in bad)
+        # *** BORN VERIFIED: that is the point. *** Every survivor has been
+        # vouched for by every rank, at the right size, so `lookup` can answer
+        # True immediately and nothing ever defers.
+        self._verified_set().update(kept)
+        ms = int((_now() - t0) * 1000)
+        self._stats["boot_verify_ms"] = ms
+        self._stats["boot_verify_dropped"] = bad_total
+        self._stats["boot_verify_rpcs"] = (len(keys) + cap - 1) // cap
+        return (kept, "all-ranks (%d key(s) in %d RPC(s), %.1fs, %d dropped "
+                      "as missing or wrong-sized on some rank)"
+                      % (len(keys), (len(keys) + cap - 1) // cap, ms / 1000.0,
+                         bad_total))
 
     # -- the presence journal: the I/O shell over the pure functions -------
     #
@@ -2723,6 +2914,7 @@ class DiskPresenceManager(OffloadingManager):
             "wanted": len(self._wanted_map()),
             "unverified": max(0, len(self._present) - len(self._verified_set())),
             "cursor": int(self._verify_state().get("cursor") or 0),
+            "boot_check": getattr(self, "_boot_how", None),
             "fault": _VERIFY_FAULT,
         }
 

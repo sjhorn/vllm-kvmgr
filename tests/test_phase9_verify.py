@@ -570,8 +570,12 @@ for n in ("disk_verify_enabled", "disk_verify_chunk", "disk_verify_defer_s",
 # verification job never finishes inside its budget. This assertion is pinned
 # the other way round now, so flipping the default back cannot happen by
 # accident: it needs the boot-time all-ranks pass first.
-check("*** disk_verify_enabled defaults OFF -- the trigger is not ready ***",
-      KF.DEFAULTS["disk_verify_enabled"] is False)
+# *** AND IT IS ON AGAIN, because the TRIGGER MOVED TO BOOT. *** The lazy
+# version broke the 700K restore; `_boot_verify` asks every rank before the API
+# opens, which is cheaper than the rank-local walk it replaces (~200s against
+# 365s) and makes the deferral structurally impossible.
+check("*** disk_verify_enabled defaults ON, now the check is at BOOT ***",
+      KF.DEFAULTS["disk_verify_enabled"] is True)
 check("*** and the deferral budget defaults to 0, meaning NEVER DEFER ***",
       float(KF.DEFAULTS["disk_verify_defer_s"]) == 0.0)
 # The FLOOR, by contrast, remains the documented safety-bound exception and is
@@ -607,6 +611,229 @@ check("a rank with no handler reports an ERROR rather than an empty pass",
       "no live disk handler on this rank" in _csrc)
 check("the pump rides the existing step wrap rather than a new installer",
       "_verify_pump(self)" in _csrc and "_install_verify" not in _csrc)
+
+print()
+print("== (9x) THE BOOT CHECK: every rank, before the API opens ==")
+# *** THIS IS THE FIX FOR THE ONE THING THE BOX REFUTED. *** Verifying from
+# `lookup` meant deferring, and `_sliding_window_lookup` keeps scanning past a
+# deferred key -- so one pass walked a ~175,000-key SWA group and the 700K
+# restore returned ZERO tokens. Asking every rank at BOOT removes the deferral
+# structurally, and it is CHEAPER than the rank-local walk it replaces (~200s
+# against 365s for 922,992 keys, because the ranks stat in parallel).
+
+
+class FakeCore:
+    """Just enough EngineCore: `collective_rpc` and a `model_executor`.
+
+    The capture matches on CAPABILITY rather than a class name, so this is a
+    faithful stand-in -- and that is deliberate, because `EngineCoreProc`
+    subclasses `EngineCore` and a name list is a thing that goes stale.
+    """
+
+    def __init__(self, missing=(), wrong=(), ranks=2, raise_after=None):
+        self.model_executor = object()
+        self._missing = {bytes(k).hex() for k in missing}
+        self._wrong = {bytes(k).hex() for k in wrong}
+        self._ranks = ranks
+        self._raise_after = raise_after
+        self.calls = 0
+        self.seen = []
+
+    def build(self, tmp):
+        """Construct the manager FROM A BOUND METHOD, so `self` is on the stack.
+
+        *** A LAMBDA DOES NOT WORK HERE, AND THE FIRST VERSION USED ONE. ***
+        The capture walks caller frames for a `self` with `collective_rpc` and
+        a `model_executor`; a lambda assigned to an attribute is not a bound
+        method, so it puts no `self` in its frame and the capture correctly
+        found nothing -- which made twelve assertions fail for the wrong
+        reason. That the capture refused rather than finding something else is
+        the reassuring half.
+        """
+        return mkmgr(tmp)
+
+    def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+        self.calls += 1
+        if self._raise_after is not None and self.calls > self._raise_after:
+            raise RuntimeError("rank 1 stopped answering (test)")
+        hexes = list((kwargs or {}).get("keys") or ())
+        self.seen.append(len(hexes))
+        assert timeout is not None, "the boot RPC must never pass timeout=None"
+        out = []
+        for r in range(self._ranks):
+            out.append({"rank": r,
+                        "missing": [h for h in hexes if h in self._missing],
+                        "wrong_size": [h for h in hexes if h in self._wrong],
+                        "checked": len(hexes), "free_bytes": 10 ** 12})
+        return out
+
+
+def boot_with(tmp, keys, core, **fl):
+    """Build a manager whose _load_manifest runs with `core` on the stack."""
+    with open(os.path.join(tmp, "presence.json"), "w") as fh:
+        json.dump({"keys": [[bytes(k).hex(), i] for i, k in enumerate(keys)]}, fh)
+    F.write(disk_restore=1, disk_verify_enabled=1, **fl)
+    KF.reset_for_tests()
+    # The real capture walks caller frames for a `self` with collective_rpc and
+    # a model_executor. A method on `core` puts exactly that on the stack, so
+    # the capture is exercised for real rather than monkeypatched away -- which
+    # is what makes the "no engine core" case below a genuine discriminator.
+    return core.build(tmp)
+
+
+tmp = tempfile.mkdtemp(prefix="kv9-boot-")
+BK = [K(bytes([i]) * 32, 0) for i in range(1, 7)]
+for k in BK:
+    touch(tmp, k)
+core = FakeCore()
+m = boot_with(tmp, BK, core)
+eq("*** the boot asked the ranks, not just this node ***", core.calls >= 1, True)
+eq("...and kept every key they vouched for", m._stats["manifest_loaded"], len(BK))
+eq("...pruning none", m._stats["manifest_pruned"], 0)
+check("*** every survivor is BORN VERIFIED, so no lookup can defer ***",
+      all(bytes(k) in m._verified_set() for k in BK))
+eq("...and a lookup answers at once, with no deferral",
+   m.lookup(BK[0], Ctx()), True)
+eq("...nothing was queued", len(m._wanted_map()), 0)
+check("the boot names HOW it checked, and it says all-ranks",
+      (getattr(m, "_boot_how", "") or "").startswith("all-ranks"),
+      getattr(m, "_boot_how", ""))
+check("...and it is published on /kv, not only logged",
+      (m._verify_snapshot().get("boot_check") or "").startswith("all-ranks"))
+
+print()
+print("== (9y) a file missing on ONE rank is pruned AT BOOT ==")
+tmp = tempfile.mkdtemp(prefix="kv9-boot2-")
+for k in BK:
+    touch(tmp, k)          # present on THIS node -- the old walk would keep it
+core = FakeCore(missing=[BK[2]])
+m = boot_with(tmp, BK, core)
+eq("*** the key whose file is gone on the OTHER node is PRUNED ***",
+   m._stats["manifest_pruned"], 1)
+check("...even though it exists on this one, which the old walk could not see",
+      os.path.exists(os.path.join(tmp, bytes(BK[2]).hex() + ".bin")))
+check("...so it cannot be claimed", bytes(BK[2]) not in m._present)
+eq("...and lookup misses it rather than loading into an assert",
+   m.lookup(BK[2], Ctx()), False)
+eq("...the drop is counted", m._stats.get("boot_verify_dropped"), 1)
+
+print()
+print("== (9z) a WRONG SIZE is pruned at boot too ==")
+tmp = tempfile.mkdtemp(prefix="kv9-boot3-")
+for k in BK:
+    touch(tmp, k)
+core = FakeCore(wrong=[BK[1]])
+m = boot_with(tmp, BK, core)
+eq("*** a truncated or foreign-sized file is as bad as absent ***",
+   m._stats["manifest_pruned"], 1)
+check("...and it is the wrong-sized one", bytes(BK[1]) not in m._present)
+
+print()
+print("== (9aa) the FALLBACK is the old walk, and it is NAMED ==")
+# *** NEVER "TRUST THE INDEX". *** If the ranks cannot be asked, the honest
+# degradation is the weaker check, and the log and /kv must say which happened
+# -- the old log line claimed "can only be checked against this one" as though
+# it were the only possibility, which is false once the ranks are asked.
+tmp = tempfile.mkdtemp(prefix="kv9-boot4-")
+for k in BK[:4]:
+    touch(tmp, k)          # BK[4], BK[5] have no file on this node
+with open(os.path.join(tmp, "presence.json"), "w") as fh:
+    json.dump({"keys": [[bytes(k).hex(), i] for i, k in enumerate(BK)]}, fh)
+F.write(disk_restore=1, disk_verify_enabled=1)
+KF.reset_for_tests()
+m = mkmgr(tmp)             # NO FakeCore on the stack -> capture must fail
+eq("*** with no engine core reachable it still prunes, rank-locally ***",
+   m._stats["manifest_loaded"], 4)
+eq("...dropping the two whose own file is gone", m._stats["manifest_pruned"], 2)
+check("*** and it SAYS it was head-only rather than implying a guarantee ***",
+      (getattr(m, "_boot_how", "") or "").startswith("head-only"),
+      getattr(m, "_boot_how", ""))
+check("...so nothing is marked verified on that path",
+      len(m._verified_set()) == 0)
+
+print()
+print("== (9ab) a mid-way failure keeps the ALL-RANKS verdicts already earned ==")
+tmp = tempfile.mkdtemp(prefix="kv9-boot5-")
+MK = [K(bytes([i]) * 32, 0) for i in range(1, 13)]
+for k in MK:
+    touch(tmp, k)
+core = FakeCore(raise_after=1)
+m = boot_with(tmp, MK, core, disk_verify_chunk=4)
+eq("every key survives (the files are all here)",
+   m._stats["manifest_loaded"], len(MK))
+check("*** the first chunk's keys keep their all-ranks verdict ***",
+      len(m._verified_set()) == 4, f"{len(m._verified_set())} verified")
+check("...and the rest are NOT claimed as verified",
+      not all(bytes(k) in m._verified_set() for k in MK))
+check("...the fallback is recorded", m._stats.get("boot_verify_fell_back") == 1)
+check("*** and `how` names both halves rather than rounding to one ***",
+      "all-ranks for 4" in (getattr(m, "_boot_how", "") or "")
+      and "head-only" in (getattr(m, "_boot_how", "") or ""),
+      getattr(m, "_boot_how", ""))
+
+print()
+print("== (9ab2) A RANK THAT DOES NOT ANSWER MUST NOT READ AS A RANK SAYING YES ==")
+# *** THIS HOLE WAS FOUND BY BREAK-VERIFICATION, NOT BY WRITING THE TEST. ***
+# A mutation that ignored `verdict["fault"]` in the boot loop was NOT CAUGHT:
+# with a short reply list the boot would have kept every key on the strength of
+# having failed to ask one of the ranks, which is the manufactured zero this
+# repo keeps paying for -- and at boot it would have been printed as
+# "all-ranks", a guarantee that had not been made.
+tmp = tempfile.mkdtemp(prefix="kv9-boot-fault-")
+for k in BK[:4]:
+    touch(tmp, k)          # all four exist HERE
+with open(os.path.join(tmp, "presence.json"), "w") as fh:
+    json.dump({"keys": [[bytes(k).hex(), i] for i, k in enumerate(BK)]}, fh)
+F.write(disk_restore=1, disk_verify_enabled=1)
+KF.reset_for_tests()
+core = FakeCore(ranks=1)   # one reply for a two-rank cluster
+m = core.build(tmp)
+check("*** a short reply list makes the boot FALL BACK, not accept ***",
+      m._stats.get("boot_verify_fell_back") == 1,
+      "fell_back=%r" % (m._stats.get("boot_verify_fell_back"),))
+check("...and `how` does NOT claim all-ranks",
+      "head-only" in (getattr(m, "_boot_how", "") or ""),
+      getattr(m, "_boot_how", ""))
+check("...nothing is marked verified on the strength of the short reply",
+      len(m._verified_set()) == 0, f"{len(m._verified_set())} verified")
+eq("...and the rank-local walk still did its job",
+   m._stats["manifest_loaded"], 4)
+eq("...pruning the two with no file here", m._stats["manifest_pruned"], 2)
+
+print()
+print("== (9ac) the boot RPC is chunked and never passes timeout=None ==")
+tmp = tempfile.mkdtemp(prefix="kv9-boot6-")
+CK = [K(bytes([i]) * 32, 0) for i in range(1, 11)]
+for k in CK:
+    touch(tmp, k)
+core = FakeCore()
+m = boot_with(tmp, CK, core, disk_verify_chunk=3)
+eq("*** the key list is chunked, so no single message is large ***",
+   core.seen, [3, 3, 3, 1])
+eq("...and the RPC count is recorded", m._stats.get("boot_verify_rpcs"), 4)
+# FakeCore.collective_rpc asserts timeout is not None, so reaching here at all
+# is the proof -- a boot RPC with timeout=None is a wait with no end, and at
+# boot there is no NCCL watchdog to break it.
+check("*** the boot RPC carried a timeout (FakeCore asserts it) ***", True)
+check("BOOT_VERIFY_TIMEOUT_S is generous and a CODE constant",
+      D.BOOT_VERIFY_TIMEOUT_S >= 120.0
+      and "disk_boot_verify_timeout_s" not in KF.DEFAULTS)
+
+print()
+print("== (9ad) the knob still turns the whole thing off ==")
+tmp = tempfile.mkdtemp(prefix="kv9-boot7-")
+for k in BK[:3]:
+    touch(tmp, k)
+with open(os.path.join(tmp, "presence.json"), "w") as fh:
+    json.dump({"keys": [[bytes(k).hex(), i] for i, k in enumerate(BK[:3])]}, fh)
+F.write(disk_restore=1, disk_verify_enabled=0)
+KF.reset_for_tests()
+core = FakeCore()
+m = core.build(tmp)
+eq("with the knob off the ranks are NOT asked", core.calls, 0)
+check("...and `how` says why", "disk_verify_enabled is off"
+      in (getattr(m, "_boot_how", "") or ""), getattr(m, "_boot_how", ""))
+eq("...the index still loads", m._stats["manifest_loaded"], 3)
 
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")

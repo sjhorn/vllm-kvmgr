@@ -141,10 +141,28 @@ DEFAULTS: dict[str, Any] = {
     # executor reference -- the same problem `capture_offload_sched_from_caller`
     # already solves off the call stack.
     #
-    # Until then this is OFF, which is this table's ordinary rule after all:
-    # the default is today's behaviour. The mechanism is built, has 113 offline
-    # assertions behind it, and is one hot knob away.
-    "disk_verify_enabled": False,
+    # *** AND THEN THE TRIGGER MOVED TO BOOT, SO IT IS ON AGAIN -- for a
+    # *** reason that is measured rather than argued. *** `_boot_verify` asks
+    # EVERY rank before the API opens, in place of the rank-local walk, and
+    # that is **cheaper than the walk it replaces**: all 922,992 keys verified
+    # on both nodes in ~200s (~4,600 keys/s, ~170 RPCs) against the head-only
+    # walk's 365s at 2,528 keys/s, because the ranks `stat` in parallel. It
+    # also checks the SIZE, which `os.path.exists` cannot.
+    #
+    # The deferral that broke the restore is then **structurally absent**:
+    # every key in the index is vouched for before the first request, so
+    # `lookup` never returns None. With `disk_verify_defer_s` at 0 as well,
+    # even the leftover cases (a boot that fell back, a deliberate re-queue)
+    # answer MISS rather than deferring, so the 500,720-lookup storm cannot
+    # recur.
+    #
+    # This still breaks the table's "an empty flags file behaves as today"
+    # rule, knowingly, on the load_inflight_max reasoning: the state in which
+    # it changes anything is one where today's behaviour is a DEAD ENGINE. And
+    # the degradation is safe in both directions -- it falls back to the old
+    # walk if the engine core cannot be reached, and a fault refuses presence,
+    # which costs a cold cache and never correctness.
+    "disk_verify_enabled": True,
     # Keys per `collective_rpc`. Bounds the MESSAGE, and must stay ~100x
     # smaller than the RPC timeout's worth of work so the bound below is never
     # approached in healthy operation. 4,000 stats is tens of milliseconds on a
