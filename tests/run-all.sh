@@ -24,7 +24,15 @@ for f in test_phase0.py test_phase0_disk.py test_phase1.py test_phase1_disk.py \
   # read to find the verdict gets `| tail`ed, and a 2026-10-02 run lost its one
   # failing check exactly that way.
   if [ "$rc" = "0" ]; then
-    printf '  ok    %-26s %s\n' "$f" "$(printf '%s' "$out" | grep -E '^[0-9]+ passed' | tail -1)"
+    # Two summary formats exist: most suites end "N passed, N failed" and
+    # test_phase7_dropguard.py ends "phase7 drop guard: N assertions passed".
+    # Matching only the first left phase7's cell BLANK, which reads as "no
+    # assertions ran" beside an `ok` -- absent rendered as zero, in the sweep
+    # whose whole job is saying whether anything was checked. The suite was
+    # always sound (it exits 1 on the first failure); the SUMMARY was lying.
+    sum=$(printf '%s' "$out" | grep -E '^[0-9]+ passed|assertions passed' | tail -1)
+    [ -n "$sum" ] || sum='(NO SUMMARY LINE -- did this suite assert anything?)'
+    printf '  ok    %-26s %s\n' "$f" "$sum"
   else
     printf '  FAIL  %-26s exit=%s\n' "$f" "$rc"
     printf '%s\n' "$out" | grep -E "FAILED:|Error|Traceback" | head -8 | sed 's/^/          /'
