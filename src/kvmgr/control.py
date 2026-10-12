@@ -224,6 +224,13 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
      "completion-arrival counters -- losing them restarts the measurement"),
     ("kvmgr.diskio", "_LIVE_CONN_WORKER",
      "upstream's connector worker -- the unshipped completion queue"),
+    # *** A FAULT MUST NOT BE CLEARABLE BY A RELOAD. *** It means a rank could
+    # not be asked whether it holds a key's file, so presence refuses for the
+    # rest of the boot; a reload re-executing the module would set it back to
+    # None and silently re-enable claims nobody can vouch for. It clears only
+    # on an explicit reset, which is the whole design.
+    ("kvmgr.diskspec", "_VERIFY_FAULT",
+     "the cross-rank verification fault -- a rank that could not answer"),
 )
 
 
@@ -610,6 +617,100 @@ def install_worker_methods() -> None:
             out["handlers_error"] = str(e)
         return out
 
+    def kvmgr_verify_presence(self, keys: "list[str] | None" = None) -> dict:
+        """Does THIS rank hold each key's file, at exactly the right size?
+
+        *** THIS IS THE HALF THE BOOT WALK CANNOT DO. *** The index is a claim
+        about two filesystems; `_load_manifest`'s prune runs in the engine core
+        and `get_file_name` is rank-dependent, so the 371s spent at every boot
+        checks ONE node. A file lost on the other one is not a miss -- upstream
+        asserts on a failed transfer, so it is a dead engine core.
+
+        *** SIZE, NOT EXISTENCE, AND THE SYSCALL ALREADY RETURNS IT. *** The
+        boot walk calls `os.path.exists`, which is a `stat` whose size is
+        thrown away -- so a truncated or foreign-sized file passes the gate and
+        dies at load as a `ValueError` on the worker's critical path
+        (`read_chunks` refuses before reading a byte, which is right, but by
+        then there is no safe answer left). The expected size is a property of
+        the GROUP GEOMETRY, which this process holds: `group_file_sizes` is
+        exactly what `read_chunks` itself computes.
+
+        A wrong-sized file is UNLINKED here. It is provably unloadable, and
+        `_write_batch`'s `exists()` skip would otherwise preserve it for ever --
+        so leaving it would make the self-heal unable to heal.
+
+        Returns hex keys, because an OffloadKey is raw bytes and this reply
+        crosses msgpack. `free_bytes` rides along so the engine core's
+        free-space floor can see THIS node's filesystem; it is the whole reason
+        the keep-alive round exists.
+        """
+        import os as _os
+        import time as _time
+
+        out: dict = {"rank": getattr(self, "rank", None), "missing": [],
+                     "wrong_size": [], "checked": 0, "ms": 0,
+                     "free_bytes": None, "unlinked": 0}
+        t0 = _time.monotonic()
+        try:
+            from . import diskio
+            from vllm.v1.kv_offload.base import get_offload_group_idx
+
+            h = None
+            for cand in list(getattr(diskio, "_LIVE_HANDLERS", ())):
+                if getattr(cand, "_mapper", None) is not None and \
+                        getattr(cand, "_refs", None) is not None:
+                    h = cand
+                    break
+            if h is None:
+                # *** NOT AN EMPTY ANSWER. *** "No handler" must not read as
+                # "nothing is missing" -- that is the manufactured zero this
+                # repo keeps paying for, and here it would vouch for a whole
+                # node on the strength of having failed to look.
+                out["error"] = ("no live disk handler on this rank, so nothing "
+                                "could be checked")
+                return out
+            sizes = diskio.group_file_sizes(h._refs)
+            try:
+                vfs = _os.statvfs(getattr(h._spec, "root_dir", None)
+                                  or _os.path.dirname(h._mapper.get_file_name(
+                                      bytes.fromhex((keys or ["00" * 32])[0]))))
+                out["free_bytes"] = int(vfs.f_bavail) * int(vfs.f_frsize)
+            except Exception:
+                out["free_bytes"] = None
+            for hexkey in (keys or ()):
+                try:
+                    k = bytes.fromhex(hexkey)
+                except Exception:
+                    out["missing"].append(hexkey)
+                    continue
+                out["checked"] += 1
+                path = h._mapper.get_file_name(k)
+                try:
+                    stt = _os.stat(path)
+                except OSError:
+                    out["missing"].append(hexkey)
+                    continue
+                try:
+                    g = int(get_offload_group_idx(k))
+                    want = int(sizes[g])
+                except Exception:
+                    # A key naming a group this engine does not have is not
+                    # something to guess about.
+                    out["wrong_size"].append(hexkey)
+                    continue
+                if int(stt.st_size) != want:
+                    out["wrong_size"].append(hexkey)
+                    try:
+                        _os.unlink(path)
+                        out["unlinked"] += 1
+                    except Exception:
+                        pass
+        except Exception as e:
+            out["error"] = repr(e)
+        out["ms"] = int((_time.monotonic() - t0) * 1000)
+        return out
+
+    Worker.kvmgr_verify_presence = kvmgr_verify_presence
     Worker.kvmgr_set_knob = kvmgr_set_knob
     Worker.kvmgr_clear_knob = kvmgr_clear_knob
     Worker.kvmgr_reload = kvmgr_reload
@@ -752,6 +853,39 @@ def wrap_engine_core_init() -> None:
                          "off and the ranks may start from different files")
         return
 
+    def _verify_pump(engine_core) -> None:
+        """Drive the cross-rank presence verification, once per step.
+
+        *** THIS RIDES THE EXISTING WRAP RATHER THAN ADDING AN INSTALLER, and
+        *** that is deliberate on two counts. *** It avoids the installer
+        audit (`register.py`'s `_install_*` table, which found two unarmed
+        re-arms the moment it was written), and more importantly it inherits
+        the hard-won answer to "which step entry point actually runs" -- the
+        one this project got wrong twice, once by wrapping the function that
+        loads the plugin and once by wrapping a `step` async scheduling never
+        calls.
+        
+        A repeating `collective_rpc` from the scheduler step is exactly what
+        `_enforce_budget`'s comment forbids ("the blocking-the-critical-path
+        mistake that has already cost this project an NCCL kill") -- so note
+        what makes this different: it is DEMAND-DRIVEN and bounded. With
+        nothing deferring and the background rate at its default, it is one
+        bounded RPC a minute; with a request deferring, it is one chunk per
+        step until that request is answered. The alternative it replaces is a
+        919,669-key walk, not nothing.
+
+        It never raises EXCEPT on an RPC timeout, which is unrecoverable --
+        see DiskPresenceManager.pump.
+        """
+        try:
+            from . import diskspec
+            m = diskspec._LIVE_MANAGER
+            if m is None:
+                return
+        except Exception:
+            return
+        m.pump(engine_core)
+
     def _oneshot(original):
         def wrapper(self, *a, **kw):
             if not getattr(self, "_kvmgr_synced", False):
@@ -766,6 +900,7 @@ def wrap_engine_core_init() -> None:
                         "kvmgr: the boot knob sync failed, so the ranks may be "
                         "starting from DIFFERENT files. Knobs set over HTTP "
                         "still fan out; only the boot defaults may disagree.")
+            _verify_pump(self)
             return original(self, *a, **kw)
 
         wrapper._kvmgr_sync = True  # type: ignore[attr-defined]
@@ -797,6 +932,15 @@ def _apply_locally(method: str, args: tuple, kwargs: dict) -> None:
         clear_knob(kwargs.get("name", args[0] if args else None))
     elif method == "kvmgr_reload":
         reload_modules()
+    elif method == "kvmgr_verify_presence":
+        # *** AN EXPLICIT NO-OP, BECAUSE THIS FUNCTION IGNORES UNKNOWN NAMES
+        # *** SILENTLY AND A READER WOULD ASSUME IT RAN. *** The presence
+        # verification is a question about a WORKER's filesystem: each rank
+        # stats its own slice, and the engine core has no files of its own to
+        # check -- the core's node is rank 0's node, already covered by rank
+        # 0's own reply. Applying it locally would double-count rank 0 and
+        # make `verify_verdict`'s rank arithmetic wrong.
+        pass
 
 
 # --- the router, attached to the engine's own app -------------------------
@@ -890,6 +1034,72 @@ def _router():
         out = await _fanout(raw_request, "kvmgr_reload", {})
         return JSONResponse(status_code=200 if out.get("ok") else 409,
                             content=out)
+
+    @router.post("/kv/verify")
+    async def kv_verify(raw_request: Request):
+        """Re-queue the index for cross-rank verification, or clear a fault.
+
+        *** THIS IS THE LEVER FOR AFTER YOU TOUCHED FILES ON ONE NODE. *** A
+        partial `kvsweep.sh`, an operator `rm`, a restored backup: the
+        background sweep would find it eventually (at
+        `disk_verify_bg_per_s`, hours for a full index), and somebody who
+        KNOWS they changed one node's files should not have to wait.
+        
+        Body (all optional):
+          `clear_fault`: true  -- drop a recorded fault so presence can be
+            claimed again. *** DELIBERATELY MANUAL. *** A fault means a rank
+            could not be asked; healing it automatically would mean nothing
+            ever gets looked at, which is how a refusal nobody can see becomes
+            a capability nobody checked.
+          `all`: true -- re-queue EVERY key. The background cursor does this
+            slowly by design; this is the impatient version, and it is bounded
+            by VERIFY_WANTED_MAX rather than by the index size.
+
+        It does NOT verify synchronously: the work happens on the step pump,
+        where the RPC's interaction with an outstanding model step is
+        understood. A route that blocked on 919,669 keys would be the
+        critical-path mistake wearing a different hat.
+        """
+        from . import diskspec
+
+        body = {}
+        try:
+            body = await raw_request.json()
+        except Exception:
+            pass
+        m = diskspec._LIVE_MANAGER
+        if m is None:
+            # The API server holds no manager -- this route is attached to the
+            # engine's app, so say which process answered rather than
+            # reporting an empty success.
+            return JSONResponse(status_code=409, content={
+                "ok": False,
+                "error": ("no disk manager in THIS process. /kv/verify must "
+                          "reach the engine core; the API server's own view "
+                          "has no index, which is the same `disk: null` trap "
+                          "GET /kv on :8888 has.")})
+        out = {"ok": True}
+        if body.get("clear_fault"):
+            out["fault_was"] = diskspec._VERIFY_FAULT
+            diskspec._VERIFY_FAULT = None
+            logger.warning("kvmgr: verification fault CLEARED by the control "
+                           "plane -- presence can be claimed again, and the "
+                           "next pump round re-checks what it is asked for")
+        if body.get("all"):
+            w = m._wanted_map()
+            ver = m._verified_set()
+            ver.clear()
+            now = diskspec._now()
+            n = 0
+            for k in m._present:
+                if len(w) >= m.VERIFY_WANTED_MAX:
+                    break
+                w.setdefault(k, now)
+                n += 1
+            out["requeued"] = n
+            out["capped"] = n < len(m._present)
+        out["verify"] = m._verify_snapshot()
+        return JSONResponse(content=out)
 
     @router.post("/kv/drop_gpu_cache")
     async def kv_drop(raw_request: Request):

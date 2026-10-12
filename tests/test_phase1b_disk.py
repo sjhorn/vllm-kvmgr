@@ -716,8 +716,27 @@ flags.reset_for_tests()
 m2 = diskspec.DiskPresenceManager(FakeMapper, num_workers=2, manifest_path=mpath)
 eq("*** a restarted engine RECOVERS presence from disk -- the whole prize ***",
    m2._stats["manifest_loaded"], 2)
-eq("...and lookup now hits for a key stored before the restart",
+# *** AND THE CONTRACT CHANGED HERE ON 2026-10-12, DELIBERATELY. *** A key
+# recovered from the manifest has been checked on ONE node -- the engine core's
+# -- and the index is a claim about two. So the first lookup DEFERS (`None`,
+# which is upstream's own "ask me again") instead of claiming, and it hits once
+# the cross-rank check has vouched for it. The old assertion here read
+# `lookup == True` immediately, and keeping it would have meant keeping the
+# hazard: a file lost on the OTHER node answered True and became upstream's
+# bare assert.
+eq("*** a manifest-recovered key DEFERS rather than claiming ***",
+   m2.lookup(k_a, ctx2), None)
+eq("...and the defer put it on the verification queue",
+   list(m2._wanted_map()), [bytes(k_a)])
+# one verification round, as the pump would apply it: both ranks vouch
+_v = m2.verify_apply([bytes(k_a)],
+                     [{"rank": 0, "missing": [], "wrong_size": [], "checked": 1},
+                      {"rank": 1, "missing": [], "wrong_size": [], "checked": 1}],
+                     2)
+eq("...the verdict carries no fault", _v["fault"], None)
+eq("*** and THEN lookup hits -- the prize still survives the restart ***",
    m2.lookup(k_a, ctx2), True)
+eq("...the queue is drained", list(m2._wanted_map()), [])
 
 # ...and an entry whose own file has gone is PRUNED, not trusted.
 os.unlink(FakeMapper.get_file_name(k_b))
@@ -725,7 +744,12 @@ m3 = diskspec.DiskPresenceManager(FakeMapper, num_workers=2, manifest_path=mpath
 eq("*** an entry whose file is gone is PRUNED ***", m3._stats["manifest_pruned"], 1)
 eq("...the survivor is kept", m3._stats["manifest_loaded"], 1)
 eq("...and lookup refuses the pruned key", m3.lookup(k_b, ctx2), False)
-eq("...while still hitting the live one", m3.lookup(k_a, ctx2), True)
+eq("...while still DEFERRING the live one until the cluster vouches for it",
+   m3.lookup(k_a, ctx2), None)
+m3.verify_apply([bytes(k_a)],
+                [{"rank": 0, "missing": [], "wrong_size": [], "checked": 1},
+                 {"rank": 1, "missing": [], "wrong_size": [], "checked": 1}], 2)
+eq("...and then hitting it", m3.lookup(k_a, ctx2), True)
 
 # a corrupt manifest must cost recompute, never correctness
 open(mpath, "w").write("{not json")

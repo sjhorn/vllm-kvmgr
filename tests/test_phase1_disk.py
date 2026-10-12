@@ -404,11 +404,80 @@ for _attr in _OPTIONAL_ATTRS:
         t = line.strip()
         return t.startswith(f"self.{attr} =") or t.startswith(f"self.{attr}:")
 
+    # The same word boundary the lazy tier needs: an accessor named after the
+    # attribute (`self._verified_set()`) CONTAINS `self._verified`, so a
+    # substring test reports the correct spelling as a violation. This lint
+    # escaped it only because `_gcounts` has no such accessor.
+    import re as _reO
+    _patO = _reO.compile(r"self\." + _attr + r"(?![A-Za-z0-9_])")
     _direct = [ln.strip() for ln in _dsrc.splitlines()
-               if f"self.{_attr}" in ln and "getattr" not in ln
+               if _patO.search(ln) and "getattr" not in ln
                and not ln.strip().startswith("#")
                and not _is_decl(ln, _attr)]
     eq(f"every read of self.{_attr} outside __init__ uses getattr", _direct, [])
+
+# *** AND A SECOND TIER THE AUDIT ABOVE COULD NOT SEE: PURELY LAZY STATE. ***
+# `_OPTIONAL_ATTRS` asserts the attribute EXISTS on a fresh instance, so it can
+# only cover things __init__ creates. State created on first use and never in
+# __init__ -- which is the strictly safer pattern, and what `_loading_map` has
+# always done -- was therefore outside the audit entirely, including its getattr
+# LINT. That gap is why this tier exists: `_loading` is the eviction hold, and a
+# direct `self._loading` read on a rebound manager is the same fatal
+# AttributeError in the same function as `_gcounts` was.
+#
+# The contract is the inverse of the one above: ABSENT on a fresh instance (no
+# __init__ assignment to drift), present after use, and every read through the
+# one accessor.
+# `_loading` is in here, and this audit is how that was settled: it asked
+# whether __init__ creates it and the answer was YES -- so it is a HYBRID,
+# assigned in __init__ and still read through `_loading_map()`. The braces are
+# what matter, because a rebound instance is the case that crashes, and that is
+# exactly what this tier checks. Sorting attributes by whether __init__
+# happens to touch them would have been a category judgment nobody can keep
+# current; "survive the attribute being gone" is the property either way.
+_LAZY_ATTRS = ("_loading", "_verified", "_wanted", "_vst", "_fst")
+_ACCESSOR = {"_loading": "_loading_map", "_verified": "_verified_set",
+             "_wanted": "_wanted_map", "_vst": "_verify_state",
+             "_fst": "_free_state"}
+
+for _attr in _LAZY_ATTRS:
+    m_lz = diskspec.DiskPresenceManager(sp.file_mapper(), num_workers=WORLD)
+    # Whether __init__ created it or not, a REBIND leaves it gone. That is the
+    # state to test, so make it unconditionally.
+    if hasattr(m_lz, _attr):
+        delattr(m_lz, _attr)
+    _ok, _why = True, ""
+    try:
+        m_lz.prepare_store([k1, k2], ctx)
+        m_lz.complete_store([k1, k2], ctx)
+        m_lz.lookup(k1, ctx)
+        _snap2 = m_lz.snapshot()
+    except Exception as _exc:
+        _ok, _why = False, repr(_exc)
+    check(f"*** a manager that never had {_attr} still serves the data path "
+          f"*** {_why}", _ok)
+    check(f"...and snapshot() still answers", _ok and isinstance(_snap2, dict))
+    # And the accessor must SUPPLY it, not merely tolerate its absence: a
+    # getattr-with-default that never stores anything back would pass the check
+    # above while silently losing every write.
+    getattr(m_lz, _ACCESSOR[_attr])()
+    check(f"...and {_ACCESSOR[_attr]}() creates it on the INSTANCE",
+          hasattr(m_lz, _attr))
+
+# *** THE MATCHER NEEDS A WORD BOUNDARY, AND ITS FIRST VERSION FAILED FOR THE
+# *** WRONG REASON BECAUSE IT DID NOT HAVE ONE. *** `self._verified_set()` -- the
+# accessor, which is the CORRECT spelling -- contains `self._verified`, so a
+# substring test reported every proper call as a violation. The `_gcounts` lint
+# above never hit this only because its accessor is not named after it. A lint
+# that fails for the wrong reason is as unhelpful as one that passes for it.
+import re as _reL
+for _attr in _LAZY_ATTRS:
+    _pat = _reL.compile(r"self\." + _attr + r"(?![A-Za-z0-9_])")
+    _direct = [ln.strip() for ln in _dsrc.splitlines()
+               if _pat.search(ln) and "getattr" not in ln
+               and not ln.strip().startswith("#")
+               and not _is_decl(ln, _attr)]
+    eq(f"every read of self.{_attr} goes through its accessor", _direct, [])
 
 print("== (1x) capturing the connector scheduler off the CALL STACK ==")
 # A gc scan cannot find it: EngineCore.__init__ calls freeze_gc_heap() ->

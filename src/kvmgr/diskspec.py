@@ -604,6 +604,102 @@ JOURNAL_CLEAR = "c"
 _JMISSING = object()
 
 
+# ---------------------------------------------------------------------------
+# CROSS-RANK VERIFICATION AND THE FREE-SPACE FLOOR -- the pure halves
+# ---------------------------------------------------------------------------
+# Both mechanisms exist for one reason: `offloading/worker.py:273` is a bare
+# `assert transfer_result.success` under the comment "we currently do not
+# support job failures". So a missing file on ONE node, a truncated file, or a
+# full disk is not a miss -- it is a dead engine core. "Handle the error
+# gracefully" is not on the menu; a hazard here is closed only by making that
+# assert UNREACHABLE.
+#
+# The decision logic is pure and lives here, for the reason everything
+# dangerous in this plugin is pure: it is the half that can be wrong in a way
+# nothing crashes on, and it has to be testable with no GPU, no torch and no
+# filesystem.
+
+# *** A RANK THAT CANNOT ANSWER, and "I cannot tell" must never read as
+# *** "nothing wrong". *** A missing rank, an exception or a timeout records a
+# persistent fault here and presence REFUSES for the rest of the boot. That is
+# the drop guard's precedent: for a lever whose failure mode is a dead engine,
+# unreadable has to be treated as bad. It is a module global so a hot reload
+# cannot silently clear a fault -- see control._PRESERVE.
+_VERIFY_FAULT: "dict | None" = None
+
+# The absolute floor, in code and not a knob. Below this the tier stops
+# admitting even the single key that carries the unlinks: at ~1 MB per key per
+# rank, one key cannot rescue a filesystem this close to full, and the write it
+# would attempt is the ENOSPC we are avoiding.
+FREE_ABSOLUTE_MIN_BYTES = 1 << 30
+
+BAND_OK = "ok"
+BAND_DEGRADED = "degraded"
+BAND_FROZEN = "frozen"
+
+
+def free_band(free: int, floor: int, hard: int, hyst: int,
+              prev: str = BAND_OK) -> str:
+    """Which free-space band are we in? Pure, with hysteresis.
+
+    *** HYSTERESIS IS NOT POLISH HERE. *** Without it a tier sitting exactly at
+    the floor flaps band on every store round, and the band EDGE is what gets
+    logged -- so a flapping tier is also a log flood, which is how a reader
+    learns to ignore the one transition that matters.
+
+    `free <= 0` is treated as FROZEN rather than as "unknown": a zero from a
+    real statvfs means a full disk. An UNREADABLE statvfs never reaches here --
+    the caller treats that as OK and says so loudly, which is the opposite of
+    the drop guard's choice and for the opposite reason: there "unknown" risks
+    a dead worker, here it risks only a cold cache.
+    """
+    if free <= hard:
+        return BAND_FROZEN
+    if free < floor:
+        return BAND_DEGRADED
+    # Coming back up needs to clear the floor by the hysteresis, and a frozen
+    # tier has to clear the DEGRADED gate as well -- it cannot jump to ok.
+    if prev in (BAND_DEGRADED, BAND_FROZEN) and free < floor + hyst:
+        return BAND_DEGRADED
+    return BAND_OK
+
+
+def verify_verdict(results: "Sequence[dict]", expect_ranks: int) -> dict:
+    """Fold per-rank verification replies into one verdict. Pure.
+
+    Returns `{"bad": [key, ...], "checked": int, "ranks": int,
+              "fault": None | str}` -- `bad` being every key that ANY rank
+    could not vouch for, because a key is only restorable if every rank holds
+    its own slice. One rank's miss is the whole key's miss, which is the same
+    all-ranks property `complete_store` rests on, read in the other direction.
+
+    *** A SHORT REPLY LIST IS A FAULT, NOT A SMALLER CHECK. *** Fewer replies
+    than ranks means a rank did not answer, and treating that as "the ranks
+    that did answer all said yes" is exactly the manufactured zero this repo
+    keeps paying for. It is named as a fault and the caller refuses.
+    """
+    out = {"bad": [], "checked": 0, "ranks": len(results), "fault": None}
+    if len(results) < expect_ranks:
+        out["fault"] = (f"only {len(results)} of {expect_ranks} rank(s) "
+                        f"answered the presence verification")
+        return out
+    bad: dict[bytes, None] = {}
+    for r in results:
+        if not isinstance(r, dict):
+            out["fault"] = f"a rank replied with {type(r).__name__}, not a dict"
+            return out
+        if r.get("error"):
+            out["fault"] = f"rank {r.get('rank')}: {r['error']}"
+            return out
+        out["checked"] = max(out["checked"], int(r.get("checked") or 0))
+        for hexkey in (r.get("missing") or ()):
+            bad[bytes.fromhex(hexkey)] = None
+        for hexkey in (r.get("wrong_size") or ()):
+            bad[bytes.fromhex(hexkey)] = None
+    out["bad"] = list(bad)
+    return out
+
+
 def journal_encode(kind: str, items) -> str:
     """One journal record, newline-terminated.
 
@@ -919,6 +1015,11 @@ class DiskPresenceManager(OffloadingManager):
     # And a time floor, because a session adding fewer than 512 keys would
     # otherwise never flush at all. See flush_manifest for the measurement.
     MANIFEST_FLUSH_S = 30.0
+    # The deferral queue's hard cap. Demand-fed, and demand can be a
+    # million-token prompt, so it is bounded in code rather than by a knob: a
+    # knob here would be a knob on how much of the scheduler's thread a bad
+    # day may have. Past the cap a lookup answers miss, which is safe.
+    VERIFY_WANTED_MAX = 200_000
 
     def __init__(self, file_mapper: FileMapper, num_workers: int,
                  manifest_path: str | None = None):
@@ -1090,6 +1191,11 @@ class DiskPresenceManager(OffloadingManager):
 
     def _forget(self, key: bytes) -> int:
         """Drop a key from the index, returning the bytes reclaimed."""
+        # Hygiene, and it matters for the verified set specifically: a key
+        # evicted and later re-stored must not inherit the old vouching, since
+        # the file it refers to is a different file.
+        self._verified_set().discard(bytes(key))
+        self._wanted_map().pop(bytes(key), None)
         nb, _pos = self._present.pop(bytes(key), (0, -1))
         self._bytes -= nb
         if self._bytes < 0:
@@ -1657,10 +1763,438 @@ class DiskPresenceManager(OffloadingManager):
             # for keys lookup claimed, so returning False here means no file can
             # reach a GPU tensor at all. See this module's docstring.
             return False
-        hit = bytes(key) in self._present
-        if hit:
+        kb = bytes(key)
+        if kb not in self._present:
+            return False
+        # *** THE INDEX IS A CLAIM ABOUT TWO FILESYSTEMS. *** Present is not
+        # the same statement as restorable: the boot walk checked this node
+        # only, and a file lost on the other one makes the load upstream's bare
+        # assert. So a key the cluster has not vouched for DEFERS rather than
+        # being claimed -- `None` is upstream's own "ask me again", and the
+        # scheduler re-queues the request with nothing allocated and no worker
+        # involved. See _verify_answer for the three outcomes.
+        ans = self._verify_answer(kb)
+        if ans is None:
+            self._stats["verify_deferred"] = (
+                self._stats.get("verify_deferred", 0) + 1)
+            return None
+        if ans:
             self._stats["hit"] += 1
-        return hit
+            return True
+        return False
+
+    # -- cross-rank verification ------------------------------------------
+    #
+    # Every piece of state here is created LAZILY ON THE INSTANCE and read
+    # through one accessor, for the reason stated at _loading_map: `rebind`
+    # re-points a live manager with `obj.__class__ = new`, so an instance
+    # already serving requests gets every new METHOD and no new attribute, and
+    # an AttributeError on this path is fatal to the scheduler.
+
+    def _verified_set(self) -> set:
+        """Keys every rank has vouched for, created on first use.
+
+        It holds references to the SAME bytes objects `_present` keys on, so
+        the cost is the set's slot array rather than a second copy of 919,669
+        keys.
+        """
+        v = getattr(self, "_verified", None)
+        if v is None:
+            v = set()
+            self._verified = v
+        return v
+
+    def _wanted_map(self) -> "OrderedDict":
+        """Keys a lookup is waiting on -> when it first asked (monotonic).
+
+        An OrderedDict so the pump drains oldest-first: the request that has
+        been deferring longest is the one closest to answering False.
+        """
+        w = getattr(self, "_wanted", None)
+        if w is None:
+            w = OrderedDict()
+            self._wanted = w
+        return w
+
+    def _verify_answer(self, kb: bytes) -> "bool | None":
+        """True = vouched for, None = defer, False = answer miss.
+
+        Three outcomes and a strict order of precedence:
+
+        1. verification OFF -> True. The knob means "trust the index", which is
+           exactly today's behaviour, so turning it off cannot make anything
+           slower or stranger than it already is.
+        2. a persistent FAULT -> False. A rank that cannot answer must not read
+           as a rank that said yes; refusing costs a cold cache, and claiming
+           costs the engine.
+        3. otherwise: verified -> True; else enqueue and defer until the
+           deferral budget is spent, then False.
+
+        *** A MISS IS ALWAYS SAFE, AND THAT IS WHY THE EXPIRY EXISTS. *** The
+        worst this can do by answering False is recompute a prefix -- which is
+        the thing the whole tier is measured against -- while answering True
+        wrongly is upstream's assert.
+        """
+        if not flags.peek("disk_verify_enabled"):
+            return True
+        if _VERIFY_FAULT is not None:
+            self._stats["verify_refused_fault"] = (
+                self._stats.get("verify_refused_fault", 0) + 1)
+            return False
+        if kb in self._verified_set():
+            return True
+        w = self._wanted_map()
+        now = _now()
+        t0 = w.get(kb)
+        if t0 is None:
+            # Bounded, because the queue is fed by demand and demand can be a
+            # million-token prompt. Past the cap a key is simply answered as a
+            # miss rather than queued -- the cap is reached only when the pump
+            # is not keeping up, and in that state a cold prefix beats an
+            # unbounded dict on the scheduler's thread.
+            if len(w) >= self.VERIFY_WANTED_MAX:
+                self._stats["verify_queue_full"] = (
+                    self._stats.get("verify_queue_full", 0) + 1)
+                return False
+            w[kb] = now
+            return None
+        budget = float(flags.peek("disk_verify_defer_s") or 0.0)
+        if budget > 0 and (now - t0) < budget:
+            return None
+        self._stats["verify_defer_expired"] = (
+            self._stats.get("verify_defer_expired", 0) + 1)
+        return False
+
+    def _verify_state(self) -> dict:
+        """Pump bookkeeping, created on first use."""
+        st = getattr(self, "_vst", None)
+        if st is None:
+            st = {"cursor": 0, "bg_credit": 0.0, "bg_at": 0.0, "rpc_at": 0.0}
+            self._vst = st
+        return st
+
+    def _verify_chunk(self) -> list:
+        """The next keys to verify: demand first, then slow background.
+
+        *** DEMAND BEFORE BACKGROUND, ALWAYS. *** A deferring request is a
+        request not being served, and the background sweep has all boot to
+        finish. The chunk bounds the RPC MESSAGE, not the work: a long
+        request's whole candidate set (2,758 keys for a 700K prefix, measured)
+        fits inside one.
+        """
+        st = self._verify_state()
+        cap = max(1, int(flags.peek("disk_verify_chunk") or 1))
+        w = self._wanted_map()
+        # oldest-first: the request closest to giving up is served first
+        out = [k for k, _t in list(w.items())[:cap]]
+        if len(out) >= cap:
+            return out
+        # -- the slow background re-verification --------------------------
+        #
+        # It exists because divergence can appear MID-BOOT: an operator `rm`, a
+        # partial kvsweep.sh, a filesystem error. Rate-limited in keys per
+        # second rather than per step, because step rate is a property of the
+        # traffic and this must not speed up under load -- it is the one thing
+        # here that has all day.
+        rate = float(flags.peek("disk_verify_bg_per_s") or 0.0)
+        if rate <= 0:
+            return out
+        now = _now()
+        last = st.get("bg_at") or now
+        st["bg_credit"] = min(float(cap),
+                              float(st.get("bg_credit") or 0.0)
+                              + max(0.0, now - last) * rate)
+        st["bg_at"] = now
+        take = min(int(st["bg_credit"]), cap - len(out))
+        if take <= 0:
+            return out
+        # A CURSOR OVER THE INDEX, not a timestamp per key: 919,669 floats is
+        # memory this box does not have spare, and the question "has this been
+        # re-checked lately" only ever needs answering in aggregate.
+        keys = list(self._present.keys())
+        if not keys:
+            return out
+        i = int(st.get("cursor") or 0) % len(keys)
+        picked, seen = [], 0
+        while len(picked) < take and seen < len(keys):
+            k = keys[i]
+            i = (i + 1) % len(keys)
+            seen += 1
+            if k not in w:
+                picked.append(k)
+        st["cursor"] = i
+        st["bg_credit"] -= len(picked)
+        # *** BACKGROUND KEYS ARE NOT ENQUEUED IN `_wanted`, AND THAT IS THE
+        # *** POINT. *** `_wanted` is what makes a lookup defer, and a key
+        # already vouched for must stay claimable while it is re-checked -- the
+        # only thing a re-check can do is remove a key that was already going
+        # to kill the engine. Re-verification must never cost a cache miss.
+        self._stats["verify_bg_checked"] = (
+            self._stats.get("verify_bg_checked", 0) + len(picked))
+        return out + picked
+
+    def verify_apply(self, asked: "Sequence[bytes]", results: "Sequence[dict]",
+                     expect_ranks: int) -> dict:
+        """Apply per-rank verdicts. Returns the folded verdict, never raises.
+
+        *** THE SELF-HEAL IS THE BEST PROPERTY OF THIS DESIGN AND IT IS THREE
+        *** LINES. *** A key any rank cannot vouch for is FORGOTTEN and a
+        remove is journalled. It leaves the index, so the next `prepare_store`
+        offers it again; the rank that still holds a good file SKIPS the write
+        (`disk_skip_present_before_copy`, and `_write_batch`'s own exists()
+        behind it), the rank that lost it writes it, and `complete_store`
+        re-indexes it as verified. **A file lost on one node is repaired by the
+        next store instead of killing the engine.**
+        """
+        v = verify_verdict(results, expect_ranks)
+        if v["fault"]:
+            return v
+        asked_set = {bytes(k) for k in asked}
+        bad = {bytes(k) for k in v["bad"]}
+        good = asked_set - bad
+        ver = self._verified_set()
+        w = self._wanted_map()
+        for k in good:
+            if k in self._present:
+                ver.add(k)
+            w.pop(k, None)
+        if bad:
+            freed = 0
+            for k in bad:
+                freed += self._forget(k)
+                w.pop(k, None)
+            # Journalled, so a boot cannot resurrect a key the cluster has just
+            # told us it cannot serve. Same ordering argument as eviction: a
+            # remove recorded for a file that survives costs one re-store, a
+            # delete with no record is an orphan.
+            self._journal_append(JOURNAL_REMOVE, list(bad))
+            self._stats["verify_forgot"] = (
+                self._stats.get("verify_forgot", 0) + len(bad))
+            self._stats["verify_forgot_bytes"] = (
+                self._stats.get("verify_forgot_bytes", 0) + freed)
+            self._unflushed += len(bad)
+            logger.warning(
+                "kvmgr: cross-rank verification DROPPED %d key(s) (%.2f GB) "
+                "that at least one rank could not vouch for -- a missing or "
+                "wrong-sized file on EITHER node. They are out of the index, "
+                "so the next store re-offers them: the rank that still has a "
+                "good file skips the write, the rank that lost it writes it, "
+                "and the key comes back verified. This is the self-heal, not "
+                "a loss -- without it the next load of one of these keys "
+                "would have been upstream's assert and a dead engine.",
+                len(bad), freed / 1e9)
+        self._stats["verify_checked"] = (
+            self._stats.get("verify_checked", 0) + len(asked_set))
+        self._stats["verify_rpcs"] = self._stats.get("verify_rpcs", 0) + 1
+        return v
+
+    def pump(self, engine_core) -> None:
+        """One verification round, from the scheduler step. Called every step.
+
+        *** THE RPC IS BLOCKING, AND THAT IS SAFE FOR A REASON THAT HAD TO BE
+        *** READ OFF THE IMAGE RATHER THAN ASSUMED. ***
+        `MultiprocExecutor.collective_rpc` wraps every call in a
+        `FutureWrapper` on a shared `futures_queue`, and a blocking
+        `result()` DRAINS that queue oldest-first
+        (`while not self.done(): self.futures_queue.pop()._wait_for_response()`).
+        So with an `execute_model` future outstanding -- and
+        `--async-scheduling` means there normally IS one -- ordering is
+        preserved by construction. The cost is latency, not corruption: our
+        call forces the outstanding model step to be awaited inline. See
+        patches/pristine/vllm/v1/executor/multiproc_executor.py, captured for
+        exactly this question.
+
+        *** AND IT IS WHY A TIMEOUT IS FATAL. *** A `TimeoutError` does NOT set
+        the executor's `is_failed`; the future takes the exception and is
+        popped, leaving the worker's eventual reply UNCLAIMED on an ordered
+        response queue. Every later dequeue is then off by one, so the engine
+        receives a verification dict where it expects a `ModelRunnerOutput`.
+        Swallowing that is silent corruption; the honest choice is to die here
+        with a line naming the cause rather than fifty milliseconds later with
+        an unattributable traceback. Same argument as `stall_fail_after_s`.
+
+        Everything else is caught: a chunk that cannot be built, a verdict that
+        cannot be applied, a rank that errored. Those become a FAULT, which
+        refuses presence and costs a cold cache.
+        """
+        try:
+            keys = []
+            if flags.peek("disk_verify_enabled") and _VERIFY_FAULT is None:
+                keys = self._verify_chunk()
+            st = self._verify_state()
+            now = _now()
+            rpc_iv = float(flags.peek("disk_free_rpc_s") or 0.0)
+            due = rpc_iv > 0 and (now - float(st.get("rpc_at") or 0.0)) >= rpc_iv
+            # *** A KEEP-ALIVE WITH NO KEYS IS NOT A WASTED CALL. *** It is how
+            # the worker's free space is refreshed at all, and it proves the
+            # channel works BEFORE a sweep needs it -- a verification path
+            # whose first ever use is an emergency is a path nobody has tested.
+            if not keys and not due:
+                return
+            st["rpc_at"] = now
+        except Exception:
+            logger.exception("kvmgr: verification pump could not build a "
+                             "chunk; skipping this round")
+            return
+
+        timeout = float(flags.peek("disk_verify_rpc_timeout_s") or 0.0)
+        if timeout <= 0:
+            # NEVER None, which collective_rpc turns into dequeue(timeout=None)
+            # and therefore into a wait with no end. A zeroed knob falls back to
+            # the declaration rather than to the dangerous value -- the
+            # load_inflight_max lesson, where a reader's own fallback literal
+            # reinstated the fatal number through the safety path.
+            timeout = float(flags.DEFAULTS["disk_verify_rpc_timeout_s"])
+        try:
+            results = engine_core.collective_rpc(
+                "kvmgr_verify_presence", timeout=timeout,
+                kwargs={"keys": [k.hex() for k in keys]})
+        except TimeoutError:
+            self.verify_fault(
+                "the presence-verification RPC timed out after %.0fs. THE "
+                "ENGINE CANNOT CONTINUE: a collective_rpc timeout leaves the "
+                "worker's reply unclaimed on an ordered response queue, so "
+                "every later dequeue is off by one and the engine core would "
+                "receive this verification dict where it expects a "
+                "ModelRunnerOutput. Dying here with the cause named beats "
+                "dying in a moment with an unattributable traceback. The "
+                "likely cause is a rank whose filesystem is not answering."
+                % timeout)
+            raise
+        except Exception as e:
+            # A dead executor, a missing method, a worker that raised. None of
+            # those desync the queue, so this is survivable -- as a fault.
+            self.verify_fault("the presence-verification RPC failed: %r" % (e,))
+            return
+
+        try:
+            if not isinstance(results, list):
+                results = [results]
+            # The free-space half rides the same reply, so it is applied even
+            # when the key list was empty.
+            self.note_worker_free([r.get("free_bytes") for r in results
+                                   if isinstance(r, dict)])
+            if not keys:
+                return
+            v = self.verify_apply(keys, results, self._num_workers)
+            if v.get("fault"):
+                self.verify_fault(v["fault"])
+        except Exception as e:
+            self.verify_fault("the verification reply could not be "
+                              "applied: %r" % (e,))
+
+    def verify_fault(self, reason: str) -> None:
+        """Record a rank that could not answer. Logged ONCE, queryable always.
+
+        *** "I CANNOT TELL" MUST NEVER READ AS "NOTHING WRONG". *** The drop
+        guard set this precedent: for a lever whose failure mode is a dead
+        engine, unreadable is treated as bad. So presence refuses for the rest
+        of the boot, the fault goes in `/kv` where a script can fail on it, and
+        it clears only on an explicit knob reset -- never by itself, because a
+        fault that heals silently is a fault nobody fixes.
+        """
+        global _VERIFY_FAULT
+        if _VERIFY_FAULT is not None:
+            _VERIFY_FAULT["seen"] = int(_VERIFY_FAULT.get("seen", 0)) + 1
+            return
+        _VERIFY_FAULT = {"reason": str(reason), "at": _now(), "seen": 1}
+        logger.error(
+            "kvmgr: PRESENCE VERIFICATION FAULT -- %s. The disk index is a "
+            "claim about every rank and one of them cannot be asked, so "
+            "presence now REFUSES for the rest of this boot: restores go cold "
+            "rather than risking a load whose file is gone on the node that "
+            "could not answer, which is upstream's bare assert and a dead "
+            "engine core. Visible as `verify.fault` on :9199/kv; clears only "
+            "on an explicit reset.", reason)
+
+    # -- the free-space floor ---------------------------------------------
+
+    def _free_state(self) -> dict:
+        """Free-space bookkeeping, created on first use."""
+        st = getattr(self, "_fst", None)
+        if st is None:
+            st = {"at": 0.0, "local": None, "ranks": None, "ranks_at": 0.0,
+                  "band": BAND_OK}
+            self._fst = st
+        return st
+
+    def _statvfs_free(self) -> "int | None":
+        """Free bytes where the tier writes, or None if it cannot be read.
+
+        The target is the manifest's own directory, which IS `spec.root_dir` --
+        no new reference is needed, and it is by construction the filesystem
+        the files land on.
+        """
+        try:
+            import os as _os
+            if not self._manifest:
+                return None
+            vfs = _os.statvfs(_os.path.dirname(self._manifest))
+            return int(vfs.f_bavail) * int(vfs.f_frsize)
+        except Exception:
+            self._stats["free_check_errors"] = (
+                self._stats.get("free_check_errors", 0) + 1)
+            return None
+
+    def note_worker_free(self, free_by_rank: "Sequence[int]") -> None:
+        """Record what the WORKERS say about their own filesystems.
+
+        *** THE ACTUATOR OTHERWISE SEES ONLY THE HEAD, AND THE WORKER IS
+        *** CURRENTLY THE FULLER OF THE TWO. *** Each rank writes its own slice
+        to its own node's disk, so the binding constraint is the MINIMUM across
+        nodes and a head-only reading is the wrong number on exactly the day it
+        matters. It rides the verification RPC, so it costs no channel of its
+        own and doubles as a keep-alive proving that channel works before a
+        sweep needs it.
+        """
+        vals = [int(v) for v in free_by_rank if v is not None and int(v) >= 0]
+        st = self._free_state()
+        st["ranks"] = min(vals) if vals else None
+        st["ranks_at"] = _now()
+
+    def _free_pressure(self) -> tuple:
+        """`(band, evict_step_bytes, free_bytes_or_None)`. Throttled.
+
+        *** AN UNREADABLE statvfs READS AS OK, AND SAYS SO. *** That is the
+        OPPOSITE of the drop guard's choice and for the opposite reason: there
+        "I cannot tell" risks a dead worker, so it refuses; here it risks only
+        a cold cache, so refusing would turn a diagnostic failure into a
+        feature outage. It is counted and logged rather than assumed.
+        """
+        st = self._free_state()
+        now = _now()
+        iv = float(flags.peek("disk_free_check_s") or 0.0)
+        if (now - float(st.get("at") or 0.0)) >= iv:
+            st["at"] = now
+            st["local"] = self._statvfs_free()
+            self._stats["free_checks"] = self._stats.get("free_checks", 0) + 1
+        seen = [v for v in (st.get("local"), st.get("ranks")) if v is not None]
+        step = int(float(flags.peek("disk_free_evict_step_gb") or 0.0) * 1e9)
+        if not seen:
+            return (BAND_OK, step, None)
+        free = min(seen)
+        floor = int(float(flags.peek("disk_free_floor_gb") or 0.0) * 1e9)
+        hard = int(float(flags.peek("disk_free_hard_gb") or 0.0) * 1e9)
+        hyst = int(float(flags.peek("disk_free_hysteresis_gb") or 0.0) * 1e9)
+        if floor <= 0:
+            return (BAND_OK, step, free)
+        band = free_band(free, floor, hard, hyst, st.get("band") or BAND_OK)
+        if band != st.get("band"):
+            # *** THE BAND EDGE IS THE EVENT; THE 400TH STORE ROUND IN A BAND
+            # *** IS NOT. *** Logging per round is how a reader learns to skip
+            # the channel the first transition arrives on.
+            logger.warning(
+                "kvmgr: free-space band %s -> %s (%.1f GB free, floor %.1f, "
+                "hard %.1f, min across %d node(s)). DEGRADED makes every store "
+                "round net-negative by one %.1f GB step, so the drain is paid "
+                "by the traffic that caused it; FROZEN admits exactly one key "
+                "per round so the store job still exists to carry the unlinks "
+                "out, because a refusal would destroy the only delete channel "
+                "there is and make the freeze permanent.",
+                st.get("band"), band, free / 1e9, floor / 1e9, hard / 1e9,
+                len(seen), step / 1e9)
+            st["band"] = band
+        return (band, step, free)
 
     def _loading_map(self) -> dict:
         """The in-flight-load holds, created on first use.
@@ -1784,6 +2318,36 @@ class DiskPresenceManager(OffloadingManager):
         if not todo:
             return _nothing_to_store()
 
+        # *** A FULL DISK IS A DEAD ENGINE, AND THE REFUSAL HAS TO HAPPEN
+        # *** HERE. *** The worker CANNOT refuse: `success=False` is fatal on
+        # every path, and reporting success without writing poisons the index
+        # so a later load dies on a missing file instead. The engine core is
+        # the only process that can both decline a store and choose victims.
+        _band, _step, _free = self._free_pressure()
+        if _band == BAND_FROZEN:
+            if _free is not None and _free <= FREE_ABSOLUTE_MIN_BYTES:
+                # The one place the tier truly stops. Below a gigabyte free,
+                # the single key below cannot rescue anything and its write IS
+                # the ENOSPC being avoided.
+                self._stats["free_refusals"] = (
+                    self._stats.get("free_refusals", 0) + len(todo))
+                # _nothing_to_store(), NEVER None: None means "I cannot", which
+                # leaves stored_idx unadvanced and re-offers the same blocks
+                # every step for ever -- measured here at 3,309 warnings at
+                # ~20/s. This is the same refusal `disk_store_paused` makes.
+                return _nothing_to_store()
+            # *** ADMIT EXACTLY ONE KEY, AND THE REASON IS NOT OBVIOUS. *** A
+            # hard refusal destroys the only delete channel there is:
+            # `scheduler.py:745` does `if not store_output.keys_to_store:
+            # advance_stored_idx(...); continue`, which drops the store spec --
+            # and the unlinks ride that spec by design. So a refusal would make
+            # the freeze PERMANENT. One ~1 MB write buys a step-sized reclaim.
+            self._stats["free_frozen_rounds"] = (
+                self._stats.get("free_frozen_rounds", 0) + 1)
+            self._stats["free_refusals"] = (
+                self._stats.get("free_refusals", 0) + max(0, len(todo) - 1))
+            todo = todo[:1]
+
         # *** RECORD THE POSITION NOW, because this is the only moment it is
         # *** known. *** The scheduler hands keys in block order within a
         # group -- the same input-order invariant check_pairing depends on --
@@ -1857,10 +2421,32 @@ class DiskPresenceManager(OffloadingManager):
         would be simpler and are not safe.
         """
         budget = budget_bytes(flags.peek("disk_budget_gb"))
-        if not budget:
-            return []
+        # *** THE FLOOR IS EVALUATED BEFORE THE `budget == 0` EARLY RETURN, AND
+        # *** GETTING THAT ORDER WRONG WOULD HAVE LEFT A disk_budget_gb=0
+        # *** DEPLOYMENT WITH NO FLOOR AT ALL. *** `budget_bytes` returns 0 for
+        # "unbounded", and this function used to return [] on that immediately.
+        # A free-space floor is not a budget: it is the thing standing between
+        # ENOSPC and upstream's bare assert, and it has to hold whether or not
+        # anybody set a byte budget.
+        band, step, _free = self._free_pressure()
         incoming_bytes = sum(self._key_bytes(bytes(k)) for k in incoming)
-        need = (self._bytes + incoming_bytes) - budget
+        need = (self._bytes + incoming_bytes) - budget if budget else 0
+        if band != BAND_OK and step > 0:
+            # *** DRIVE THE EXISTING EVICTION MACHINERY VIA AN *EFFECTIVE*
+            # *** BUDGET -- never by lowering disk_budget_gb. *** Writing the
+            # knob would be an actuator mutating its own configuration: the
+            # operator's number would be gone, and nothing would restore it
+            # when the disk recovered. So the pressure is expressed as a budget
+            # for THIS CALL only.
+            #
+            # `max(0, held - step)` makes `need` come out as
+            # `incoming + min(step, held)`, so every store round is
+            # net-negative by one step and the drain is paid by the traffic
+            # that caused it rather than in one burst.
+            eff = max(0, self._bytes - step)
+            need = max(need, (self._bytes + incoming_bytes) - eff)
+            self._stats["free_evict_rounds"] = (
+                self._stats.get("free_evict_rounds", 0) + 1)
         if need <= 0:
             return []
         # Never consider what we are about to store as a victim.
@@ -1937,6 +2523,17 @@ class DiskPresenceManager(OffloadingManager):
             _p = self._pos_hint.pop(bytes(k), -1)
             self._remember(bytes(k), _p)
             _jadds.append((bytes(k), _p))
+            # *** KEYS STORED THIS BOOT ARE BORN VERIFIED, and that is not an
+            # *** optimisation -- it is the same all-ranks property the index
+            # *** already rests on. *** complete_store fires if and only if
+            # EVERY rank reported the job done (`pending_count=world_size`,
+            # aggregated by the framework), so a key arriving here was written
+            # everywhere, by construction. The cross-rank sweep therefore only
+            # ever covers keys restored from the manifest or the journal --
+            # which is also why a long-running boot converges to zero
+            # verification traffic.
+            self._verified_set().add(bytes(k))
+            self._wanted_map().pop(bytes(k), None)
         # The journal's add edge is THIS one and only this one, for the same
         # reason the manifest's is: complete_store fires if and only if every
         # rank reported the job done, so a key recorded here was written
@@ -2013,6 +2610,13 @@ class DiskPresenceManager(OffloadingManager):
         self._present.clear()
         self._bytes = 0
         self._pos_hint.clear()
+        # *** CLEAR THE VOUCHING TOO, or a reset leaks verdicts across it. ***
+        # The keys are gone, so every verdict about them is about files this
+        # index no longer claims; keeping them would vouch for whatever a
+        # future key with the same hash pointed at.
+        self._verified_set().clear()
+        self._wanted_map().clear()
+        self._verify_state()["cursor"] = 0
         self.flush_manifest(force=True)
 
     def _count_groups(self, what: str, keys: "Collection[OffloadKey]") -> None:
@@ -2100,7 +2704,48 @@ class DiskPresenceManager(OffloadingManager):
                     sched=offload_sched_snapshot(),
                     restore_enabled=bool(flags.peek("disk_restore")),
                     store_paused=bool(flags.peek("disk_store_paused")),
+                    verify=self._verify_snapshot(),
+                    free=self._free_snapshot(),
                     fingerprint=self._fingerprint())
+
+    def _verify_snapshot(self) -> dict:
+        """What the cross-rank check knows. *** A FAULT MUST BE QUERYABLE. ***
+
+        Logged-once is not enough: `kvbootconfirm.sh` has to be able to FAIL on
+        a down worker, and a log line is not something a script should parse.
+        `fault` is null when there is none and a dict naming the rank and
+        reason when there is -- never absent, so a reader cannot mistake "no
+        key" for "no problem".
+        """
+        return {
+            "enabled": bool(flags.peek("disk_verify_enabled")),
+            "verified": len(self._verified_set()),
+            "wanted": len(self._wanted_map()),
+            "unverified": max(0, len(self._present) - len(self._verified_set())),
+            "cursor": int(self._verify_state().get("cursor") or 0),
+            "fault": _VERIFY_FAULT,
+        }
+
+    def _free_snapshot(self) -> dict:
+        """The floor, as numbers. *** A FLOOR NOBODY CAN SEE IS A FLOOR NOBODY
+        WILL TRUST, which is why this exists before it has ever fired. ***
+
+        `bytes` is null when statvfs could not be read -- which is treated as
+        OK, deliberately, and must therefore be VISIBLE as "not measured"
+        rather than rendered as a zero that would read as a full disk.
+        """
+        st = self._free_state()
+        band, step, free = self._free_pressure()
+        return {
+            "bytes": free,
+            "local_bytes": st.get("local"),
+            "worker_min_bytes": st.get("ranks"),
+            "floor_bytes": int(float(flags.peek("disk_free_floor_gb") or 0) * 1e9),
+            "hard_bytes": int(float(flags.peek("disk_free_hard_gb") or 0) * 1e9),
+            "absolute_min_bytes": FREE_ABSOLUTE_MIN_BYTES,
+            "evict_step_bytes": step,
+            "band": band,
+        }
 
     def _fingerprint(self) -> dict:
         """What this cache is KEYED ON, exposed so the proxy can see it.

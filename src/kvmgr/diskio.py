@@ -2127,9 +2127,41 @@ class DiskStoreHandler:
         self._ready = []
         return out
 
+    def _free_bytes(self) -> "int | None":
+        """Free bytes on THIS NODE's tier filesystem. Throttled, best-effort.
+
+        *** A DIAGNOSTIC, NOT THE ACTUATOR. *** The floor that actually refuses
+        a store lives in the engine core, because the worker cannot refuse at
+        all: `success=False` is fatal on every path. What this buys is that
+        `/kv/workers` can show BOTH nodes' free space -- and the worker is
+        currently the fuller of the two, so a head-only reading is the wrong
+        number on exactly the day it matters.
+
+        Throttled because `snapshot()` is called from the control plane and
+        this runs on the worker's own thread; `None` is published as null
+        rather than as a zero that would read as a full disk.
+        """
+        import time as _t
+        st = getattr(self, "_freechk", None)
+        if st is None:
+            st = {"at": 0.0, "bytes": None}
+            self._freechk = st
+        now = _t.monotonic()
+        if (now - st["at"]) >= 5.0:
+            st["at"] = now
+            try:
+                root = getattr(self._spec, "root_dir", None)
+                vfs = os.statvfs(root) if root else None
+                st["bytes"] = (int(vfs.f_bavail) * int(vfs.f_frsize)
+                               if vfs is not None else None)
+            except Exception:
+                st["bytes"] = None
+        return st["bytes"]
+
     def snapshot(self) -> dict:
         return dict(self.stats, staging=self._pool.snapshot(),
                     group_file_sizes=self._sizes,
+                    free_bytes=self._free_bytes(),
                     jobs_open=len(self._jobs), writes_open=len(self._writing),
                     # the bound, readable per rank -- a cap nobody can see is a
                     # cap nobody can confirm took effect

@@ -334,6 +334,22 @@ PROBE = {
     "journal_max_records": (100, 50000),
     "journal_max_bytes": (65536, 67108864),
     "journal_fsync": (0, 1),
+    # Cross-rank verification and the free-space floor, added 2026-10-12. This
+    # audit raised KeyError on `disk_verify_enabled` the first time it ran
+    # after they were declared -- the FOURTH time it has caught a knob nobody
+    # had proved hot, and louder than the eq() below because the loop gets
+    # there first.
+    "disk_verify_enabled": (0, 1),
+    "disk_verify_chunk": (100, 20000),
+    "disk_verify_defer_s": (0.5, 30.0),
+    "disk_verify_rpc_timeout_s": (5.0, 600.0),
+    "disk_verify_bg_per_s": (0.0, 5000.0),
+    "disk_free_floor_gb": (0.0, 2000.0),
+    "disk_free_hard_gb": (0.0, 500.0),
+    "disk_free_hysteresis_gb": (0.0, 100.0),
+    "disk_free_evict_step_gb": (0.1, 50.0),
+    "disk_free_check_s": (0.5, 300.0),
+    "disk_free_rpc_s": (1.0, 3600.0),
 }
 # *** THIS ASSERTION IS WHY A NEW KNOB CANNOT SHIP UNPROVEN, and it caught one
 # on 2026-10-08. *** `disk_store_paused` was added to DEFAULTS and not here, and

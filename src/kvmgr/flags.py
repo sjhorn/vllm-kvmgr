@@ -102,6 +102,120 @@ DEFAULTS: dict[str, Any] = {
     # today": the skipped copies were discarded anyway, so the bytes that reach
     # disk are identical. Only the wasted copy disappears.
     "disk_skip_present_before_copy": True,
+    # ----------------------------------------------------------------
+    # CROSS-RANK PRESENCE VERIFICATION
+    # ----------------------------------------------------------------
+    # *** THE INDEX IS A CLAIM ABOUT TWO FILESYSTEMS AND THE BOOT WALK CAN
+    # *** ONLY CHECK ONE. *** `_load_manifest`'s prune is
+    # `os.path.exists(self._mapper.get_file_name(k))` on the ENGINE CORE's own
+    # node, and `get_file_name` is rank-dependent. Its own docstring admits the
+    # hole: "what that CANNOT catch is rank 1's files being deleted while the
+    # head's survive". And the consequence is not a miss -- upstream's
+    # `offloading/worker.py:273` is a bare `assert transfer_result.success`, so
+    # a load whose file is gone on ONE node kills the engine core. The 371s we
+    # pay at every boot protects against exactly half of what it is for.
+    #
+    # *** DEFAULT ON, AND IT IS THE ONE CASE WHERE THAT IS THE SAFE
+    # *** DIRECTION. *** It breaks this table's own rule ("the default is
+    # today's behaviour") knowingly, on the same reasoning as
+    # load_inflight_max=1: the state in which this knob changes anything is a
+    # state where today's behaviour is a DEAD ENGINE. The honest cost is
+    # stated rather than hidden -- the first lookup of a key restored from the
+    # manifest DEFERS (see disk_verify_defer_s), so a restore pays about a
+    # second before it hits. A fault refuses presence, which costs a cold
+    # cache and never correctness, and the knob is hot either way.
+    "disk_verify_enabled": True,
+    # Keys per `collective_rpc`. Bounds the MESSAGE, and must stay ~100x
+    # smaller than the RPC timeout's worth of work so the bound below is never
+    # approached in healthy operation. 4,000 stats is tens of milliseconds on a
+    # warm dentry cache and well under a second on a cold one.
+    #
+    # It is a bound and not a batch target: a long request's whole candidate
+    # set (measured: 2,758 keys for a 700K prefix) fits in one chunk.
+    "disk_verify_chunk": 4000,
+    # How long a lookup may DEFER one key before answering False.
+    #
+    # *** DEFERRING IS UPSTREAM'S OWN MECHANISM, not a trick. *** `lookup`
+    # returns `bool | None` and None means defer:
+    # `_maximal_prefix_lookup` keeps scanning (so one pass yields the whole
+    # candidate set), `get_num_new_matched_tokens` returns (None, False), and
+    # the scheduler re-queues the request next step with NOTHING allocated and
+    # no worker involved -- tiering's own docstring calls it "transparent
+    # retry". Expiry answers False, which is always safe: a miss costs
+    # recompute, and recompute is what we are comparing against.
+    "disk_verify_defer_s": 5.0,
+    # *** GENEROUS AND FATAL. NEVER ZERO, WHICH WOULD MEAN FOREVER. ***
+    # Read off the image (patches/pristine/vllm/v1/executor/
+    # multiproc_executor.py): a TimeoutError does NOT set the executor's
+    # `is_failed`, and the worker's eventual response is left UNCLAIMED on an
+    # ordered response MessageQueue -- so every later dequeue is off by one and
+    # the engine receives a verification dict where it expects a
+    # ModelRunnerOutput. Swallowing that is silent corruption. So a timeout is
+    # not caught-and-continued anywhere; it is reported with our own line
+    # naming the cause, because the alternative is the same death a moment
+    # later with an unattributable traceback.
+    #
+    # A 0 or negative value is coerced UP to this default rather than becoming
+    # `timeout=None`, which `deadline = None if timeout is None` turns into
+    # `mq.dequeue(timeout=None)`: a rank whose disk is in D-state -- exactly
+    # what this mechanism defends against -- would then block the engine core
+    # for ever with NO collective pending, so no NCCL watchdog can end it. A
+    # hung engine with no traceback is worse than the crash it replaces.
+    "disk_verify_rpc_timeout_s": 60.0,
+    # SLOW BACKGROUND RE-VERIFICATION, in keys per second.
+    #
+    # Demand-driven verification only ever covers what a request asks for, and
+    # divergence can appear MID-BOOT: an operator `rm`, a partial kvsweep.sh, a
+    # filesystem error. This re-checks already-verified keys in the background
+    # so that is caught inside a boot rather than at the next restart. It never
+    # defers a lookup -- a key stays claimable while it is re-checked, because
+    # the only thing a re-check can do is remove a key that was already going
+    # to kill the engine.
+    #
+    # 100/s walks a 919,669-key index in about 2.5 hours. 0 disables it.
+    "disk_verify_bg_per_s": 100.0,
+    # ----------------------------------------------------------------
+    # THE FREE-SPACE FLOOR
+    # ----------------------------------------------------------------
+    # *** A FULL DISK IS A DEAD ENGINE, AND THERE WAS NO PREFLIGHT ANYWHERE.
+    # *** No statvfs existed in the plugin. ENOSPC inside `write_chunks`
+    # becomes `st["failed"]`, becomes `TransferResult(success=False)`, becomes
+    # upstream's bare assert. So the floor's job is to make that
+    # UNREACHABLE BY CONSTRUCTION, and it does it by EVICTING rather than by
+    # refusing -- a refusal destroys the only delete channel there is, since
+    # deletes ride the store spec and `scheduler.py:745` drops that spec when
+    # `keys_to_store` is empty.
+    #
+    # *** NON-ZERO DEFAULTS, AS THE DOCUMENTED SAFETY-BOUND EXCEPTION. ***
+    # Same reasoning as load_inflight_max=1 again: the only state in which a
+    # non-zero floor changes behaviour is one where today's behaviour is a dead
+    # engine. Sized against measurement, not taste -- both nodes hold 3,755 GiB
+    # total with ~2.26-2.32 TiB free and 620 G of tier, so the tier's remaining
+    # growth to its 1000 GB cap CANNOT reach any sane floor by itself. The floor
+    # fires only on a foreign filler: weights, logs, captures. 64 GB is ~100x
+    # the largest single prepare_store a 1M-token prompt can offer.
+    "disk_free_floor_gb": 64.0,
+    # Below this, the tier FREEZES -- it admits exactly one key per round so
+    # the store job still exists to carry the unlinks out, and stops when even
+    # that is too much (a fixed code-level minimum, not a knob).
+    "disk_free_hard_gb": 16.0,
+    # Leaving DEGRADED needs more than entering it, or a tier sitting exactly
+    # at the floor flaps between bands on every store round.
+    "disk_free_hysteresis_gb": 8.0,
+    # How much the effective budget is cut below what is held, per store round,
+    # while DEGRADED. Every round is then net-negative by one step, so the
+    # drain is paid by the traffic that caused it rather than in one burst.
+    "disk_free_evict_step_gb": 2.0,
+    # statvfs is cheap and this is the scheduler's thread, so it is throttled
+    # anyway: a free-space reading older than this is re-taken, never more
+    # often.
+    "disk_free_check_s": 5.0,
+    # How often the step pump refreshes the WORKERS' free space over the same
+    # RPC the verification uses. *** THE ACTUATOR SEES ONLY THE HEAD'S
+    # FILESYSTEM, and the worker is currently the fuller of the two. *** One
+    # RPC a minute closes that, and doubles as a keep-alive proving the channel
+    # works before a sweep needs it.
+    "disk_free_rpc_s": 60.0,
     # The LOAD pool's live size, mirroring `staging_slots` for the store. The
     # load has its OWN pinned allocation now (sharing one buffer is what
     # faulted the worker with Xid 13 five times), so it needs its own live
