@@ -24,6 +24,35 @@ so.
 
 IT MUST NOT BE ABLE TO HARM A REQUEST.  Daemon thread, bounded work, every
 handler total.  Nothing here touches a request, a block or a token.
+
+*** AND IT IS NO LONGER PURELY READ-ONLY -- ONE POST EXISTS, and the exception
+is argued rather than assumed. ***  `POST /kv/verify` is the lever for after
+somebody has touched files on ONE node: a partial `kvsweep.sh`, an operator
+`rm`, a restored backup.  It has to live here because it needs the disk index,
+which is in THIS process -- the same `disk: null` trap that makes `GET /kv` on
+:8888 answer about the wrong process -- and because :8888 is behind Caddy's
+catch-all, so a mutating route there is reachable by any holder of a client
+certificate.  It was attached to :8888 first and was structurally dead: 409 on
+every call, because the router is built in the API server and the manager is
+not there.
+
+Two properties keep the exception narrow, and both are load-bearing:
+
+  * it MUTATES NO MANAGER STATE.  It rebinds one module global and returns 202;
+    the work happens on the scheduler's own thread next step.  `_wanted` and
+    `_verified` have exactly one writer, which is the race the stall watchdog
+    already paid for.
+  * *** A CHANGE HERE IS NOT HOT, AND THE REASON IS THE RELOAD FAMILY AGAIN. ***
+    `ThreadingHTTPServer` stamps `_Handler` into `RequestHandlerClass` at bind
+    time, and `_server` is in `control._PRESERVE` -- correctly, since a reload
+    must not leak a second listener -- so a reload builds a new `_Handler` that
+    nothing serves and the running server keeps the old one.  Same shape as
+    `all_managers` and the serializer shim: anything stamped once at boot is
+    unrecoverable by a reload.  Editing this handler costs a RESTART, which is
+    a reason to keep it small rather than a problem to work around.
+  * it is the ONLY non-GET path.  Anything else answers 404, and this handler
+    is not a place to grow a control plane -- that is what :8888's router is
+    for, for everything that does not need the index.
 """
 
 from __future__ import annotations
@@ -101,6 +130,107 @@ class _Handler(BaseHTTPRequestHandler):
                 pass
 
 
+    # The request body cap. A control lever on a loopback listener in the
+    # engine core reads a bounded number of bytes or it is a way to make the
+    # engine core allocate; 4 KiB is three orders of magnitude more than the
+    # largest sensible body here.
+    MAX_BODY = 4096
+
+    def do_POST(self):  # noqa: N802
+        """`/kv/verify` only. Total, bounded, and it reports what it accepted.
+
+        202 rather than 200, because the work has not happened: the pump
+        applies it on the scheduler's thread, and *** the step runs only when
+        there are requests ***, so on an idle engine this sits pending until
+        traffic arrives. The response says so, and names where to read the
+        outcome, because a lever whose effect cannot be confirmed is one
+        nobody will trust.
+        """
+        try:
+            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path != "/kv/verify":
+                self._send(404, b'{"error":"not found"}', "application/json")
+                return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except Exception:
+                n = 0
+            if n > self.MAX_BODY:
+                self._send(413, json.dumps({
+                    "error": "body too large",
+                    "max_bytes": self.MAX_BODY}).encode(), "application/json")
+                return
+            body = {}
+            if n > 0:
+                try:
+                    body = json.loads(self.rfile.read(n) or b"{}")
+                except Exception:
+                    self._send(400, b'{"error":"body is not JSON"}',
+                               "application/json")
+                    return
+            if not isinstance(body, dict):
+                self._send(400, b'{"error":"body must be a JSON object"}',
+                           "application/json")
+                return
+
+            from . import diskspec
+
+            if diskspec._LIVE_MANAGER is None:
+                # The listener starts from the manager's constructor, so this
+                # is close to unreachable -- and it is reported rather than
+                # assumed away, because an empty success here would read as a
+                # verification that never happened.
+                self._send(409, json.dumps({
+                    "ok": False,
+                    "error": ("no disk manager in this process yet; the "
+                              "listener outlived the index, which should not "
+                              "happen -- do not read this as verified"),
+                }).encode(), "application/json")
+                return
+            requeue_all = bool(body.get("all"))
+            clear_fault = bool(body.get("clear_fault"))
+            if not requeue_all and not clear_fault:
+                self._send(400, json.dumps({
+                    "ok": False,
+                    "error": "nothing asked for",
+                    "accepts": {
+                        "all": ("re-queue every indexed key for a cross-rank "
+                                "re-check; bounded by VERIFY_WANTED_MAX, and "
+                                "it does NOT unverify, so no lookup slows "
+                                "while it runs"),
+                        "clear_fault": ("drop a recorded verification fault "
+                                        "so presence can be claimed again -- "
+                                        "deliberately manual"),
+                    }}).encode(), "application/json")
+                return
+            req = diskspec.request_verify(requeue_all=requeue_all,
+                                          clear_fault=clear_fault)
+            logger.warning(
+                "kvmgr: POST /kv/verify accepted seq=%s all=%s clear_fault=%s "
+                "-- queued for the scheduler thread, NOT applied yet",
+                req.get("seq"), requeue_all, clear_fault)
+            self._send(202, json.dumps({
+                "ok": True,
+                "accepted": req,
+                "applied": False,
+                "note": ("the pump applies this on the scheduler's thread. "
+                         "THE STEP RUNS ONLY WHEN THERE ARE REQUESTS, so an "
+                         "idle engine applies it when traffic next arrives. "
+                         "Confirm with GET /kv -> verify.last_request, "
+                         "matching this seq; verify.pending_request is "
+                         "non-null until then."),
+                "cost": ("`all` makes the pump issue blocking collective_rpc "
+                         "calls from the scheduler step, one per "
+                         "disk_verify_chunk keys, ~1054ms per 4000 measured. "
+                         "The runtime rate is 0 by default for that reason."),
+            }, default=str).encode(), "application/json")
+        except Exception:  # never let a writer take the engine down either
+            try:
+                self._send(500, b'{"error":"internal"}', "application/json")
+            except Exception:
+                pass
+
+
 def _flags_path() -> str:
     try:
         from vllm.v1.core.single_type_kv_cache_manager import _FLAGS_PATH
@@ -137,8 +267,9 @@ def maybe_start() -> None:
             ).start()
             _server = srv
             logger.info(
-                "kvmgr: stats on 127.0.0.1:%d (/kv json, /metrics prometheus, "
-                "/flags effective) -- engine-core process, loopback only",
+                "kvmgr: stats on 127.0.0.1:%d (GET /kv json, /metrics "
+                "prometheus, /flags effective; POST /kv/verify re-check) -- "
+                "engine-core process, loopback only",
                 port,
             )
         except Exception:

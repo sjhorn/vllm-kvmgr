@@ -866,6 +866,222 @@ check("...and `how` says why", "disk_verify_enabled is off"
 eq("...the index still loads", m._stats["manifest_loaded"], 3)
 
 print()
+print("== (9ae) POST /kv/verify: a cross-thread handoff with ONE writer ==")
+# The route was structurally dead on :8888 -- the router is built in the API
+# server and the index is in the engine core, so every call 409'd. It lives on
+# the :9199 listener now, which IS the engine core, and that puts the request
+# on a DAEMON THREAD. `_wanted` and `_verified` are written by `lookup` and
+# `pump` on the scheduler's thread, so the listener must not touch them.
+tmp = tempfile.mkdtemp(prefix="kv9-req-")
+RK = [K(bytes([i]) * 32, 0) for i in range(10, 20)]
+for k in RK:
+    touch(tmp, k)
+F.write(disk_restore=1, disk_verify_enabled=1, disk_verify_chunk=3,
+        disk_verify_defer_s=0.0, disk_verify_bg_per_s=0.0, disk_free_rpc_s=0.0)
+KF.reset_for_tests()
+D._VERIFY_REQUEST = None
+D._VERIFY_LAST = None
+D._VERIFY_FAULT = None
+m = restored(tmp, RK)
+eq("a restored index starts unverified", len(m._verified_set()), 0)
+
+r1 = D.request_verify(requeue_all=True)
+eq("*** the listener touches NO manager state -- nothing is queued yet ***",
+   len(m._wanted_map()), 0)
+check("...it only parks the request", D._VERIFY_REQUEST is not None)
+eq("...and reports what it accepted", (r1["all"], r1["clear_fault"]),
+   (True, False))
+check("...with a seq", isinstance(r1.get("seq"), int))
+r2 = D.request_verify(clear_fault=True)
+check("*** a seq is unique, so a caller cannot match somebody else's receipt",
+      r2["seq"] != r1["seq"], f"{r1['seq']} vs {r2['seq']}")
+
+# The pump is the single writer, and it must take the request even on a round
+# with no keys and no RPC due -- otherwise an idle-ish engine never applies one.
+D._VERIFY_REQUEST = None
+D._VERIFY_LAST = None
+D._VERIFY_FAULT = {"reason": "rank 1 did not answer (test)", "at": 0.0}
+core = FakeCore()
+D.request_verify(clear_fault=True)
+m.pump(core)
+check("*** the pump applies a request on a round that does nothing else ***",
+      D._VERIFY_FAULT is None)
+eq("...and issued NO rpc to do it", core.calls, 0)
+check("...recording what it cleared, so the 202 is checkable",
+      (D._VERIFY_LAST or {}).get("fault_was", {}).get("reason", "")
+      == "rank 1 did not answer (test)", D._VERIFY_LAST)
+check("...and the request is consumed", D._VERIFY_REQUEST is None)
+
+# Taken ONCE. A request re-applied every step would re-queue the whole index
+# forever, which is a permanent stall rather than an operator action.
+# *** THE SEQ IS NOT A DISCRIMINATOR: re-applying the SAME request writes the
+# *** same seq, so comparing it passes however broken the consume is. The
+# receipt's `applied_at` is what moves, which is the mutation-caught version.
+applied_was = (D._VERIFY_LAST or {}).get("applied_at")
+m.pump(core)
+eq("*** a consumed request is NOT re-applied on the next step ***",
+   (D._VERIFY_LAST or {}).get("applied_at"), applied_was)
+
+print()
+print("== (9af) `all` re-queues, is capped, and does NOT unverify ==")
+D._VERIFY_LAST = None
+# *** RK[0] IS INSIDE THE CHUNK, so a `_verified.clear()` is undone by the
+# *** same pump call and the obvious assertion cannot see it -- measured, as a
+# surviving mutation. RK[9] is past the chunk, so if the re-queue ever clears
+# the vouching, this is what notices.
+m._verified_set().add(bytes(RK[0]))
+m._verified_set().add(bytes(RK[9]))
+D.request_verify(requeue_all=True)
+m.pump(core)
+last = D._VERIFY_LAST or {}
+eq("every indexed key is queued", last.get("requeued"), len(RK))
+eq("...and `capped` says it was not truncated", last.get("capped"), False)
+check("*** `_verified` is NOT cleared -- a re-check must not be a cache "
+      "outage ***", bytes(RK[9]) in m._verified_set(),
+      "RK[9] is beyond the chunk, so only the re-queue could have dropped it")
+eq("...and the key inside the chunk is vouched for too",
+   bytes(RK[0]) in m._verified_set(), True)
+eq("...so an already-vouched-for key still answers at once",
+   m.lookup(RK[0], Ctx()), True)
+# RK[1] is inside the chunk the pump just verified, so the discriminator has
+# to be a key the chunk did not reach -- otherwise this passes for the wrong
+# reason and would keep passing with the re-queue removed.
+# RK[8]: past the chunk AND not one of the two vouched for above, so it is
+# the only key here whose answer is decided by the verification alone.
+check("...while a key the chunk has not reached yet does NOT claim presence",
+      m.lookup(RK[8], Ctx()) in (None, False))
+check("...and the pump then actually checked a chunk", core.calls >= 1)
+
+# *** THE FILES MUST EXIST, or `_load_manifest` prunes every key and this
+# *** tests an EMPTY index -- which reports `requeued: 0` and looks like a
+# broken re-queue. The fixture has to be able to express the failure.
+tmp2 = tempfile.mkdtemp(prefix="kv9-cap-")
+for k in RK:
+    touch(tmp2, k)
+m2 = restored(tmp2, RK)
+eq("the capped fixture really holds the index", len(m2._present), len(RK))
+m2.VERIFY_WANTED_MAX = 4
+D._VERIFY_LAST = None
+D.request_verify(requeue_all=True)
+m2.pump(FakeCore())
+last = D._VERIFY_LAST or {}
+# *** READ THE ENQUEUE, NOT THE QUEUE: the pump drains a chunk in the same
+# *** call that applies the request, so the queue alone is already short by
+# `disk_verify_chunk`. Queued-plus-verified is what the cap actually bounds.
+eq("the re-queue is bounded by VERIFY_WANTED_MAX",
+   len(m2._wanted_map()) + len(m2._verified_set()), 4)
+eq("...and the pump drained part of it in the same round",
+   len(m2._wanted_map()) < 4, True)
+check("...and SAYS it was capped, rather than looking complete",
+      last.get("capped") is True, last)
+
+print()
+print("== (9ag) a request that raises is DROPPED, not retried forever ==")
+# The hot-path trap this repo records twice: a one-shot that raises becomes a
+# retry on every step. The flag is taken before the work for that reason.
+class _Boom:
+    def __getattr__(self, n):
+        raise RuntimeError("wanted map unavailable (test)")
+
+tmp3 = tempfile.mkdtemp(prefix="kv9-boom-")
+for k in RK:
+    touch(tmp3, k)
+m3 = restored(tmp3, RK)
+eq("the raising fixture really holds the index", len(m3._present), len(RK))
+m3._wanted = _Boom()  # the real attribute `_wanted_map` returns
+D._VERIFY_REQUEST = None
+D._VERIFY_LAST = None
+D.request_verify(requeue_all=True)
+m3.pump(FakeCore())
+check("the failure is recorded rather than swallowed",
+      (D._VERIFY_LAST or {}).get("ok") is False, D._VERIFY_LAST)
+check("*** and the request is GONE, so it cannot raise every step ***",
+      D._VERIFY_REQUEST is None)
+
+print()
+print("== (9ah) the snapshot makes a 202 falsifiable ==")
+snap = m._verify_snapshot()
+for key in ("last_request", "pending_request", "fault"):
+    check(f"`{key}` is present even when there is nothing to say -- absent "
+          f"must not read as fine", key in snap)
+D._VERIFY_REQUEST = None
+D._VERIFY_LAST = None
+snap = m._verify_snapshot()
+eq("...null rather than missing, with nothing applied",
+   (snap["last_request"], snap["pending_request"]), (None, None))
+D.request_verify(requeue_all=True)
+check("...and a parked request is visible as pending, so an IDLE engine's "
+      "unapplied request can be told from a lost one",
+      m._verify_snapshot()["pending_request"] is not None)
+m.pump(FakeCore())
+
+print()
+print("== (9ai) the one-writer discipline, enforced structurally ==")
+# A lint, because the property is "only these two functions assign it" and a
+# test of behaviour cannot see a third writer somebody adds later.
+DS = code_only(D.__file__)
+import re as _re
+writers = []
+for mo in _re.finditer(r"^\s*_VERIFY_REQUEST\s*=", DS, _re.M):
+    fn = None
+    for fmo in _re.finditer(r"^(\s*)def (\w+)", DS[:mo.start()], _re.M):
+        fn = fmo.group(2)
+    writers.append(fn)
+eq("*** `_VERIFY_REQUEST` is assigned in exactly two places ***",
+   len(writers), 2)
+eq("...the listener's hand-off and the scheduler's take, and nothing else",
+   sorted(set(writers)), ["_apply_verify_request", "request_verify"])
+check("the lint can see assignments at all (canary)",
+      "_VERIFY_REQUEST" in DS)
+
+SV = code_only(os.path.join(os.path.dirname(D.__file__), "serve.py"))
+post = SV.split("def do_POST", 1)
+eq("the listener has a POST handler", len(post), 2)
+body = post[1].split("\ndef ", 1)[0]
+for forbidden in ("_wanted_map", "_verified_set", "_present", "_forget",
+                  "_journal", "pump("):
+    check(f"*** the listener thread does not touch `{forbidden}` ***",
+          forbidden not in body)
+check("...it hands over through request_verify and nothing else",
+      "request_verify" in body)
+check("...and reads the manager only to refuse when it is absent",
+      "_LIVE_MANAGER" in body)
+# A strings-KEPT view, because the header name is a string literal and the
+# default view blanks those -- the same two-view split the dict-lookup checks
+# above need. Asserting on the blanked view would pass vacuously.
+SV_STR = code_only(os.path.join(os.path.dirname(D.__file__), "serve.py"),
+                   blank_strings=False)
+body_str = SV_STR.split("def do_POST", 1)[1].split("\ndef ", 1)[0]
+check("the body is bounded, so a lever cannot make the core allocate",
+      "> self.MAX_BODY" in body and "Content-Length" in body_str,
+      "the bare name survives in the 413 payload, so the TEST must be the "
+      "comparison -- a surviving mutation taught this")
+check("...and over-long bodies are refused rather than truncated",
+      "413" in body_str)
+check("the POST lint is looking at real code (canary)", "do_POST" in SV)
+
+print()
+print("== (9aj) the dead :8888 route is GONE, and named where it went ==")
+CT = os.path.join(os.path.dirname(D.__file__), "control.py")
+# *** STRINGS KEPT, DELIBERATELY. *** The route path is a string literal, so
+# the default blanked view cannot see it and this lint passed vacuously --
+# found by re-adding the route and watching the suite stay green. Comments are
+# still blanked, which is what lets the explanatory comment below mention the
+# path without becoming the failure.
+ct_code = code_only(CT, blank_strings=False)
+check("*** no router.post for /kv/verify on the API server's app ***",
+      '"/kv/verify"' not in ct_code,
+      "the :8888 route answers 409 by construction -- the index is elsewhere")
+check("...the lint can see sibling routes, so it is looking at real code",
+      '"/kv/knob"' in ct_code)
+ct_raw = open(CT).read()
+check("...but the reason survives as a comment, rather than vanishing",
+      "/kv/verify" in ct_raw and "9199" in ct_raw)
+for g in ("_VERIFY_REQUEST", "_VERIFY_LAST", "_VERIFY_SEQ"):
+    check(f"`{g}` is in _PRESERVE -- a reload between the hand-off and the "
+          f"take would lose a 202'd request", f'"{g}"' in ct_raw)
+
+print()
 print(f"{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print(f"  FAILED: {f}")

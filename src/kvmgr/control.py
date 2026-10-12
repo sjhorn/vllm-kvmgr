@@ -231,6 +231,20 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     # on an explicit reset, which is the whole design.
     ("kvmgr.diskspec", "_VERIFY_FAULT",
      "the cross-rank verification fault -- a rank that could not answer"),
+    # *** THE HANDOFF, AND LOSING IT LOSES A REQUEST SILENTLY. *** The listener
+    # thread rebinds `_VERIFY_REQUEST` and the scheduler thread takes it; a
+    # reload between those two moments re-executes the module and sets it back
+    # to None, so an operator's `POST /kv/verify` would 202 and then never
+    # happen -- the worst shape available, because the caller was told yes.
+    ("kvmgr.diskspec", "_VERIFY_REQUEST",
+     "the listener's pending re-verify request, not yet applied"),
+    # The outcome, which is the only thing that makes the 202 checkable.
+    ("kvmgr.diskspec", "_VERIFY_LAST",
+     "what the pump did with the last request -- the 202's receipt"),
+    # Monotonic. A reload restarting it at 0 would hand out a seq already in
+    # `_VERIFY_LAST`, so a caller polling for its own request could match
+    # somebody else's receipt.
+    ("kvmgr.diskspec", "_VERIFY_SEQ", "the request sequence, so a seq is unique"),
 )
 
 
@@ -1035,81 +1049,29 @@ def _router():
         return JSONResponse(status_code=200 if out.get("ok") else 409,
                             content=out)
 
-    @router.post("/kv/verify")
-    async def kv_verify(raw_request: Request):
-        """Re-queue the index for cross-rank verification, or clear a fault.
-
-        *** THIS IS THE LEVER FOR AFTER YOU TOUCHED FILES ON ONE NODE. *** A
-        partial `kvsweep.sh`, an operator `rm`, a restored backup: the
-        background sweep would find it eventually (at
-        `disk_verify_bg_per_s`, hours for a full index), and somebody who
-        KNOWS they changed one node's files should not have to wait.
-        
-        Body (all optional):
-          `clear_fault`: true  -- drop a recorded fault so presence can be
-            claimed again. *** DELIBERATELY MANUAL. *** A fault means a rank
-            could not be asked; healing it automatically would mean nothing
-            ever gets looked at, which is how a refusal nobody can see becomes
-            a capability nobody checked.
-          `all`: true -- re-queue EVERY key for a re-check. The background
-            cursor does this slowly by design; this is the impatient version.
-            It is bounded by VERIFY_WANTED_MAX rather than by the index size,
-            and it does NOT unverify anything, so no lookup is slowed while it
-            runs. The gentler alternative needs no route at all: raise
-            `disk_verify_bg_per_s`, which is hot -- but note the pump rides the
-            scheduler step, so neither makes progress on an IDLE engine.
-
-        It does NOT verify synchronously: the work happens on the step pump,
-        where the RPC's interaction with an outstanding model step is
-        understood. A route that blocked on 919,669 keys would be the
-        critical-path mistake wearing a different hat.
-        """
-        from . import diskspec
-
-        body = {}
-        try:
-            body = await raw_request.json()
-        except Exception:
-            pass
-        m = diskspec._LIVE_MANAGER
-        if m is None:
-            # The API server holds no manager -- this route is attached to the
-            # engine's app, so say which process answered rather than
-            # reporting an empty success.
-            return JSONResponse(status_code=409, content={
-                "ok": False,
-                "error": ("no disk manager in THIS process. /kv/verify must "
-                          "reach the engine core; the API server's own view "
-                          "has no index, which is the same `disk: null` trap "
-                          "GET /kv on :8888 has.")})
-        out = {"ok": True}
-        if body.get("clear_fault"):
-            out["fault_was"] = diskspec._VERIFY_FAULT
-            diskspec._VERIFY_FAULT = None
-            logger.warning("kvmgr: verification fault CLEARED by the control "
-                           "plane -- presence can be claimed again, and the "
-                           "next pump round re-checks what it is asked for")
-        if body.get("all"):
-            # *** IT RE-QUEUES WITHOUT UNVERIFYING, AND THE FIRST VERSION OF
-            # *** THIS CLEARED `_verified` -- which was strictly worse for no
-            # *** gain. *** `lookup` consults `_verified` BEFORE `_wanted`, so a
-            # key that is both already-vouched-for and queued still answers True
-            # immediately while the pump re-checks it in the background.
-            # Clearing would have made every lookup in the index defer, turning
-            # a diagnostic into a cache outage -- and the only thing a re-check
-            # can do is REMOVE a key that was already going to kill the engine.
-            w = m._wanted_map()
-            now = diskspec._now()
-            n = 0
-            for k in m._present:
-                if len(w) >= m.VERIFY_WANTED_MAX:
-                    break
-                w.setdefault(k, now)
-                n += 1
-            out["requeued"] = n
-            out["capped"] = n < len(m._present)
-        out["verify"] = m._verify_snapshot()
-        return JSONResponse(content=out)
+    # *** POST /kv/verify USED TO BE HERE, AND IT WAS STRUCTURALLY DEAD. ***
+    #
+    # It needs the disk index to re-queue keys, and the index lives in the
+    # ENGINE CORE while this router is built and attached in the API SERVER
+    # process -- so every call answered 409 "no disk manager in THIS process",
+    # measured 2026-10-12. The same split makes `GET /kv` on :8888 report
+    # `disk: null`, which this repo's digest already records as a field named
+    # for a state it does not report.
+    #
+    # Routing it through `collective_rpc` like `/kv/knob` -- the obvious fix --
+    # was rejected: the wrap applies `kvmgr_*` in the core and then forwards to
+    # the workers, but it RETURNS the workers' replies, so the core's own
+    # result is dropped on the floor. A lever that cannot report what it did is
+    # how a refusal nobody can see becomes a capability nobody checked, and the
+    # workers would need a no-op method purely to keep the fan-out from
+    # raising.
+    #
+    # So it moved to the listener the engine core already owns, where the index
+    # is a local variable: `POST 127.0.0.1:9199/kv/verify` (kvmgr/serve.py).
+    # That is also this repo's stated Stage 6 rule -- hot levers go on
+    # :9199, outside the traffic path, because Caddyfile's catch-all proxies
+    # every unmatched path to :8888 and would expose a mutating route to any
+    # holder of a client certificate.
 
     @router.post("/kv/drop_gpu_cache")
     async def kv_drop(raw_request: Request):

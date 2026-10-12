@@ -687,6 +687,65 @@ _JMISSING = object()
 # cannot silently clear a fault -- see control._PRESERVE.
 _VERIFY_FAULT: "dict | None" = None
 
+# *** THE OPERATOR'S RE-VERIFY REQUEST, AND IT IS A CROSS-THREAD HANDOFF WITH
+# *** EXACTLY ONE WRITER ON EACH SIDE. ***
+#
+# The lever belongs in THIS process -- the engine core is where the index is --
+# and the only HTTP surface this process owns is `kvmgr.serve`'s listener,
+# which answers on its own daemon thread. So the request arrives on a thread
+# that must not touch the manager: `_wanted` and `_verified` are mutated by
+# `lookup` and `pump` on the SCHEDULER's thread, and a second writer in those
+# is a data race in the structures that decide whether a key is claimed. That
+# is the lesson the stall watchdog already paid for -- it raises a request and
+# never writes `_jobs`.
+#
+# So the listener only ever REBINDS this to a new dict (one store, so a reader
+# sees the whole request or none of it) and the pump takes it on the scheduler's
+# thread. Same shape as `gpu_cache_epoch`, which is acted on at the edge in
+# `new_step_starts()` rather than where it is set.
+#
+# *** AND THE STEP ONLY RUNS WHEN THERE ARE REQUESTS, so a request posted to an
+# *** IDLE engine sits here unapplied. *** That is upstream's own documented
+# behaviour (`_process_engine_step`: "Called only when there are unfinished
+# local requests") and it is why the route answers 202 with a sequence number
+# rather than a result: the caller confirms by reading `verify.last_request`
+# back off GET /kv, which is the only honest way to report work that happens
+# somewhere else later.
+_VERIFY_REQUEST: "dict | None" = None
+
+# The outcome of the last request the pump applied, so a 202 is checkable.
+# Without this the route would be unfalsifiable: nothing else distinguishes
+# "applied and there was nothing to do" from "never ran because the engine is
+# idle".
+_VERIFY_LAST: "dict | None" = None
+
+# Monotonic, so two requests are distinguishable even inside one second.
+_VERIFY_SEQ = 0
+
+
+def request_verify(requeue_all: bool = False,
+                   clear_fault: bool = False) -> dict:
+    """Ask the pump for a re-verification. *** CALLED FROM THE LISTENER THREAD.
+
+    *** IT TOUCHES NO MANAGER STATE, DELIBERATELY. *** Everything it does is
+    rebind the two module globals above; the work happens on the scheduler's
+    thread in `_apply_verify_request`. Keep it that way -- the whole safety
+    argument for having a mutating route in the engine core at all is that the
+    mutation happens in one place, on the thread that owns the structures.
+
+    Returns what was accepted, for the 202. It cannot report an outcome,
+    because there is not one yet.
+    """
+    global _VERIFY_REQUEST, _VERIFY_SEQ
+
+    _VERIFY_SEQ += 1
+    req = {"seq": _VERIFY_SEQ,
+           "all": bool(requeue_all),
+           "clear_fault": bool(clear_fault),
+           "at": _now()}
+    _VERIFY_REQUEST = req  # one store, never a partially built request
+    return dict(req)
+
 # The absolute floor, in code and not a knob. Below this the tier stops
 # admitting even the single key that carries the unlinks: at ~1 MB per key per
 # rank, one key cannot rescue a filesystem this close to full, and the write it
@@ -2192,6 +2251,80 @@ class DiskPresenceManager(OffloadingManager):
         self._stats["verify_rpcs"] = self._stats.get("verify_rpcs", 0) + 1
         return v
 
+    def _apply_verify_request(self) -> None:
+        """Take the listener's request, if any. *** SCHEDULER THREAD ONLY. ***
+
+        The single writer of `_wanted` besides `lookup`, and it runs in the
+        same place `lookup` does -- which is the entire reason the listener
+        hands over a dict instead of doing this itself.
+
+        Total: a request that cannot be applied is logged and DROPPED rather
+        than retried, because a request that raises every step forever is the
+        hot-path trap this codebase already records twice.
+        """
+        global _VERIFY_REQUEST, _VERIFY_LAST, _VERIFY_FAULT
+
+        req = _VERIFY_REQUEST
+        if req is None:
+            return
+        _VERIFY_REQUEST = None  # take it first, so a raise cannot re-run it
+        out = {"seq": req.get("seq"), "requested_at": req.get("at"),
+               "applied_at": _now(), "all": bool(req.get("all")),
+               "clear_fault": bool(req.get("clear_fault"))}
+        try:
+            if req.get("clear_fault"):
+                # *** DELIBERATELY MANUAL, and this is the only lever. *** A
+                # fault means a rank could not be asked whether it holds a
+                # file; healing it on a timer would mean nothing ever gets
+                # looked at, which is how a refusal nobody can see becomes a
+                # capability nobody checked.
+                out["fault_was"] = _VERIFY_FAULT
+                _VERIFY_FAULT = None
+                if out["fault_was"] is not None:
+                    logger.warning(
+                        "kvmgr: verification fault CLEARED on request (was "
+                        "%r) -- presence can be claimed again and the next "
+                        "pump round re-checks what it is asked for",
+                        out["fault_was"])
+            if req.get("all"):
+                # *** IT RE-QUEUES WITHOUT UNVERIFYING. *** `lookup` consults
+                # `_verified` BEFORE `_wanted`, so a key that is both
+                # already-vouched-for and queued still answers True
+                # immediately while the pump re-checks it behind the request.
+                # Clearing `_verified` instead -- the first version of this --
+                # would make every lookup in the index defer, turning a
+                # diagnostic into a cache outage, and all a re-check can
+                # ever do is REMOVE a key that was going to kill the engine.
+                w = self._wanted_map()
+                now = _now()
+                n = 0
+                for k in self._present:
+                    if len(w) >= self.VERIFY_WANTED_MAX:
+                        break
+                    if k not in w:
+                        w[k] = now
+                    n += 1
+                out["requeued"] = n
+                out["capped"] = n < len(self._present)
+                logger.warning(
+                    "kvmgr: %d key(s) re-queued for cross-rank verification "
+                    "on request (capped=%s). *** THIS ISSUES BLOCKING RPCs "
+                    "FROM THE SCHEDULER STEP, AND A CHUNK IS A STALL *** -- "
+                    "%d keys per round, measured at ~1054ms for 4000, so the "
+                    "stream pays it until the queue drains. The runtime rate "
+                    "is 0 by default because a step-time RPC is what is "
+                    "suspected in the 2026-10-12 NCCL kill, so this is an "
+                    "operator action with a known cost, not a sweep.",
+                    n, out["capped"],
+                    int(flags.peek("disk_verify_chunk") or 0))
+            out["ok"] = True
+        except Exception as e:
+            out["ok"] = False
+            out["error"] = repr(e)
+            logger.exception("kvmgr: could not apply verification request %r; "
+                             "it is DROPPED rather than retried", req)
+        _VERIFY_LAST = out
+
     def pump(self, engine_core) -> None:
         """One verification round, from the scheduler step. Called every step.
 
@@ -2221,6 +2354,13 @@ class DiskPresenceManager(OffloadingManager):
         cannot be applied, a rank that errored. Those become a FAULT, which
         refuses presence and costs a cold cache.
         """
+        # Before anything else, and before the early return below: a request
+        # must be taken even on a round that has no keys and no RPC due, or an
+        # idle-ish engine would never apply one.
+        try:
+            self._apply_verify_request()
+        except Exception:
+            logger.exception("kvmgr: taking the verification request failed")
         try:
             keys = []
             if flags.peek("disk_verify_enabled") and _VERIFY_FAULT is None:
@@ -2929,6 +3069,11 @@ class DiskPresenceManager(OffloadingManager):
             "cursor": int(self._verify_state().get("cursor") or 0),
             "boot_check": getattr(self, "_boot_how", None),
             "fault": _VERIFY_FAULT,
+            # Never absent, for the same reason `fault` is not: a 202 from
+            # POST /kv/verify is only checkable if "nothing has been applied"
+            # is a value rather than a missing key.
+            "last_request": _VERIFY_LAST,
+            "pending_request": _VERIFY_REQUEST,
         }
 
     def _free_snapshot(self) -> dict:
