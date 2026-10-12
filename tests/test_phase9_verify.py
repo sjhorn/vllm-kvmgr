@@ -556,7 +556,8 @@ check("...and it is not in the knob table",
 
 print()
 print("== (9v) every new knob is declared, published and inert-safe ==")
-for n in ("disk_verify_enabled", "disk_verify_chunk", "disk_verify_defer_s",
+for n in ("disk_verify_enabled", "disk_verify_chunk",
+          "disk_boot_verify_chunk", "disk_verify_defer_s",
           "disk_verify_rpc_timeout_s", "disk_verify_bg_per_s",
           "disk_free_floor_gb", "disk_free_hard_gb",
           "disk_free_hysteresis_gb", "disk_free_evict_step_gb",
@@ -758,7 +759,7 @@ MK = [K(bytes([i]) * 32, 0) for i in range(1, 13)]
 for k in MK:
     touch(tmp, k)
 core = FakeCore(raise_after=1)
-m = boot_with(tmp, MK, core, disk_verify_chunk=4)
+m = boot_with(tmp, MK, core, disk_boot_verify_chunk=4)
 eq("every key survives (the files are all here)",
    m._stats["manifest_loaded"], len(MK))
 check("*** the first chunk's keys keep their all-ranks verdict ***",
@@ -807,14 +808,25 @@ CK = [K(bytes([i]) * 32, 0) for i in range(1, 11)]
 for k in CK:
     touch(tmp, k)
 core = FakeCore()
-m = boot_with(tmp, CK, core, disk_verify_chunk=3)
+m = boot_with(tmp, CK, core, disk_boot_verify_chunk=3, disk_verify_chunk=99)
 eq("*** the key list is chunked, so no single message is large ***",
    core.seen, [3, 3, 3, 1])
+# *** AND IT IS THE BOOT'S OWN KNOB, NOT THE RUNTIME PUMP'S. *** A chunk is a
+# blocking RPC and therefore a step stall: at 4,000 keys that is ~1,054ms warm,
+# already past test-meter section 1's 1.0s gate, while at boot nothing is being
+# served and 40,000 is measurably faster (3,794 -> 7,998 keys/s, A/B/A). One
+# value cannot be right for both, so the test pins WHICH knob the boot reads --
+# setting disk_verify_chunk to 99 above would have produced chunks of 99 if the
+# boot read the wrong one.
+eq("...the runtime knob did NOT drive the boot", 99 in core.seen, False)
 eq("...and the RPC count is recorded", m._stats.get("boot_verify_rpcs"), 4)
 # FakeCore.collective_rpc asserts timeout is not None, so reaching here at all
 # is the proof -- a boot RPC with timeout=None is a wait with no end, and at
 # boot there is no NCCL watchdog to break it.
 check("*** the boot RPC carried a timeout (FakeCore asserts it) ***", True)
+check("*** the boot chunk is 10x the runtime one, which is the measurement ***",
+      int(KF.DEFAULTS["disk_boot_verify_chunk"])
+      >= 10 * int(KF.DEFAULTS["disk_verify_chunk"]))
 check("BOOT_VERIFY_TIMEOUT_S is generous and a CODE constant",
       D.BOOT_VERIFY_TIMEOUT_S >= 120.0
       and "disk_boot_verify_timeout_s" not in KF.DEFAULTS)

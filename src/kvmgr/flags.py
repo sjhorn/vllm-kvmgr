@@ -186,7 +186,40 @@ DEFAULTS: dict[str, Any] = {
     #
     # It is a bound and not a batch target: a long request's whole candidate
     # set (measured: 2,758 keys for a 700K prefix) fits in one chunk.
+    #
+    # *** IT MUST STAY SMALL *WHILE SERVING*, and the measurement below is why.
+    # *** A chunk is a blocking RPC on the scheduler's thread, so its duration
+    # is a step stall. At 4,000 keys that is ~1,054ms warm -- already past
+    # test-meter section 1's 1.0s gate if a batch ever filled. It does not
+    # today only because the batch is `min(credit, cap)` and the background
+    # rate keeps credit tiny (~40 keys), so the shipped pair is safe. Raise one
+    # without the other at your peril.
     "disk_verify_chunk": 4000,
+    # *** THE BOOT GETS ITS OWN, TEN TIMES LARGER, BECAUSE NOTHING IS BEING
+    # *** SERVED YET. *** Measured on the live engine 2026-10-12, rate pinned
+    # so the chunk was the only limiter, A/B/A so cache warming could not
+    # flatter an arm:
+    #
+    #     cap  4,000 -> 3,794 keys/s   1,054 ms/RPC
+    #     cap 20,000 -> 5,332 keys/s   3,751 ms/RPC
+    #     cap  4,000 -> 3,799 keys/s   1,053 ms/RPC   <- the returning arm
+    #     cap 40,000 -> 7,998 keys/s   5,001 ms/RPC
+    #
+    # Throughput DOUBLES, because a large part of each round trip is fixed
+    # cost rather than per-key work -- which is the same fact as "231
+    # synchronous chunks each pay max(rank0, rank1)", read from the other side.
+    # A 5s stall per RPC is free at boot and intolerable while serving, which
+    # is the whole reason this is a separate knob and not a bigger default for
+    # the one above.
+    #
+    # *** WHAT THIS DOES *NOT* SAY. *** The boot's 467.1s was paid COLD, with
+    # the start script dropping the dentry cache every 2s, and at 4,000 it
+    # managed 1,976 keys/s against this 3,794 warm -- so cold costs ~1.9x and
+    # chunk size ~2x, and they are different levers. Extrapolating this warm
+    # measurement onto the boot is exactly the mistake that produced the
+    # retracted "cheaper than the walk" claim, so the expectation here is
+    # "materially less than 467s", not a number.
+    "disk_boot_verify_chunk": 40000,
     # How long a lookup may DEFER one key before answering False.
     #
     # *** DEFERRING IS UPSTREAM'S OWN MECHANISM, not a trick. *** `lookup`

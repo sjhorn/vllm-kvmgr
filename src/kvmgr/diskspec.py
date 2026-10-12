@@ -1440,10 +1440,16 @@ class DiskPresenceManager(OffloadingManager):
                 "the engine is busy.")
             return (self._head_only_prune(keys), "head-only (no engine core)")
 
+        # *** THE BOOT'S OWN CHUNK, not the runtime pump's. *** A chunk is a
+        # blocking RPC and therefore a step stall, so while serving it must
+        # stay small; at boot nothing is being served and a bigger one is
+        # measurably faster (4,000 -> 3,794 keys/s, 40,000 -> 7,998 keys/s,
+        # A/B/A on the live engine). Two knobs because one value cannot be
+        # right for both.
         try:
-            cap = max(1, int(flags.peek("disk_verify_chunk") or 1))
+            cap = max(1, int(flags.peek("disk_boot_verify_chunk") or 1))
         except Exception:
-            cap = int(flags.DEFAULTS["disk_verify_chunk"])
+            cap = int(flags.DEFAULTS["disk_boot_verify_chunk"])
         kept: list = []
         bad_total = 0
         t0 = _now()
