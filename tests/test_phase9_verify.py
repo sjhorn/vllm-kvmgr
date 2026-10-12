@@ -824,6 +824,24 @@ eq("...and the RPC count is recorded", m._stats.get("boot_verify_rpcs"), 4)
 # is the proof -- a boot RPC with timeout=None is a wait with no end, and at
 # boot there is no NCCL watchdog to break it.
 check("*** the boot RPC carried a timeout (FakeCore asserts it) ***", True)
+# *** THE RUNTIME RPC RATE IS ZERO BY DEFAULT, AND THAT IS PINNED HERE. ***
+# 2026-10-12 17:37:35: Xid 32 twice on the head and an NCCL kill, on the first
+# boot with runtime verification RPCs enabled through a 700K restore. NOT
+# proven -- the previous boot ran the same sweep through the same restore with
+# Xid unchanged -- but this repo's own comment in `_enforce_budget` says "a
+# collective_rpc from inside the scheduler step is precisely the
+# blocking-the-critical-path mistake that has already cost this project an NCCL
+# kill", and I overrode it. The BOOT check does all the safety work before any
+# transfer exists, so OFF costs nothing. These two knobs are the only things
+# that issue a step RPC while serving, so the assertion is on both.
+eq("*** the background sweep is OFF by default (no step RPCs while serving) ***",
+   float(KF.DEFAULTS["disk_verify_bg_per_s"]), 0.0)
+eq("*** and so is the worker free-space keep-alive, for the same reason ***",
+   float(KF.DEFAULTS["disk_free_rpc_s"]), 0.0)
+check("*** so the pump issues NOTHING on a default config with a clean index ***",
+      float(KF.DEFAULTS["disk_verify_bg_per_s"]) == 0.0
+      and float(KF.DEFAULTS["disk_free_rpc_s"]) == 0.0
+      and float(KF.DEFAULTS["disk_verify_defer_s"]) == 0.0)
 check("*** the boot chunk is 10x the runtime one, which is the measurement ***",
       int(KF.DEFAULTS["disk_boot_verify_chunk"])
       >= 10 * int(KF.DEFAULTS["disk_verify_chunk"]))

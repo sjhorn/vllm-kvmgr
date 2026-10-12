@@ -282,7 +282,39 @@ DEFAULTS: dict[str, Any] = {
     # nothing to be wrong about, and it resumes the moment traffic arrives.
     # The DEMAND path is unaffected by this, because a deferring lookup implies
     # a waiting request, which implies steps. 0 disables it.
-    "disk_verify_bg_per_s": 100.0,
+    #
+    # *** AND THE DEFAULT IS 0 -- OFF -- AFTER AN NCCL KILL I CANNOT RULE THIS
+    # *** OUT OF. *** 2026-10-12 17:37:35, on the first boot with runtime
+    # verification RPCs enabled through a 700K restore: `Xid 32` twice on the
+    # head, `torch.AcceleratorError: CUDA error: unspecified launch failure` at
+    # upstream's `async_copy_ready_event.synchronize()`, then
+    # `ProcessGroupNCCL` terminated rank 0 and Docker restarted the head alone.
+    # Our ledger dumped `1 transfers, block ids [7, 39] of 22756, slots [0, 32]
+    # of 256` -- every index in range, so the bounds guards correctly refused
+    # nothing and the memory simply stopped being what a valid index pointed
+    # at, which is this project's recorded signature for this fault.
+    #
+    # *** NOT PROVEN, AND THE CONTRARY EVIDENCE IS STATED: *** the PREVIOUS
+    # boot ran the same sweep at the same rate through the same 700K restore
+    # with Xid unchanged at 30/22. One event is not a cause.
+    #
+    # What makes OFF the right default anyway is that this repo's own comment
+    # in `_enforce_budget` says so, and I overrode it: *"a collective_rpc from
+    # inside the scheduler step is precisely the blocking-the-critical-path
+    # mistake that has already cost this project an NCCL kill."* A blocking
+    # RPC forces an outstanding `execute_model` future to be awaited INLINE,
+    # which moves a synchronisation point relative to the offload handler's
+    # async copies -- and those copies are driven from `get_finished()` inside
+    # the very step being blocked. The load path here has been exquisitely
+    # concurrency-sensitive before (inflight 4 -> Xid 32; a shared staging
+    # buffer -> Xid 13 five times).
+    #
+    # The cost of OFF is nil, which is what settles it: the BOOT check does all
+    # the safety work, before any transfer exists, and it leaves the index
+    # fully verified with new keys born verified. The sweep only ever covered
+    # divergence appearing MID-boot -- a real but secondary case, and one
+    # `POST /kv/knob` away for anyone who wants it on a quiet engine.
+    "disk_verify_bg_per_s": 0.0,
     # ----------------------------------------------------------------
     # THE FREE-SPACE FLOOR
     # ----------------------------------------------------------------
@@ -324,7 +356,19 @@ DEFAULTS: dict[str, Any] = {
     # FILESYSTEM, and the worker is currently the fuller of the two. *** One
     # RPC a minute closes that, and doubles as a keep-alive proving the channel
     # works before a sweep needs it.
-    "disk_free_rpc_s": 60.0,
+    #
+    # *** ALSO 0 -- OFF -- FOR THE SAME REASON AS disk_verify_bg_per_s. *** It
+    # is the only other thing that issues a blocking `collective_rpc` from the
+    # scheduler step while requests are being served, and with the sweep off it
+    # would be the sole remaining one. Together they make the runtime RPC rate
+    # exactly ZERO by default, which is the conservative position after the
+    # 17:37:35 NCCL kill.
+    #
+    # What is lost is small and already stated as a limit elsewhere: the floor's
+    # actuator sees only the HEAD's filesystem. The worker's free space is still
+    # visible to a human on `/kv/workers`, because the store handler computes it
+    # on its OWN thread in `snapshot()` and needs no step RPC to do it.
+    "disk_free_rpc_s": 0.0,
     # The LOAD pool's live size, mirroring `staging_slots` for the store. The
     # load has its OWN pinned allocation now (sharing one buffer is what
     # faulted the worker with Xid 13 five times), so it needs its own live
