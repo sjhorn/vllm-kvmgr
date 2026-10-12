@@ -1051,9 +1051,13 @@ def _router():
             could not be asked; healing it automatically would mean nothing
             ever gets looked at, which is how a refusal nobody can see becomes
             a capability nobody checked.
-          `all`: true -- re-queue EVERY key. The background cursor does this
-            slowly by design; this is the impatient version, and it is bounded
-            by VERIFY_WANTED_MAX rather than by the index size.
+          `all`: true -- re-queue EVERY key for a re-check. The background
+            cursor does this slowly by design; this is the impatient version.
+            It is bounded by VERIFY_WANTED_MAX rather than by the index size,
+            and it does NOT unverify anything, so no lookup is slowed while it
+            runs. The gentler alternative needs no route at all: raise
+            `disk_verify_bg_per_s`, which is hot -- but note the pump rides the
+            scheduler step, so neither makes progress on an IDLE engine.
 
         It does NOT verify synchronously: the work happens on the step pump,
         where the RPC's interaction with an outstanding model step is
@@ -1086,9 +1090,15 @@ def _router():
                            "plane -- presence can be claimed again, and the "
                            "next pump round re-checks what it is asked for")
         if body.get("all"):
+            # *** IT RE-QUEUES WITHOUT UNVERIFYING, AND THE FIRST VERSION OF
+            # *** THIS CLEARED `_verified` -- which was strictly worse for no
+            # *** gain. *** `lookup` consults `_verified` BEFORE `_wanted`, so a
+            # key that is both already-vouched-for and queued still answers True
+            # immediately while the pump re-checks it in the background.
+            # Clearing would have made every lookup in the index defer, turning
+            # a diagnostic into a cache outage -- and the only thing a re-check
+            # can do is REMOVE a key that was already going to kill the engine.
             w = m._wanted_map()
-            ver = m._verified_set()
-            ver.clear()
             now = diskspec._now()
             n = 0
             for k in m._present:

@@ -172,7 +172,15 @@ DEFAULTS: dict[str, Any] = {
     # the only thing a re-check can do is remove a key that was already going
     # to kill the engine.
     #
-    # 100/s walks a 919,669-key index in about 2.5 hours. 0 disables it.
+    # 100/s walks a 919,669-key index in about 2.5 hours OF BUSY ENGINE, and
+    # that qualifier is load-bearing: the pump rides the scheduler step, and
+    # `EngineCoreProc._process_engine_step`'s own docstring is "Called only
+    # when there are unfinished local requests". *** SO THE BACKGROUND SWEEP
+    # MAKES NO PROGRESS ON A FULLY IDLE ENGINE. *** That is acceptable rather
+    # than merely tolerated -- an idle engine is issuing no loads, so there is
+    # nothing to be wrong about, and it resumes the moment traffic arrives.
+    # The DEMAND path is unaffected by this, because a deferring lookup implies
+    # a waiting request, which implies steps. 0 disables it.
     "disk_verify_bg_per_s": 100.0,
     # ----------------------------------------------------------------
     # THE FREE-SPACE FLOOR
