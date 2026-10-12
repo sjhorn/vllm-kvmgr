@@ -141,13 +141,29 @@ DEFAULTS: dict[str, Any] = {
     # executor reference -- the same problem `capture_offload_sched_from_caller`
     # already solves off the call stack.
     #
-    # *** AND THEN THE TRIGGER MOVED TO BOOT, SO IT IS ON AGAIN -- for a
-    # *** reason that is measured rather than argued. *** `_boot_verify` asks
-    # EVERY rank before the API opens, in place of the rank-local walk, and
-    # that is **cheaper than the walk it replaces**: all 922,992 keys verified
-    # on both nodes in ~200s (~4,600 keys/s, ~170 RPCs) against the head-only
-    # walk's 365s at 2,528 keys/s, because the ranks `stat` in parallel. It
-    # also checks the SIZE, which `os.path.exists` cannot.
+    # *** AND THEN THE TRIGGER MOVED TO BOOT, SO IT IS ON AGAIN. ***
+    # `_boot_verify` asks EVERY rank before the API opens, in place of the
+    # rank-local walk. Verified live 2026-10-12: 922,977 keys, 231 RPCs,
+    # **0 dropped**, `unverified 0`, and the 700K restore back at **13s /
+    # 700,416 tokens** with **not one deferral** -- against `restored=0` on the
+    # lazy version.
+    #
+    # ~~that is cheaper than the walk it replaces: ~200s against 365s~~
+    # *** THAT CLAIM WAS MINE AND THE BOOT IT PREDICTED REFUTED IT. *** The
+    # all-ranks pass took **467.1s** against the rank-local walk's **365s** --
+    # **+102s, 28% more boot**, not a saving. The ~4,600 keys/s I generalised
+    # from was measured by the background sweep **while serving, on a warm
+    # dentry cache**; a boot's cache is cold *and* the start script drops it
+    # every 2 seconds. And the parallelism does not compose the way I assumed:
+    # 231 SYNCHRONOUS chunks each pay `max(rank0, rank1)`, so the cost is
+    # `231 x max(...)` rather than `max(sum, sum)`.
+    #
+    # So the honest trade, stated as one: **+28% boot time** buys coverage of
+    # BOTH nodes, a SIZE check that `os.path.exists` cannot make, and the
+    # removal of every runtime deferral. That is worth it -- a 467s boot
+    # against a dead engine core -- but it is a trade and not a free win, and
+    # the lever left for boot time is `DROP_CACHES_ON_START`, which is now
+    # worth much more than it was.
     #
     # The deferral that broke the restore is then **structurally absent**:
     # every key in the index is vouched for before the first request, so

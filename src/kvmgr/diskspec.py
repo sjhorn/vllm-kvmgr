@@ -1391,13 +1391,20 @@ class DiskPresenceManager(OffloadingManager):
         the other one survives the gate and becomes upstream's bare assert on
         the first load. The docstring above has always admitted this.
 
-        *** AND ASKING EVERY RANK IS *CHEAPER* THAN THE WALK IT REPLACES.
-        *** Measured 2026-10-12 by driving the background sweep: all 922,992
-        keys verified on BOTH nodes in ~200s of busy engine (~4,600 keys/s,
-        ~170 RPCs) against the head-only walk's 365s at 2,528 keys/s -- because
-        the two ranks `stat` in parallel and the work is batched. So this is
-        not a cost traded for safety; it is faster, it covers both nodes, and
-        it checks the SIZE, which existence cannot.
+        *** ASKING EVERY RANK COSTS +28% OF BOOT, AND I PREDICTED A SAVING.
+        *** Measured live 2026-10-12: **467.1s** for 922,977 keys in 231 RPCs,
+        against the rank-local walk's **365s** -- **+102s**. The ~4,600 keys/s
+        I sized it from was the background sweep measured **while serving, on a
+        warm dentry cache**, and a boot's cache is cold *and* dropped every 2
+        seconds by the start script. The parallelism also does not compose the
+        way the estimate assumed: 231 SYNCHRONOUS chunks each pay
+        `max(rank0, rank1)`, so the cost is `231 x max(...)` and not
+        `max(sum, sum)`.
+
+        So the trade, stated as one: +28% boot time buys coverage of BOTH
+        nodes, a SIZE check that existence cannot make, and the removal of
+        every runtime deferral. Worth it against a dead engine core -- but a
+        trade, not a free win.
         
         *** IT ALSO REMOVES THE DEFERRAL ENTIRELY, which is the whole reason it
         *** exists. *** The first design verified on demand, from `lookup`, and
