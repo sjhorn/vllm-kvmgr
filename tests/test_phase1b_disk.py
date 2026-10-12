@@ -2680,6 +2680,51 @@ for _m in _re_lit.finditer(
     eq(f"...and {_m.group(1)}'s except-path literal matches it too",
        int(_m.group(3)), flags.DEFAULTS[_m.group(1)])
 
+# *** THE LEDGER MUST HOLD BUILTIN ints, AND THIS IS A SERIALISATION BUG
+# WEARING A DIAGNOSTIC'S CLOTHES. *** `_ledger_note` is handed the engine's
+# block-id metadata, whose elements can be numpy scalars; `min`/`max` return
+# whatever they were handed, and those four integers travel through
+# /kv/workers' ledger report into the engine core's output socket, where
+# msgpack refuses a numpy.int64 and kills the THREAD -- requests complete, the
+# core goes idle, clients hang for ever, and the main loop logs nothing. Found
+# live on 2026-10-12 at `...['ledger']['block_id_range'][0]`, the fourth
+# producer of that fault and the first one that was OURS.
+#
+# numpy is STUBBED in this harness, so the discriminator cannot be
+# `numpy.int64`. It is a scalar that is NOT an int and knows how to compare --
+# which is all `min`/`max` need, and exactly what reaches us in production.
+class _NpLike:
+    """Orders and converts like an integer, and `type(x) is int` is False."""
+    def __init__(self, v): self.v = v
+    def __lt__(self, o): return self.v < (o.v if isinstance(o, _NpLike) else o)
+    def __gt__(self, o): return self.v > (o.v if isinstance(o, _NpLike) else o)
+    def __eq__(self, o): return self.v == (o.v if isinstance(o, _NpLike) else o)
+    def __hash__(self): return hash(self.v)
+    def __int__(self): return int(self.v)
+    def __index__(self): return int(self.v)
+    def __repr__(self): return "_NpLike(%r)" % (self.v,)
+
+check("the fixture is a real discriminator -- it is NOT an int",
+      type(_NpLike(3)) is not int)
+_hl2 = mkhandler(8)
+_hl2._ledger = None
+_hl2._ledger_note("store", 0, [_NpLike(27), _NpLike(4)], [_NpLike(1)])
+for _k in ("bid_min", "bid_max", "slot_min", "slot_max"):
+    eq(f"*** the ledger's {_k} is a BUILTIN int, not a numpy-like scalar ***",
+       type(_hl2._ledger[_k]), int)
+eq("...and the value survived the coercion", _hl2._ledger["bid_max"], 27)
+# the reported shape is what actually reaches the socket, so assert THERE too
+_snap2 = _hl2._ledger_snapshot()
+_rng = _snap2.get("block_id_range") or []
+check("the ledger SNAPSHOT reports a range (the field that reached msgpack)",
+      len(_rng) == 2, f"got {_rng!r}")
+for _i, _v in enumerate(_rng):
+    eq(f"...and block_id_range[{_i}] is a builtin int", type(_v), int)
+# BREAK-VERIFIED: reverting either `int(min(bids))` to `min(bids)` fails the
+# bid_min/bid_max pair and the snapshot pair -- four assertions, not one, which
+# is the point. A single type check would have passed on the slots while the
+# bids stayed poisoned.
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
     for f in FAIL:

@@ -1562,8 +1562,22 @@ class DiskStoreHandler:
                 led = {"n": 0, "bid_min": None, "bid_max": None,
                        "slot_min": None, "slot_max": None, "recent": []}
                 self._ledger = led
-            lo, hi = (min(bids), max(bids)) if bids else (None, None)
-            slo, shi = (min(slots), max(slots)) if slots else (None, None)
+            # *** int() IS LOAD-BEARING, NOT TIDINESS. *** `bids` carries the
+            # engine's block-id metadata, so its elements can be numpy
+            # scalars, and `min` returns whatever it was handed. These four
+            # integers travel through /kv/workers' ledger report into the
+            # engine core's OUTPUT socket, where msgpack refuses a
+            # numpy.int64 and kills the THREAD rather than the engine --
+            # results then never reach the API server and clients hang for
+            # ever with nothing logged. This was the fourth producer of that
+            # fault, found 2026-10-12 when the two-encode-root walk named the
+            # path `...['ledger']['block_id_range'][0]`. The serializer shim
+            # coerces it downstream; coercing at the SOURCE means the shim
+            # never has to, and the shim is a diagnostic rather than a
+            # guarantee.
+            lo, hi = (int(min(bids)), int(max(bids))) if bids else (None, None)
+            slo, shi = ((int(min(slots)), int(max(slots)))
+                        if slots else (None, None))
             led["n"] += 1
             for k, v, f in (("bid_min", lo, min), ("bid_max", hi, max),
                             ("slot_min", slo, min), ("slot_max", shi, max)):
@@ -2344,8 +2358,22 @@ class DiskLoadHandler:
                 led = {"n": 0, "bid_min": None, "bid_max": None,
                        "slot_min": None, "slot_max": None, "recent": []}
                 self._ledger = led
-            lo, hi = (min(bids), max(bids)) if bids else (None, None)
-            slo, shi = (min(slots), max(slots)) if slots else (None, None)
+            # *** int() IS LOAD-BEARING, NOT TIDINESS. *** `bids` carries the
+            # engine's block-id metadata, so its elements can be numpy
+            # scalars, and `min` returns whatever it was handed. These four
+            # integers travel through /kv/workers' ledger report into the
+            # engine core's OUTPUT socket, where msgpack refuses a
+            # numpy.int64 and kills the THREAD rather than the engine --
+            # results then never reach the API server and clients hang for
+            # ever with nothing logged. This was the fourth producer of that
+            # fault, found 2026-10-12 when the two-encode-root walk named the
+            # path `...['ledger']['block_id_range'][0]`. The serializer shim
+            # coerces it downstream; coercing at the SOURCE means the shim
+            # never has to, and the shim is a diagnostic rather than a
+            # guarantee.
+            lo, hi = (int(min(bids)), int(max(bids))) if bids else (None, None)
+            slo, shi = ((int(min(slots)), int(max(slots)))
+                        if slots else (None, None))
             led["n"] += 1
             for k, v, f in (("bid_min", lo, min), ("bid_max", hi, max),
                             ("slot_min", slo, min), ("slot_max", shi, max)):
