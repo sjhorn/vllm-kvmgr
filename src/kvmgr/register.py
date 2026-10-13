@@ -81,7 +81,7 @@ def register() -> None:
     # coordinator converges the hit length to the MINIMUM across all five
     # groups, so restoring only group 0 buys nothing -- every spec type has to
     # be registered before a restore can lengthen a hit.  See
-    # docs/local/KVMGR-PHASE0-20261007.md finding 1.
+    # docs/history/KVMGR-PHASE0-20261007.md finding 1.
     stm.spec_manager_map[MLAAttentionSpec] = DSparkMLAAttentionManager
     logger.info(
         "kvmgr: registered %s for MLAAttentionSpec (was %s); group 0 only, "

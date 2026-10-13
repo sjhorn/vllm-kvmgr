@@ -67,7 +67,7 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
     # trusted: it is a process-global class counter incremented per manager
     # built and NEVER decremented, so anything that constructs a second set of
     # managers halves every cap in the running engine, silently.  See
-    # docs/local/KVMGR-PHASE0-20261007.md finding 4.
+    # docs/history/KVMGR-PHASE0-20261007.md finding 4.
     group_count: int | None = None
     group_block_sizes: tuple[int, ...] = ()
     # None where a group is full-attention (unbounded need), the window in

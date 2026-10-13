@@ -624,7 +624,7 @@ BLOCKED: dict[str, str] = {
         "each rank persists its own slice. Until that spec is the live one, "
         "this knob toggles nothing, because what writes today is upstream's "
         "tiering tier via KV_TRANSFER_CONFIG and not a flag. "
-        "See kvmgr/diskspec.py and docs/local/KVMGR-PHASE45-20261007.md"
+        "See kvmgr/diskspec.py and docs/history/KVMGR-PHASE45-20261007.md"
     ),
     # *** disk_budget_gb IS OUT OF HERE: Phase 5 built it. *** The old reason
     # said "nothing we control writes to disk yet", which stopped being true

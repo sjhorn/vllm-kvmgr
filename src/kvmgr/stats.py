@@ -21,7 +21,7 @@ how to proxy and turn into Prometheus series.
 WHY THE COUNTERS ARE MODULE-LEVEL rather than per-manager instance attributes.
 ``find_longest_cache_hit`` is a CLASSMETHOD -- the coordinator calls it on the
 class, not the instance -- so the hit/miss path has no ``self`` to count on.
-See docs/local/KVMGR-PHASE0-20261007.md finding 1.  Everything is keyed by
+See docs/history/KVMGR-PHASE0-20261007.md finding 1.  Everything is keyed by
 ``kv_cache_group_id`` so a module-level home loses nothing.
 
 IT MUST NOT BE ABLE TO HARM A REQUEST.  Every counter is a plain int behind the

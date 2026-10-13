@@ -3,7 +3,7 @@
 	python3.12 local-ops/kvharness/test_phase0.py     # 59 assertions, ~1s
 
 Phase 0 of the own-KV-manager work. Findings and the reasoning are in
-`docs/local/KVMGR-PHASE0-20261007.md`; this is how to run it.
+`docs/history/KVMGR-PHASE0-20261007.md`; this is how to run it.
 
 ## What it is
 
