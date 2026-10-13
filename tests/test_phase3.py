@@ -753,7 +753,13 @@ def _drop_with(snap):
     _m = _mgr_with_pool(_p, release=lambda *a, **k: None)
     _stub = _tP3.ModuleType("kvmgr.diskspec")
     _stub.offload_sched_snapshot = lambda: snap
+    # BOTH homes: `from . import diskspec` reads the PACKAGE ATTRIBUTE first,
+    # and in DSpark mode the fork bridge has already imported the real module,
+    # so a stub in sys.modules alone would be silently bypassed.
+    _pkg = _sysP3.modules["kvmgr"]
+    _saved_attr = getattr(_pkg, "diskspec", None)
     _sysP3.modules["kvmgr.diskspec"] = _stub
+    _pkg.diskspec = _stub
     harness.clear_log()
     try:
         return _m.kvmgr_drop_gpu_cache(), _p
@@ -762,6 +768,10 @@ def _drop_with(snap):
             _sysP3.modules["kvmgr.diskspec"] = _saved_ds
         else:
             _sysP3.modules.pop("kvmgr.diskspec", None)
+        if _saved_attr is not None:
+            _pkg.diskspec = _saved_attr
+        elif hasattr(_pkg, "diskspec"):
+            delattr(_pkg, "diskspec")
 
 
 _ok, _p = _drop_with({"available": True, "jobs_open": 2, "stores_open": 2,
@@ -809,130 +819,134 @@ print("== A BLOCK WITH A TRANSFER IN FLIGHT MUST KEEP ITS LAST REFERENCE ==")
 # on 2026-10-09, rank 0's worker dead one second later.
 #
 # Not proven to be that crash's cause. A real structural gap either way.
-import kvmgr.manager as _mgrmod
-_stm = sys.modules["vllm.v1.core.single_type_kv_cache_manager"]
+# On a vLLM WITHOUT patch6 this whole section has nothing to test: the hook is
+# patch6's. That is a real difference, stated in the package README -- there,
+# releasing a protected block does not consult in-flight transfers.
+if harness.needs_dspark("patch6's pending-blocks hook (release skips in-flight blocks)"):
+    import kvmgr.manager as _mgrmod
+    _stm = sys.modules["vllm.v1.core.single_type_kv_cache_manager"]
 
-check("patch6 offers the hook at all -- without it this cannot be wired",
-      hasattr(_stm, "set_pending_block_ids_provider"))
-
-
-def _set_provider(fn):
-    """Install a provider, tolerating a patch6 that has no hook.
-
-    *** REMOVING THE HOOK ABORTED THE FILE INSTEAD OF FAILING IT. *** Renaming
-    the setter in patch6 made every later call an AttributeError that escaped,
-    so break-verification saw no output rather than a named failure -- the trap
-    this suite has now hit six times. Any call whose subject can vanish under
-    mutation has to go through something that catches.
-    """
-    setter = getattr(_stm, "set_pending_block_ids_provider", None)
-    if setter is None:
-        return False
-    setter(fn)
-    return True
+    check("patch6 offers the hook at all -- without it this cannot be wired",
+          hasattr(_stm, "set_pending_block_ids_provider"))
 
 
-def _mk_protected(ids, pending=None):
-    """A manager holding `ids` as protected, with a pending-blocks provider."""
-    F.write(kvmgr_enabled=1, protected_fraction=0.5)
-    harness.reset_manager_count()
-    pool = harness.make_pool(num_gpu_blocks=120, hash_block_size=16)
-    m = MGR.get_manager_for_kv_cache_spec(
-        kv_cache_spec=iface.MLAAttentionSpec(block_size=16),
-        max_num_batched_tokens=8192, max_model_len=harness.LIVE_MAX_MODEL_LEN,
-        block_pool=pool, enable_caching=True, kv_cache_group_id=0,
-        dcp_world_size=1, pcp_world_size=1)
-    DSparkMLAAttentionManager.group_count = 1
-    m._protected_prompt_block_ids = set(ids)
-    m._protected_prompt_block_queue = deque(ids)
-    freed = []
-    pool.free_blocks = lambda blocks: freed.extend(b.block_id for b in blocks)
-    _set_provider((lambda: pending) if pending is not None else None)
-    return m, freed
+    def _set_provider(fn):
+        """Install a provider, tolerating a patch6 that has no hook.
+
+        *** REMOVING THE HOOK ABORTED THE FILE INSTEAD OF FAILING IT. *** Renaming
+        the setter in patch6 made every later call an AttributeError that escaped,
+        so break-verification saw no output rather than a named failure -- the trap
+        this suite has now hit six times. Any call whose subject can vanish under
+        mutation has to go through something that catches.
+        """
+        setter = getattr(_stm, "set_pending_block_ids_provider", None)
+        if setter is None:
+            return False
+        setter(fn)
+        return True
 
 
-# *** ASSERT ON WHICH BLOCK WAS CHOSEN, not on free_blocks. ***
-# The first version watched a `freed` list and got [] for both arms, which
-# looked like the release doing nothing -- but `free_blocks` is gated on
-# `ref_cnt > 0` and the harness pool's blocks sit at 0, so the call is
-# legitimately skipped. The property under test is VICTIM SELECTION, and the
-# observable for that is which id left the protected set.
-def _chose(m, before):
-    gone = before - set(m._protected_prompt_block_ids)
-    return sorted(gone)
+    def _mk_protected(ids, pending=None):
+        """A manager holding `ids` as protected, with a pending-blocks provider."""
+        F.write(kvmgr_enabled=1, protected_fraction=0.5)
+        harness.reset_manager_count()
+        pool = harness.make_pool(num_gpu_blocks=120, hash_block_size=16)
+        m = MGR.get_manager_for_kv_cache_spec(
+            kv_cache_spec=iface.MLAAttentionSpec(block_size=16),
+            max_num_batched_tokens=8192, max_model_len=harness.LIVE_MAX_MODEL_LEN,
+            block_pool=pool, enable_caching=True, kv_cache_group_id=0,
+            dcp_world_size=1, pcp_world_size=1)
+        DSparkMLAAttentionManager.group_count = 1
+        m._protected_prompt_block_ids = set(ids)
+        m._protected_prompt_block_queue = deque(ids)
+        freed = []
+        pool.free_blocks = lambda blocks: freed.extend(b.block_id for b in blocks)
+        _set_provider((lambda: pending) if pending is not None else None)
+        return m, freed
 
 
-# A block NOT in flight is released exactly as before.
-_m1, _freed1 = _mk_protected([5, 6, 7], pending={99})
-_b1 = set(_m1._protected_prompt_block_ids)
-_m1._release_one_protected_prompt_block(block_ids_to_skip={99})
-eq("*** a block with no transfer in flight is still chosen -- the cap must "
-   "keep working ***", _chose(_m1, _b1), [5])
+    # *** ASSERT ON WHICH BLOCK WAS CHOSEN, not on free_blocks. ***
+    # The first version watched a `freed` list and got [] for both arms, which
+    # looked like the release doing nothing -- but `free_blocks` is gated on
+    # `ref_cnt > 0` and the harness pool's blocks sit at 0, so the call is
+    # legitimately skipped. The property under test is VICTIM SELECTION, and the
+    # observable for that is which id left the protected set.
+    def _chose(m, before):
+        gone = before - set(m._protected_prompt_block_ids)
+        return sorted(gone)
 
-# A block IN FLIGHT is skipped and RE-QUEUED, so the cap is late, not abandoned.
-_m2, _freed2 = _mk_protected([5, 6, 7], pending={5})
-_b2 = set(_m2._protected_prompt_block_ids)
-_ok = _m2._release_one_protected_prompt_block(block_ids_to_skip={5})
-eq("*** a block with a transfer in flight is NOT the one chosen ***",
-   _chose(_m2, _b2), [6])
-check("...and it is still protected, re-queued for the next attempt",
-      5 in _m2._protected_prompt_block_ids, _m2._protected_prompt_block_ids)
 
-# Every candidate pending: the release REFUSES rather than picking one anyway.
-_m3, _freed3 = _mk_protected([5, 6], pending={5, 6})
-_ok3 = _m3._release_one_protected_prompt_block(block_ids_to_skip={5, 6})
-eq("*** with every candidate in flight, nothing is freed ***", _freed3, [])
-eq("...and it reports that it could not release", _ok3, False)
-check("...leaving both protected, so the next protect retries",
-      _m3._protected_prompt_block_ids == {5, 6},
-      _m3._protected_prompt_block_ids)
+    # A block NOT in flight is released exactly as before.
+    _m1, _freed1 = _mk_protected([5, 6, 7], pending={99})
+    _b1 = set(_m1._protected_prompt_block_ids)
+    _m1._release_one_protected_prompt_block(block_ids_to_skip={99})
+    eq("*** a block with no transfer in flight is still chosen -- the cap must "
+       "keep working ***", _chose(_m1, _b1), [5])
 
-# *** AND THIS IS THE TEST THE MUTATION SHOWED WAS MISSING. ***
-# Everything above calls _release_one_protected_prompt_block DIRECTLY with an
-# explicit skip set, so none of it exercised `_trim_protected_prompt_blocks`
-# actually CONSULTING the provider. Setting `pending = None` inside the trim
-# left the whole block green -- the plumbing untested while its callee was
-# tested six ways. Same shape as an icon with no symbol: present,
-# correct-looking, wired to nothing.
-_m5, _freed5 = _mk_protected([5, 6, 7], pending={5})
-_m5._max_protected_prompt_blocks = lambda: 1      # force the trim to release
-_b5 = set(_m5._protected_prompt_block_ids)
-_m5._trim_protected_prompt_blocks()
-_left5 = set(_m5._protected_prompt_block_ids)
-check("*** the TRIM consults the provider -- the in-flight block survives a "
-      "trim that released everything else ***",
-      _left5 == {5}, (_b5, _left5))
+    # A block IN FLIGHT is skipped and RE-QUEUED, so the cap is late, not abandoned.
+    _m2, _freed2 = _mk_protected([5, 6, 7], pending={5})
+    _b2 = set(_m2._protected_prompt_block_ids)
+    _ok = _m2._release_one_protected_prompt_block(block_ids_to_skip={5})
+    eq("*** a block with a transfer in flight is NOT the one chosen ***",
+       _chose(_m2, _b2), [6])
+    check("...and it is still protected, re-queued for the next attempt",
+          5 in _m2._protected_prompt_block_ids, _m2._protected_prompt_block_ids)
 
-print("== ...AND IT FAILS OPEN, WHICH IS THE TRADE ==")
-# *** SKIPPING ON A NOT-KNOWING WOULD BE WORSE. *** If the provider is absent
-# or raises, the release must PROCEED -- that is today's behaviour. The
-# alternative makes the protection cap unenforceable the moment the hook
-# breaks, and an unenforceable cap means memory pressure and preemptions. So
-# this narrows a real window; it does not close it, and the tests say so.
-_m4, _freed4 = _mk_protected([5, 6], pending=None)   # no provider installed
-_set_provider(None)
-_m4._trim_protected_prompt_blocks()
-check("with NO provider the trim behaves exactly as before (it still runs)",
-      True)
+    # Every candidate pending: the release REFUSES rather than picking one anyway.
+    _m3, _freed3 = _mk_protected([5, 6], pending={5, 6})
+    _ok3 = _m3._release_one_protected_prompt_block(block_ids_to_skip={5, 6})
+    eq("*** with every candidate in flight, nothing is freed ***", _freed3, [])
+    eq("...and it reports that it could not release", _ok3, False)
+    check("...leaving both protected, so the next protect retries",
+          _m3._protected_prompt_block_ids == {5, 6},
+          _m3._protected_prompt_block_ids)
 
-_boom = []
-def _raiser():
-    _boom.append(1)
-    raise RuntimeError("provider exploded")
+    # *** AND THIS IS THE TEST THE MUTATION SHOWED WAS MISSING. ***
+    # Everything above calls _release_one_protected_prompt_block DIRECTLY with an
+    # explicit skip set, so none of it exercised `_trim_protected_prompt_blocks`
+    # actually CONSULTING the provider. Setting `pending = None` inside the trim
+    # left the whole block green -- the plumbing untested while its callee was
+    # tested six ways. Same shape as an icon with no symbol: present,
+    # correct-looking, wired to nothing.
+    _m5, _freed5 = _mk_protected([5, 6, 7], pending={5})
+    _m5._max_protected_prompt_blocks = lambda: 1      # force the trim to release
+    _b5 = set(_m5._protected_prompt_block_ids)
+    _m5._trim_protected_prompt_blocks()
+    _left5 = set(_m5._protected_prompt_block_ids)
+    check("*** the TRIM consults the provider -- the in-flight block survives a "
+          "trim that released everything else ***",
+          _left5 == {5}, (_b5, _left5))
 
-_set_provider(_raiser)
-try:
-    _got = _stm._pending_block_ids()
-except Exception as exc:
-    _got = "RAISED: %r" % (exc,)
-eq("*** a provider that RAISES yields None, never an exception into the "
-   "protect path ***", _got, None)
-eq("...and it really was called", len(_boom), 1)
-_set_provider(lambda: None)
-eq("a provider returning None is None, not an empty set -- 'cannot say' and "
-   "'nothing pending' must stay distinguishable",
-   _stm._pending_block_ids(), None)
-_set_provider(None)
+    print("== ...AND IT FAILS OPEN, WHICH IS THE TRADE ==")
+    # *** SKIPPING ON A NOT-KNOWING WOULD BE WORSE. *** If the provider is absent
+    # or raises, the release must PROCEED -- that is today's behaviour. The
+    # alternative makes the protection cap unenforceable the moment the hook
+    # breaks, and an unenforceable cap means memory pressure and preemptions. So
+    # this narrows a real window; it does not close it, and the tests say so.
+    _m4, _freed4 = _mk_protected([5, 6], pending=None)   # no provider installed
+    _set_provider(None)
+    _m4._trim_protected_prompt_blocks()
+    check("with NO provider the trim behaves exactly as before (it still runs)",
+          True)
+
+    _boom = []
+    def _raiser():
+        _boom.append(1)
+        raise RuntimeError("provider exploded")
+
+    _set_provider(_raiser)
+    try:
+        _got = _stm._pending_block_ids()
+    except Exception as exc:
+        _got = "RAISED: %r" % (exc,)
+    eq("*** a provider that RAISES yields None, never an exception into the "
+       "protect path ***", _got, None)
+    eq("...and it really was called", len(_boom), 1)
+    _set_provider(lambda: None)
+    eq("a provider returning None is None, not an empty set -- 'cannot say' and "
+       "'nothing pending' must stay distinguishable",
+       _stm._pending_block_ids(), None)
+    _set_provider(None)
 
 if FAIL:
     for f in FAIL:

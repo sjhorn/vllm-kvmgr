@@ -93,65 +93,66 @@ eq("still registered once", MGR.spec_manager_map[iface.MLAAttentionSpec],
 # MNT-11: patch6's own lazy hook, which is what guarantees registration in the
 # process that builds managers -- the entry point cannot be verified to load in
 # the engine core without the cluster.
-check("patch6 carries the MNT-11 lazy registration hook",
-      hasattr(MGR, "_maybe_register_kvmgr"),
-      "belt and braces: a silent no-op is the failure this stack keeps paying for")
-MGR.spec_manager_map[iface.MLAAttentionSpec] = MGR.MLAAttentionManager
-MGR._kvmgr_tried = False
-register._REGISTERED = False
-harness.reset_manager_count()
-_hook_pool = harness.make_pool(num_gpu_blocks=64, hash_block_size=16)
-_built = MGR.get_manager_for_kv_cache_spec(
-    kv_cache_spec=iface.MLAAttentionSpec(block_size=16),
-    max_num_batched_tokens=8192, max_model_len=harness.LIVE_MAX_MODEL_LEN,
-    block_pool=_hook_pool, enable_caching=True, kv_cache_group_id=0,
-    dcp_world_size=1, pcp_world_size=1)
-check("the hook registers kvmgr on the FIRST manager built, with no entry point",
-      isinstance(_built, DSparkMLAAttentionManager),
-      "so Phase 1 cannot silently do nothing if general plugins skip engine core")
+if harness.needs_dspark("MNT-11, patch6's lazy registration hook"):
+    check("patch6 carries the MNT-11 lazy registration hook",
+          hasattr(MGR, "_maybe_register_kvmgr"),
+          "belt and braces: a silent no-op is the failure this stack keeps paying for")
+    MGR.spec_manager_map[iface.MLAAttentionSpec] = MGR.MLAAttentionManager
+    MGR._kvmgr_tried = False
+    register._REGISTERED = False
+    harness.reset_manager_count()
+    _hook_pool = harness.make_pool(num_gpu_blocks=64, hash_block_size=16)
+    _built = MGR.get_manager_for_kv_cache_spec(
+        kv_cache_spec=iface.MLAAttentionSpec(block_size=16),
+        max_num_batched_tokens=8192, max_model_len=harness.LIVE_MAX_MODEL_LEN,
+        block_pool=_hook_pool, enable_caching=True, kv_cache_group_id=0,
+        dcp_world_size=1, pcp_world_size=1)
+    check("the hook registers kvmgr on the FIRST manager built, with no entry point",
+          isinstance(_built, DSparkMLAAttentionManager),
+          "so Phase 1 cannot silently do nothing if general plugins skip engine core")
 
-# And it is tried ONCE, not per manager: this is on the construction path.
-MGR.spec_manager_map[iface.MLAAttentionSpec] = MGR.MLAAttentionManager
-MGR.get_manager_for_kv_cache_spec(
-    kv_cache_spec=iface.MLAAttentionSpec(block_size=16),
-    max_num_batched_tokens=8192, max_model_len=harness.LIVE_MAX_MODEL_LEN,
-    block_pool=_hook_pool, enable_caching=True, kv_cache_group_id=0,
-    dcp_world_size=1, pcp_world_size=1)
-check("and only tries once -- a retry per manager would re-import on a hot path",
-      MGR.spec_manager_map[iface.MLAAttentionSpec] is MGR.MLAAttentionManager)
-register._REGISTERED = False
-register.register()
+    # And it is tried ONCE, not per manager: this is on the construction path.
+    MGR.spec_manager_map[iface.MLAAttentionSpec] = MGR.MLAAttentionManager
+    MGR.get_manager_for_kv_cache_spec(
+        kv_cache_spec=iface.MLAAttentionSpec(block_size=16),
+        max_num_batched_tokens=8192, max_model_len=harness.LIVE_MAX_MODEL_LEN,
+        block_pool=_hook_pool, enable_caching=True, kv_cache_group_id=0,
+        dcp_world_size=1, pcp_world_size=1)
+    check("and only tries once -- a retry per manager would re-import on a hot path",
+          MGR.spec_manager_map[iface.MLAAttentionSpec] is MGR.MLAAttentionManager)
+    register._REGISTERED = False
+    register.register()
 
-check("the other four spec types are untouched (group 0 only)",
-      MGR.spec_manager_map[iface.SlidingWindowMLASpec] is MGR.SlidingWindowMLAManager
-      and MGR.spec_manager_map[iface.FullAttentionSpec] is MGR.FullAttentionManager,
-      "the narrow rollout, and the fallback if this is wrong")
+    check("the other four spec types are untouched (group 0 only)",
+          MGR.spec_manager_map[iface.SlidingWindowMLASpec] is MGR.SlidingWindowMLAManager
+          and MGR.spec_manager_map[iface.FullAttentionSpec] is MGR.FullAttentionManager,
+          "the narrow rollout, and the fallback if this is wrong")
 
-pool, mgrs = fresh(kvmgr_enabled=1, protected_fraction=0.75)
-eq("the factory builds OUR class for group 0", type(mgrs[0]), DSparkMLAAttentionManager)
-check("and upstream's for the windowed groups",
-      all(type(m) is MGR.SlidingWindowMLAManager for m in mgrs[1:]))
+    pool, mgrs = fresh(kvmgr_enabled=1, protected_fraction=0.75)
+    eq("the factory builds OUR class for group 0", type(mgrs[0]), DSparkMLAAttentionManager)
+    check("and upstream's for the windowed groups",
+          all(type(m) is MGR.SlidingWindowMLAManager for m in mgrs[1:]))
 
-# The geometry hook: wired by register(), fed by a real KVCacheConfig.
-cfg = iface.KVCacheConfig(
-    num_blocks=harness.LIVE_NUM_GPU_BLOCKS,
-    kv_cache_groups=[iface.KVCacheGroupSpec(kv_cache_spec=s) for s in harness.live_specs()],
-)
-harness.reset_manager_count()
-coord_mod = sys.modules.get("vllm.v1.core.kv_cache_coordinator")
-check("the coordinator wrap is installed",
-      coord_mod is not None and getattr(coord_mod.KVCacheCoordinator.__init__, "_kvmgr_wrapped", False)
-      if coord_mod else False, "stamps group_count/group_block_sizes")
+    # The geometry hook: wired by register(), fed by a real KVCacheConfig.
+    cfg = iface.KVCacheConfig(
+        num_blocks=harness.LIVE_NUM_GPU_BLOCKS,
+        kv_cache_groups=[iface.KVCacheGroupSpec(kv_cache_spec=s) for s in harness.live_specs()],
+    )
+    harness.reset_manager_count()
+    coord_mod = sys.modules.get("vllm.v1.core.kv_cache_coordinator")
+    check("the coordinator wrap is installed",
+          coord_mod is not None and getattr(coord_mod.KVCacheCoordinator.__init__, "_kvmgr_wrapped", False)
+          if coord_mod else False, "stamps group_count/group_block_sizes")
 
-DSparkMLAAttentionManager.group_count = len(cfg.kv_cache_groups)
-DSparkMLAAttentionManager.group_block_sizes = tuple(
-    g.kv_cache_spec.block_size for g in cfg.kv_cache_groups)
-eq("group geometry read off the config", DSparkMLAAttentionManager.group_block_sizes,
-   harness.LIVE_BLOCK_SIZES)
-DSparkMLAAttentionManager.group_sliding_windows = tuple(
-    getattr(g.kv_cache_spec, "sliding_window", None) for g in cfg.kv_cache_groups)
-eq("and the per-group windows, which by_need needs",
-   DSparkMLAAttentionManager.group_sliding_windows, (None, 128, 128, 128, 128))
+    DSparkMLAAttentionManager.group_count = len(cfg.kv_cache_groups)
+    DSparkMLAAttentionManager.group_block_sizes = tuple(
+        g.kv_cache_spec.block_size for g in cfg.kv_cache_groups)
+    eq("group geometry read off the config", DSparkMLAAttentionManager.group_block_sizes,
+       harness.LIVE_BLOCK_SIZES)
+    DSparkMLAAttentionManager.group_sliding_windows = tuple(
+        getattr(g.kv_cache_spec, "sliding_window", None) for g in cfg.kv_cache_groups)
+    eq("and the per-group windows, which by_need needs",
+       DSparkMLAAttentionManager.group_sliding_windows, (None, 128, 128, 128, 128))
 
 # ---------------------------------------------------------------------------
 # 1b. EVERY LOGGER MUST SIT UNDER THE `vllm.` NAMESPACE
@@ -188,17 +189,18 @@ for _lg in (flags.logger, _mgr_mod_logger := __import__(
 # ---------------------------------------------------------------------------
 # 2. PARITY -- the cap agrees with patch6, block for block
 # ---------------------------------------------------------------------------
-for frac in (0.30, 0.50, 0.75, 1.00, 0.0):
-    pool, mgrs = fresh(kvmgr_enabled=1, protected_fraction=frac)
-    DSparkMLAAttentionManager.group_count = 5
-    DSparkMLAAttentionManager.group_block_sizes = harness.LIVE_BLOCK_SIZES
-    DSparkMLAAttentionManager.group_sliding_windows = harness.LIVE_SLIDING_WINDOWS
-    ours = mgrs[0]._max_protected_prompt_blocks()
+if harness.needs_dspark("cap parity with patch6's MNT-6a, block for block"):
+    for frac in (0.30, 0.50, 0.75, 1.00, 0.0):
+        pool, mgrs = fresh(kvmgr_enabled=1, protected_fraction=frac)
+        DSparkMLAAttentionManager.group_count = 5
+        DSparkMLAAttentionManager.group_block_sizes = harness.LIVE_BLOCK_SIZES
+        DSparkMLAAttentionManager.group_sliding_windows = harness.LIVE_SLIDING_WINDOWS
+        ours = mgrs[0]._max_protected_prompt_blocks()
 
-    # patch6's own answer, from the unmodified parent, via the legacy env.
-    os.environ[flags.LEGACY_FRACTION_ENV] = str(frac)
-    theirs = MGR.MLAAttentionManager._max_protected_prompt_blocks(mgrs[0])
-    eq(f"cap parity at fraction {frac}", ours, theirs)
+        # patch6's own answer, from the unmodified parent, via the legacy env.
+        os.environ[flags.LEGACY_FRACTION_ENV] = str(frac)
+        theirs = MGR.MLAAttentionManager._max_protected_prompt_blocks(mgrs[0])
+        eq(f"cap parity at fraction {frac}", ours, theirs)
 
 # negative fraction: patch6's "keep only the legacy cap" contract
 pool, mgrs = fresh(kvmgr_enabled=1, protected_fraction=-1.0)
@@ -235,23 +237,31 @@ m = mgrs[0]
 # the behavioural difference that actually matters: patch6 only ever does the
 # equal /num_managers split, so by_need is INERT with our policy off and moves
 # the cap 2.25x with it on.
+# "Off" is the loaded vLLM's OWN cap, whichever that is: patch6's equal
+# /num_managers split (3,643), or on a vLLM without patch6 upstream's legacy
+# 2 x max_model_len / block_size (8,192), which knows no fraction at all.
+_OFF_CAP = 3643 if harness.DSPARK else 8192
 F.write(kvmgr_enabled=0, protected_fraction=0.75, protect_alloc="by_need")
-eq("off: by_need is INERT -- patch6 only knows the equal split",
-   m._max_protected_prompt_blocks(), 3643)
+eq("off: by_need is INERT -- the loaded vLLM's own cap",
+   m._max_protected_prompt_blocks(), _OFF_CAP)
 F.write(kvmgr_enabled=1, protected_fraction=0.75, protect_alloc="by_need")
 eq("on: by_need applies -- 8192 blocks, live, no restart",
    m._max_protected_prompt_blocks(), 8192)
 F.write(kvmgr_enabled=0, protected_fraction=0.75, protect_alloc="by_need")
-eq("off again: back to patch6's equal split in the same process",
-   m._max_protected_prompt_blocks(), 3643)
+eq("off again: back to the loaded vLLM's own cap in the same process",
+   m._max_protected_prompt_blocks(), _OFF_CAP)
 F.write(kvmgr_enabled=1, protected_fraction=0.75, protect_alloc="by_need")
 eq("and on again", m._max_protected_prompt_blocks(), 8192)
 
 # ...and the fraction is hot on BOTH sides of the switch, which is the new
 # property and the one the operator asked for.
 F.write(kvmgr_enabled=0, protected_fraction=0.50, protect_alloc="equal")
-eq("fraction is hot with our policy OFF (patch6's own path)",
-   m._max_protected_prompt_blocks(), int(24288 * 0.50 / 5))
+if harness.DSPARK:
+    eq("fraction is hot with our policy OFF (patch6's own path)",
+       m._max_protected_prompt_blocks(), int(24288 * 0.50 / 5))
+else:
+    eq("with our policy OFF the fraction does nothing -- upstream has none",
+       m._max_protected_prompt_blocks(), 8192)
 F.write(kvmgr_enabled=1, protected_fraction=0.50, protect_alloc="equal")
 eq("and hot with it ON", m._max_protected_prompt_blocks(), int(24288 * 0.50 / 5))
 F.write(kvmgr_enabled=1, protected_fraction=0.75, protect_alloc="equal")
@@ -357,6 +367,15 @@ PROBE = {
 # the loop below raised `KeyError: 'disk_store_paused'` -- so the suite went RED
 # rather than silently skipping the one knob nobody had proved hot. The eq()
 # below would have named it; the loop got there first, which is louder.
+# The DSpark fork's knobs are declared only when patch6 is loaded.
+from kvmgr.compat import dspark as _fork  # noqa: E402
+
+if not harness.DSPARK:
+    for _k in _fork.FORK_DEFAULTS:
+        PROBE.pop(_k)
+    check("on a vLLM without patch6, the fork's knobs are NOT declared",
+          not set(_fork.FORK_DEFAULTS) & set(flags.DEFAULTS),
+          sorted(set(_fork.FORK_DEFAULTS) & set(flags.DEFAULTS)))
 eq("the probe covers every knob in the table",
    sorted(PROBE), sorted(flags.DEFAULTS))
 
@@ -416,27 +435,26 @@ F.write(protected_fraction=0.10)
 for _blank in ("", "   ", "\t"):
     os.environ[flags.LEGACY_FRACTION_ENV] = _blank
     flags.reset_for_tests()
-    MGR._flags_checked_at = -1.0
+    harness.invalidate_flags()
     eq(f"a blank env value {_blank!r} is UNSET, so the flags file still wins",
        flags.raw("protected_fraction"), 0.10)
 del os.environ[flags.LEGACY_FRACTION_ENV]
-MGR._flags_checked_at = -1.0
+harness.invalidate_flags()
 eq("with the env absent the file wins too", flags.raw("protected_fraction"), 0.10)
 os.environ[flags.LEGACY_FRACTION_ENV] = "0.55"
-MGR._flags_checked_at = -1.0
+harness.invalidate_flags()
 eq("and a REAL env value still pins an arm for a boot",
    flags.raw("protected_fraction"), 0.55)
 del os.environ[flags.LEGACY_FRACTION_ENV]
-MGR._flags_checked_at = -1.0
+harness.invalidate_flags()
 check("garbage in the env falls back to 0.30 rather than raising",
       (os.environ.__setitem__(flags.LEGACY_FRACTION_ENV, "not-a-number"),
-       MGR.__setattr__("_flags_checked_at", -1.0),
+       harness.invalidate_flags(),
        flags.raw("protected_fraction"))[2] == 0.30)
 del os.environ[flags.LEGACY_FRACTION_ENV]
-MGR._flags_checked_at = -1.0
+harness.invalidate_flags()
 
 # the compose must not re-introduce a default, or the knob goes cold again
-_compose = open(os.path.join(REPO_ROOT, "docker-compose.dspark.yml")).read()
 # A BLANK env value must not be reported as a PIN. The first version reported
 # "pinned by VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION=''" on the very boot where the
 # knob had just been made hot -- telling the operator a live knob was cold.
@@ -454,11 +472,13 @@ os.environ[flags.LEGACY_FRACTION_ENV] = "0.75"
 check("while a REAL value is still reported as a pin",
       any("protected_fraction" in e for e in flags.audit_env()))
 del os.environ[flags.LEGACY_FRACTION_ENV]
-MGR._flags_checked_at = -1.0
+harness.invalidate_flags()
 
-check("the compose does NOT default VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION",
-      'VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION: "${PROTECTED_FRACTION:-}"' in _compose,
-      "a default there wins over the flags file and makes the knob restart-only")
+if harness.needs_dspark("the DSpark compose does not pin protected_fraction"):
+    _compose = open(os.path.join(REPO_ROOT, "docker-compose.dspark.yml")).read()
+    check("the compose does NOT default VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION",
+          'VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION: "${PROTECTED_FRACTION:-}"' in _compose,
+          "a default there wins over the flags file and makes the knob restart-only")
 
 # ---------------------------------------------------------------------------
 # 5. AN UNBUILT POLICY VALUE IS REFUSED, NOT SILENTLY DOWNGRADED
@@ -645,17 +665,18 @@ eq("window_need_blocks matches patch6's MNT-9 formula",
    [None, 3, 3, 3, 17])
 
 # ...and against patch6's own code, so the two definitions cannot drift.
-harness.reset_manager_count()
-probe_pool = harness.make_pool(num_gpu_blocks=400, hash_block_size=4)
-swa = MGR.get_manager_for_kv_cache_spec(
-    kv_cache_spec=iface.SlidingWindowMLASpec(block_size=4, sliding_window=128),
-    max_num_batched_tokens=8192, max_model_len=harness.LIVE_MAX_MODEL_LEN,
-    block_pool=probe_pool, enable_caching=True, kv_cache_group_id=3,
-    dcp_world_size=1, pcp_world_size=1)
-fake_blocks = [None] * 500
-patch6_need = len(swa._head_pin_candidates(fake_blocks, 400))
-eq("patch6 agrees that a 128-token window over 4-token blocks is 33 blocks",
-   patch6_need, policy.window_need_blocks(128, 4))
+if harness.needs_dspark("window_need_blocks against patch6's MNT-9 formula"):
+    harness.reset_manager_count()
+    probe_pool = harness.make_pool(num_gpu_blocks=400, hash_block_size=4)
+    swa = MGR.get_manager_for_kv_cache_spec(
+        kv_cache_spec=iface.SlidingWindowMLASpec(block_size=4, sliding_window=128),
+        max_num_batched_tokens=8192, max_model_len=harness.LIVE_MAX_MODEL_LEN,
+        block_pool=probe_pool, enable_caching=True, kv_cache_group_id=3,
+        dcp_world_size=1, pcp_world_size=1)
+    fake_blocks = [None] * 500
+    patch6_need = len(swa._head_pin_candidates(fake_blocks, 400))
+    eq("patch6 agrees that a 128-token window over 4-token blocks is 33 blocks",
+       patch6_need, policy.window_need_blocks(128, 4))
 
 caps_by_need = [
     policy.protected_cap(num_gpu_blocks=24288, fraction=0.75, num_groups=5,

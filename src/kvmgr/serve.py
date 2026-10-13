@@ -232,12 +232,9 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def _flags_path() -> str:
-    try:
-        from vllm.v1.core.single_type_kv_cache_manager import _FLAGS_PATH
+    from . import flags
 
-        return _FLAGS_PATH
-    except Exception:
-        return "?"
+    return flags.FLAGS_PATH
 
 
 def maybe_start() -> None:

@@ -112,8 +112,8 @@ flags.set_override("kvmgr_stats_port", "9199")
 eq("a numeric string becomes an int", flags.raw("kvmgr_stats_port"), 9199)
 check("...really an int, not a string",
       isinstance(flags.raw("kvmgr_stats_port"), int))
-flags.set_override("head_pin_fraction", "0.25")
-eq("...and a float a float", flags.raw("head_pin_fraction"), 0.25)
+flags.set_override("disk_free_floor_gb", "0.25")
+eq("...and a float a float", flags.raw("disk_free_floor_gb"), 0.25)
 flags.set_override("protect_alloc", "by_need")
 eq("a string stays a string", flags.raw("protect_alloc"), "by_need")
 
@@ -746,7 +746,7 @@ _csrc = open(os.path.join(REPO, "src", "kvmgr",
 # package to check nothing is missing from it.
 import ast as _ast6  # noqa: E402
 
-_preserved = {f"{m.split('.')[-1]}.{a}" for m, a, _ in control._PRESERVE}
+_preserved = {f"{m[len('kvmgr.'):]}.{a}" for m, a, _ in control._PRESERVE}
 
 # Constants and caches are NOT state: re-executing them restores the same
 # value, or losing them costs at most one log line. Named so the exemption is
@@ -757,14 +757,26 @@ _EXEMPT = {
     "flags._last_seen": "flag-change edge cache; losing it costs one edge",
     "flags._announced": "log de-duplication; losing it costs a repeated line",
     "__init__.__all__": "an export list, not state",
+    "flags._flags_cache": "the flags file's 1s read cache; losing it costs one read",
+    "compat.dspark._INSTALLED_ON": "log de-duplication for the bridge; the "
+                                   "bridge itself is re-armed by the reload",
 }
 
 _kvdir = os.path.join(REPO, "src", "kvmgr")
 _missing = []
-for _f in sorted(os.listdir(_kvdir)):
-    if not _f.endswith(".py"):
-        continue
-    _mod = _f[:-3]
+# *** RECURSIVE. *** A top-level listdir could not see a subpackage at all, so
+# kvmgr.compat and kvmgr.diag would have been outside this audit by
+# construction -- state in them unaudited, and the audit still green.
+_audited_files = []
+for _root, _dirs, _files in os.walk(_kvdir):
+    _dirs[:] = [d for d in _dirs if d != "__pycache__"]
+    for _f in _files:
+        if _f.endswith(".py"):
+            _audited_files.append(os.path.relpath(os.path.join(_root, _f), _kvdir))
+check("the state audit walks subpackages too",
+      any(os.sep in f for f in _audited_files), sorted(_audited_files))
+for _f in sorted(_audited_files):
+    _mod = _f[:-3].replace(os.sep, ".")
     for _node in _ast6.parse(open(os.path.join(_kvdir, _f)).read()).body:
         if isinstance(_node, _ast6.Assign):
             _names = [t.id for t in _node.targets if isinstance(t, _ast6.Name)]

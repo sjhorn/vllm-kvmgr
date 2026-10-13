@@ -197,6 +197,10 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     ("kvmgr.diskio", "_STALL_FAIL_REQUEST",
      "the watchdog's stall-fail request + its dedupe key"),
     ("kvmgr.flags", "_OVERRIDE", "every knob the control plane has set"),
+    # Derived from VLLM_KV_FLAGS_FILE at import, so a reload normally re-derives
+    # the same path -- preserved anyway, because a path set at RUNTIME (the
+    # test harness does) would otherwise snap back to /etc silently.
+    ("kvmgr.flags", "FLAGS_PATH", "the flags file this process reads"),
     ("kvmgr.diskspec", "_LIVE_MANAGER", "the disk index, for GET /kv"),
     ("kvmgr.stats", "_groups", "all per-group counters -- the observability"),
     ("kvmgr.offload", "_real_odirect", "the saved platform O_DIRECT value"),
@@ -458,7 +462,7 @@ def reload_modules() -> dict:
     # reloads reported success while running the previous code.
     for name in ("kvmgr.flags", "kvmgr.policy", "kvmgr.diskio",
                  "kvmgr.diskspec", "kvmgr.manager", "kvmgr.stats",
-                 "kvmgr.offload", "kvmgr.serve",
+                 "kvmgr.offload", "kvmgr.serve", "kvmgr.compat.dspark",
                  "kvmgr.register", "kvmgr.control"):
         try:
             import sys
@@ -538,15 +542,15 @@ def reload_modules() -> dict:
         # replaced rather than stacked is in test_phase1d_disk.py.
         _reg._install_serializer_shim()
         report["serializer_shim_reinstalled"] = True
-        # *** AND RE-WIRE patch6's PENDING-BLOCKS HOOK. *** It holds a
-        # reference to `diskspec.pending_block_ids`, and the reload REBINDS
-        # that module -- so after a reload patch6 would be calling the previous
-        # module's function. It would still work, which is the trap: a stale
-        # closure that behaves correctly is invisible until the behaviour
-        # changes. The audit in test_phase1d_disk.py is what required this
-        # line, and it named the omission the moment the installer was added.
-        _reg._install_pending_blocks_provider()
-        report["pending_blocks_provider_rewired"] = True
+        # *** AND RE-WIRE THE FORK BRIDGE. *** patch6's pending-blocks hook
+        # holds a reference to `diskspec.pending_block_ids`, and its `_flag`
+        # bridge closes over `flags` -- both REBOUND by the reload, so patch6
+        # would keep calling the previous modules' functions. They would still
+        # work, which is the trap: a stale closure that behaves correctly is
+        # invisible until the behaviour changes. The installer audit in
+        # test_phase1d_disk.py is what requires this line.
+        _reg._install_fork_bridges()
+        report["fork_bridges_rewired"] = True
         _dio = _il2.import_module("kvmgr.diskio")
         _dio._start_watchdog()
         report["watchdog_armed"] = bool(_dio._watchdog_started)

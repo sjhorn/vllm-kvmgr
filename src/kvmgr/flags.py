@@ -5,12 +5,16 @@ prefill (measured 2026-10-06: 725K tokens in 795s, 767K in 672s).  Re-tuning a
 policy knob must never cost that, so a knob captured at import, in a
 constructor, or in a cached attribute is a DEFECT here rather than a detail.
 
-WE DO NOT INVENT A MECHANISM.  patch6 already has one, proven and in use for
-MNT-6b/8/9: a small JSON file re-stat'ed at most once a second, with
-``VLLM_<NAME>`` winning over the file so a boot can still pin an arm.  This
-module IMPORTS that ``_flag`` rather than copying it.  Copying would mean two
-caches and two TTLs over one file, and the drift would be invisible -- the same
-"two tables describing one wire" failure this stack keeps paying for.
+THE MECHANISM IS THE DSpark FORK'S, VENDORED.  A small JSON file re-stat'ed at
+most once a second, with ``VLLM_<NAME>`` winning over the file so a boot can
+still pin an arm -- the reader patch6 uses for MNT-6b/8/9, proven there first.
+It was IMPORTED from patch6 until 2026-10-13, which is why kvmgr could not load
+on a vLLM without that overlay; it lives here now (``file_flags``,
+``_env_or_file``, ``_protected_fraction``), with the same path, env name, TTL
+and coercion.  The reason it was imported still holds -- two caches and two
+TTLs over one file would drift invisibly -- so when patch6 IS present,
+``kvmgr.compat.dspark`` points patch6's ``_flags`` at THIS cache and its
+``_flag`` at a reader that consults the override first.  One cache either way.
 
 WHAT THIS ADDS over bare ``_flag()``:
 
@@ -41,9 +45,8 @@ from typing import Any
 
 from vllm.logger import init_logger
 
-# The single source of truth for flag reading.  Importing it binds us to
-# patch6's module-level cache, which is the point.
-from vllm.v1.core.single_type_kv_cache_manager import _flag as _patch6_flag
+import json
+import time
 
 # *** THE LOGGER NAME IS LOAD-BEARING, and `__name__` is the wrong one. ***
 #
@@ -61,6 +64,78 @@ from vllm.v1.core.single_type_kv_cache_manager import _flag as _patch6_flag
 # audit were all invisible, which is indistinguishable from the plugin never
 # having loaded. Naming the logger under `vllm.` makes it inherit that handler.
 logger = init_logger("vllm." + __name__)
+
+# ---------------------------------------------------------------------------
+# The flags FILE: the boot-time default under the env pin and the override.
+# Vendored from patch6 (MNT-6b/8/9's reader) unchanged in behaviour: same path,
+# same env var, same 1s TTL, same "missing or bad file means every default".
+# ---------------------------------------------------------------------------
+FLAGS_PATH = os.environ.get("VLLM_KV_FLAGS_FILE", "/etc/vllm-kv-flags/flags.json")
+_FLAGS_TTL_S = 1.0
+_flags_cache: dict = {}
+_flags_checked_at: float = -1.0
+
+
+def file_flags() -> dict:
+    """The flags file's contents, re-read at most once per ``_FLAGS_TTL_S``.
+
+    Missing file, bad JSON or a non-object all read as ``{}`` -- every knob at
+    its default -- because a reader that raises here would take a scheduler
+    step down over a typo in an operator's edit.
+    """
+    global _flags_cache, _flags_checked_at
+    now = time.monotonic()
+    if now - _flags_checked_at < _FLAGS_TTL_S:
+        return _flags_cache
+    _flags_checked_at = now
+    try:
+        with open(FLAGS_PATH) as fh:
+            loaded = json.load(fh)
+        _flags_cache = loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        _flags_cache = {}
+    return _flags_cache
+
+
+def invalidate_file_cache() -> None:
+    """Make the next read re-open the file. For tests and the control plane."""
+    global _flags_checked_at
+    _flags_checked_at = -1.0
+
+
+def _env_or_file(name: str, default):
+    """``VLLM_<NAME>`` if set, else the file's ``name``, else ``default``,
+    coerced to ``type(default)``. A bool is false only for 0/false/no/blank."""
+    raw_value = os.environ.get("VLLM_" + name.upper())
+    if raw_value is None:
+        raw_value = file_flags().get(name)
+    if raw_value is None:
+        return default
+    if isinstance(default, bool):
+        return str(raw_value).strip().lower() not in ("0", "false", "no", "")
+    try:
+        return type(default)(raw_value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _protected_fraction() -> float:
+    """The legacy env name (non-blank) wins, then the file, then 0.30.
+
+    *** A BLANK ENV VALUE COUNTS AS UNSET. *** docker-compose emits "" for
+    ``${PROTECTED_FRACTION:-}``, and ``float("")`` raising used to turn into a
+    silent 0.30 that ignored the file.
+    """
+    env_value = os.environ.get(LEGACY_FRACTION_ENV)
+    if env_value is not None and env_value.strip() != "":
+        try:
+            return float(env_value)
+        except ValueError:
+            return 0.30
+    try:
+        return float(_env_or_file("protected_fraction", 0.30))
+    except (TypeError, ValueError):
+        return 0.30
 
 # ---------------------------------------------------------------------------
 # The knob table.  Defaults are chosen so that an EMPTY FLAGS FILE BEHAVES
@@ -548,21 +623,10 @@ DEFAULTS: dict[str, Any] = {
     # An INTEGER rather than a boolean because the useful operation is "do it
     # again", and a bool can only be flipped once. The manager acts on the EDGE.
     "gpu_cache_epoch": 0,
-    # pre-existing, preserved unchanged -- listed so this table is the whole
-    # surface and nothing is hot-by-accident or cold-by-omission.
-    "swa_recycle": True,
-    "swa_recycle_cached": False,
-    "free_queue_prepend_uncached": False,
-    "pin_static_head": False,
-    "head_pin_fraction": 0.05,
-    # *** READ BY patch6 AND DECLARED NOWHERE until 2026-10-09. ***
-    # `_maybe_pin_static_head` reads it with an inline default, so it worked --
-    # and it was invisible: absent from this table, so absent from the knob
-    # listing, from the published policy and from anything auditing coverage.
-    # An undeclared knob is one nobody can discover, which is the quiet half of
-    # "a flag that governs nothing": here the flag governs something and no
-    # reader can tell it exists. Found by auditing reads against declarations.
-    "head_pin_partial": False,
+    # The DSpark fork's own knobs (MNT-6b SWA recycle, MNT-8 free-queue
+    # prepend, MNT-9 static-head pin) are NOT here: no kvmgr code reads them.
+    # They are declared by kvmgr.compat.dspark, and only when patch6 is
+    # present, so a stock vLLM is not shown knobs that govern nothing.
     # *** THE GPU CACHE DROP HAS KILLED THE ENGINE TWICE, SO IT IS OPT-IN. ***
     # Xid 32 on 2026-10-09 at 11:50 (worker node) and again at 17:07 (head),
     # both within ~4 seconds of a `gpu_cache_epoch` bump, on different ranks.
@@ -791,11 +855,7 @@ def source_of(name: str) -> str:
     if (os.environ.get(env_name) or "").strip():
         return "env"
     try:
-        # patch6's own reader, cached on its 1s TTL -- not a second parse of the
-        # same file, which is how two readers of one knob come to disagree.
-        from vllm.v1.core.single_type_kv_cache_manager import _flags
-
-        if name in (_flags() or {}):
+        if name in (file_flags() or {}):
             return "file"
     except Exception:
         pass
@@ -819,14 +879,32 @@ def raw(name: str) -> Any:
     if name in _OVERRIDE:
         return _OVERRIDE[name]
     if name == "protected_fraction":
-        # ONE DEFINITION, patch6's. Re-implementing the precedence here is how
-        # two readers of one knob end up disagreeing -- and this knob has three
-        # sources (legacy env, flags file, default) plus the blank-is-unset rule
-        # that lets the compose stop pinning it.
-        from vllm.v1.core.single_type_kv_cache_manager import _protected_fraction
-
+        # ONE DEFINITION. With patch6 present, compat.dspark points patch6's
+        # own _protected_fraction at raw(), so the two cannot disagree.
         return _protected_fraction()
-    return _patch6_flag(name, DEFAULTS[name])
+    return _env_or_file(name, DEFAULTS[name])
+
+
+def declare(extra: dict[str, Any], why: str) -> list[str]:
+    """Add knobs to the table at runtime -- for a fork bridge, never for core.
+
+    Returns the names that were new. An existing name with a DIFFERENT default
+    raises, because two declarations of one knob is the drift this table exists
+    to prevent.
+    """
+    added = []
+    for name, default in extra.items():
+        if name in DEFAULTS:
+            if DEFAULTS[name] != default:
+                raise ValueError(
+                    f"kvmgr: {name} is already declared with default "
+                    f"{DEFAULTS[name]!r}; {why} declares {default!r}")
+            continue
+        DEFAULTS[name] = default
+        added.append(name)
+    if added:
+        logger.info("kvmgr: knobs declared by %s: %s", why, added)
+    return added
 
 
 def knob(name: str, *, quiet: bool = False) -> Any:
@@ -933,3 +1011,4 @@ def reset_for_tests() -> None:
     _OVERRIDE.clear()
     _last_seen.clear()
     _announced.clear()
+    invalidate_file_cache()

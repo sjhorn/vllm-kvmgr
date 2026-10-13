@@ -60,7 +60,7 @@ def register() -> None:
 
     _install_hang_dump()
     _install_control_plane()
-    _install_pending_blocks_provider()
+    _install_fork_bridges()
 
     from vllm.v1.core import single_type_kv_cache_manager as stm
     from vllm.v1.kv_cache_interface import MLAAttentionSpec
@@ -339,34 +339,20 @@ def _numpy_paths(root, limit: int = 12, max_depth: int = 8,
     return out
 
 
-def _install_pending_blocks_provider() -> None:
-    """Let patch6 see which blocks have a KV transfer in flight.
+def _install_fork_bridges() -> None:
+    """Bridge to a vLLM fork's own overlays, if one is loaded.
 
-    patch6 offers a hook and imports nothing of ours, because it is a whole-file
-    overlay that must be re-cut on every image bump and must work standalone.
-    This is the only place that wires the two together.
-
-    Best-effort by construction: with no provider installed, patch6 releases
-    protected blocks exactly as it did before, so a failure here costs the
-    narrowing and nothing else.
+    Today that is the DSpark recipe's patch6 (one flags cache, overrides that
+    reach the fork's MNT-8/9 knobs, its pending-blocks hook). On any other
+    vLLM this finds nothing and does nothing. Best-effort: a bridge that can
+    break a boot is worse than none.
     """
     try:
-        from vllm.v1.core import single_type_kv_cache_manager as stm
-        setter = getattr(stm, "set_pending_block_ids_provider", None)
-        if setter is None:
-            logger.info(
-                "kvmgr: patch6 offers no pending-blocks hook (older overlay) -- "
-                "protected-block release will not consult transfer state")
-            return
-        from . import diskspec
-        setter(diskspec.pending_block_ids)
-        logger.info(
-            "kvmgr: pending-blocks provider installed -- releasing a protected "
-            "block now skips any block with a KV transfer in flight. Fails OPEN "
-            "(an unknown answer releases), so this narrows the use-after-free "
-            "window rather than closing it.")
+        from .compat import dspark
+
+        dspark.install()
     except Exception:
-        logger.exception("kvmgr: could not install the pending-blocks provider")
+        logger.exception("kvmgr: fork bridge install failed (continuing)")
 
 
 def _install_serializer_shim() -> None:

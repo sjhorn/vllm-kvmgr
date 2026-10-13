@@ -37,6 +37,14 @@ def eq(name: str, got, want) -> None:
     check(name, got == want, f"got {got!r} want {want!r}")
 
 
+# *** EVERY ASSERTION IN THIS SUITE IS A FACT ABOUT patch6 *** -- MNT-6a's
+# equal split, MNT-9's head pins, patch6's flag reader, MNT-11's hook. On a
+# vLLM without the DSpark patches there is nothing here to check, so it says so
+# and exits 0 with a SKIPPED summary rather than passing vacuously.
+if not harness.needs_dspark("test_phase0: the patched engine's own facts"):
+    print("0 passed, 0 failed (SKIPPED in pristine mode)")
+    sys.exit(0)
+
 H = harness.load()
 MGR = H.mgr_mod
 
@@ -242,8 +250,15 @@ check("the hook DOES get the block_pool, so it can allocate on a restore",
 # 9. THE REGISTRY HOOK -- substitution works, and is reversible
 # ---------------------------------------------------------------------------
 iface = sys.modules["vllm.v1.kv_cache_interface"]
-eq("MLAAttentionSpec maps to MLAAttentionManager today",
-   MGR.spec_manager_map[iface.MLAAttentionSpec], MGR.MLAAttentionManager)
+eq("MLAAttentionSpec maps to MLAAttentionManager before any manager is built",
+   harness.STOCK_MLA_MANAGER, MGR.MLAAttentionManager)
+# MNT-11 is patch6's lazy `import kvmgr; kvmgr.register()` on the first manager
+# built. It used to be a silent no-op HERE because this suite could not import
+# kvmgr -- so this suite asserted the stock map by accident. It can now, so the
+# hook is observable doing its job.
+check("MNT-11 registered kvmgr on the first manager built",
+      MGR.spec_manager_map[iface.MLAAttentionSpec].__name__ == "DSparkMLAAttentionManager",
+      MGR.spec_manager_map[iface.MLAAttentionSpec])
 
 
 class _Probe(MGR.MLAAttentionManager):
@@ -267,7 +282,7 @@ try:
 finally:
     MGR.spec_manager_map[iface.MLAAttentionSpec] = original
 eq("and the registry is restored", MGR.spec_manager_map[iface.MLAAttentionSpec],
-   MGR.MLAAttentionManager)
+   original)
 
 # ---------------------------------------------------------------------------
 # 10. MNT-5 is NOT a KV mechanism  (the plan's open Phase 0 question)

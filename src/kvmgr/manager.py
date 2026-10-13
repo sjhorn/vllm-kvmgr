@@ -105,15 +105,21 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
 
     # -- the two numbers that decide how much of a conversation survives ----
 
-    def _num_groups(self) -> int:
-        """Prefer the real group count; fall back to patch6's counter.
+    def _num_groups(self) -> int | None:
+        """The real group count, stamped by the coordinator hook; else the
+        DSpark fork's process-global counter; else None.
 
-        The fallback is not equivalent and is logged when it is used, because a
-        wrong group count scales every cap.
+        The counter is not equivalent (it is never decremented) and is logged
+        when it is used. On a vLLM without it, an unknown group count returns
+        None and the caller takes upstream's cap rather than GUESSING one --
+        a wrong group count scales every cap, silently.
         """
         if self.group_count:
             return self.group_count
-        return max(1, SingleTypeKVCacheManager._num_managers)
+        counter = getattr(SingleTypeKVCacheManager, "_num_managers", None)
+        if counter:
+            return max(1, counter)
+        return None
 
     def _max_protected_prompt_blocks(self) -> int | None:
         enabled = flags.knob("kvmgr_enabled", quiet=True)
@@ -133,6 +139,15 @@ class DSparkMLAAttentionManager(MLAAttentionManager):
         fraction = flags.knob("protected_fraction", quiet=True)
         mode = flags.knob("protect_alloc", quiet=True)
         num_groups = self._num_groups()
+        if num_groups is None:
+            if not getattr(self, "_kvmgr_geometry_refused", False):
+                self._kvmgr_geometry_refused = True
+                logger.warning(
+                    "kvmgr: KV group count unknown (the coordinator hook did not "
+                    "stamp it and this vLLM has no manager counter) -- group %d "
+                    "uses upstream's protection cap rather than a guessed one",
+                    self.kv_cache_group_id)
+            return super()._max_protected_prompt_blocks()
 
         cap = policy.protected_cap(
             num_gpu_blocks=self.block_pool.num_gpu_blocks,

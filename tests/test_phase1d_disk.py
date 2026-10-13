@@ -898,8 +898,17 @@ print("== the reload must cover every MODULE, audited not listed ==")
 # take effect, and three reloads reported success while running the previous
 # code. Same shape as the installer audit above, one level up.
 _pkg = _os4.path.join(_REPO4, "src", "kvmgr")
-_mods = sorted(f[:-3] for f in _os4.listdir(_pkg)
-               if f.endswith(".py") and f != "__init__.py")
+# RECURSIVE, with dotted names: a subpackage (compat, diag) is a module no
+# change would ever be hot for if it were invisible here.
+_mods = []
+for _r4, _d4, _f4 in _os4.walk(_pkg):
+    _d4[:] = [d for d in _d4 if d != "__pycache__"]
+    for f in _f4:
+        if f.endswith(".py"):
+            _rel = _os4.path.relpath(_os4.path.join(_r4, f), _pkg)[:-3]
+            _mods.append(_rel.replace(_os4.sep, "."))
+_mods = sorted(m for m in _mods if m != "__init__")
+check("the module audit sees subpackages", any("." in m for m in _mods), _mods)
 check("the module audit found modules at all", len(_mods) >= 5, _mods)
 
 _MOD_EXEMPT = {
@@ -908,6 +917,8 @@ _MOD_EXEMPT = {
     # exactly what makes `from kvmgr import register` return the FUNCTION
     # rather than the module -- a trap this repo has already paid for.
     "__init__",
+    # Subpackage markers holding only a docstring: nothing to rebind.
+    "compat.__init__",
 }
 # *** AND THE FIRST VERSION OF THIS CHECK COULD NOT FAIL. *** It searched the
 # WHOLE of control.py for the module name, and `"kvmgr.offload"` /
@@ -917,7 +928,7 @@ _MOD_EXEMPT = {
 _m_tuple = _re4.search(r"for name in \(([^)]*)\):", _ctl_src, _re4.S)
 check("the reload tuple was actually located -- otherwise this lint is "
       "scanning nothing", _m_tuple is not None)
-_reload_list = _re4.findall(r'"kvmgr\.(\w+)"', _m_tuple.group(1) if _m_tuple else "")
+_reload_list = _re4.findall(r'"kvmgr\.([\w.]+)"', _m_tuple.group(1) if _m_tuple else "")
 check("...and it names several modules", len(_reload_list) >= 5, _reload_list)
 _mod_missing = [m for m in _mods
                 if m not in _MOD_EXEMPT and m not in _reload_list]

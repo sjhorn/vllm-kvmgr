@@ -22,6 +22,11 @@ from dataclasses import dataclass
 
 import vllm_stubs
 
+# kvmgr itself, from the package's src/ -- never an installed copy.
+_SRC_FOR_IMPORT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if _SRC_FOR_IMPORT not in sys.path:
+    sys.path.insert(0, _SRC_FOR_IMPORT)
+
 # *** EVERY PATH A SUITE OPENS COMES FROM HERE. *** The suites used to build
 # their own from `REPO`, five different spellings of it, and one of them read
 # sources through a helper that SKIPPED a missing file -- so the move into
@@ -40,9 +45,35 @@ DSPARK_REPO = os.environ.get("KVMGR_DSPARK_REPO") or os.path.dirname(
 PATCHES = os.path.join(DSPARK_REPO, "patches")
 REPO = DSPARK_REPO  # the old name, for the few checks that read the compose
 
-# Which vLLM the suites run against. True: the DSpark fork's patch6/7/8 over the
-# vendored sources (what the box runs). Step 3.1 adds the pristine-only mode.
-DSPARK = True
+# WHICH vLLM THE SUITES RUN AGAINST, and run-all.sh runs both:
+#   pristine (default)      tests/upstream/ alone -- kvmgr on a vLLM with NO
+#                           patch of ours, which is the package's claim
+#   --with-dspark-patches   the DSpark fork's patch6/7/8 over the same sources,
+#                           which is what the box runs
+# Read from argv OR the environment, so `python3.12 test_x.py
+# --with-dspark-patches` and run-all.sh's exported variable both work.
+DSPARK = ("--with-dspark-patches" in sys.argv
+          or os.environ.get("KVMGR_WITH_DSPARK_PATCHES") == "1")
+if DSPARK and not os.path.isfile(os.path.join(
+        PATCHES, "patch6-single_type_kv_cache_manager.py")):
+    raise SystemExit(
+        f"--with-dspark-patches: no patch6 under {PATCHES}. Set "
+        "KVMGR_DSPARK_REPO to the DSpark recipe checkout.")
+MODE = "dspark" if DSPARK else "pristine"
+
+
+def needs_dspark(what: str) -> bool:
+    """True in DSpark mode. In pristine mode, print that `what` was NOT run.
+
+    A section skipped silently reads as a section that passed; this names it,
+    so the absence is visible in the suite's own output."""
+    if not DSPARK:
+        print(f"SKIP  [pristine mode] {what} -- needs --with-dspark-patches")
+        SKIPPED.append(what)
+    return DSPARK
+
+
+SKIPPED: list[str] = []
 
 
 def kvmgr_source(name: str) -> str:
@@ -98,6 +129,7 @@ class Loaded:
 
 
 _loaded: Loaded | None = None
+STOCK_MLA_MANAGER = None
 
 
 def load_kv_offload() -> types.ModuleType:
@@ -120,6 +152,13 @@ def load_kv_offload() -> types.ModuleType:
     resolution these tests see is our patched one, which is the point.
     """
     load()  # patch8 must be in sys.modules under its canonical name first
+    # *** IDEMPOTENT. *** A second load re-executes base.py and mints NEW class
+    # objects, so a spec built against the first copy is no longer an instance
+    # of the second's LoadStoreSpec -- every isinstance check then fails for a
+    # reason that has nothing to do with the code under test.
+    if "vllm.v1.kv_offload.base" in sys.modules and getattr(
+            sys.modules["vllm.v1.kv_offload.base"], "__file__", None):
+        return sys.modules["vllm.v1.kv_offload.base"]
 
     kvo = os.path.join(PRISTINE, "vllm", "v1", "kv_offload")
     for name in ("vllm.v1.kv_offload", "vllm.v1.kv_offload.worker",
@@ -156,18 +195,18 @@ def load(force: bool = False) -> Loaded:
 
     vllm_stubs.install()
 
-    utils = _load_file(
-        os.path.join(PATCHES, "patch8-kv_cache_utils.py"),
-        "vllm.v1.core.kv_cache_utils",
-    )
-    pool_mod = _load_file(
-        os.path.join(PATCHES, "patch7-block_pool-dedupe.py"),
-        "vllm.v1.core.block_pool",
-    )
-    mgr_mod = _load_file(
-        os.path.join(PATCHES, "patch6-single_type_kv_cache_manager.py"),
-        "vllm.v1.core.single_type_kv_cache_manager",
-    )
+    core = os.path.join(UPSTREAM, "vllm", "v1", "core")
+    if DSPARK:
+        sources = (os.path.join(PATCHES, "patch8-kv_cache_utils.py"),
+                   os.path.join(PATCHES, "patch7-block_pool-dedupe.py"),
+                   os.path.join(PATCHES, "patch6-single_type_kv_cache_manager.py"))
+    else:
+        sources = (os.path.join(core, "kv_cache_utils.py"),
+                   os.path.join(core, "block_pool.py"),
+                   os.path.join(core, "single_type_kv_cache_manager.py"))
+    utils = _load_file(sources[0], "vllm.v1.core.kv_cache_utils")
+    pool_mod = _load_file(sources[1], "vllm.v1.core.block_pool")
+    mgr_mod = _load_file(sources[2], "vllm.v1.core.single_type_kv_cache_manager")
     # The coordinator is NOT one of our overlays -- it is the pristine capture,
     # loaded so the layer ABOVE the managers is under test too: the group
     # geometry hook wraps its __init__, and the fixed-point hit loop that makes
@@ -184,7 +223,14 @@ def load(force: bool = False) -> Loaded:
     assert mgr_mod.BlockPool is pool_mod.BlockPool, (
         "patch6 bound a different BlockPool than patch7 defines -- load order"
     )
-    assert hasattr(mgr_mod, "_flag"), "patch6 has no _flag(): not the patched file"
+    if DSPARK:
+        assert hasattr(mgr_mod, "_flag"), "patch6 has no _flag(): not the patched file"
+    else:
+        # *** THE CLAIM UNDER TEST: nothing of patch6 is reachable. ***
+        for _sym in ("_flag", "_flags", "_protected_fraction", "_FLAGS_PATH",
+                     "set_pending_block_ids_provider"):
+            assert not hasattr(mgr_mod, _sym), (
+                f"pristine mode loaded a manager module carrying patch6's {_sym}")
     assert hasattr(mgr_mod, "spec_manager_map"), "patch6 has no spec_manager_map"
 
     assert coord_mod.BlockPool is pool_mod.BlockPool, (
@@ -194,8 +240,32 @@ def load(force: bool = False) -> Loaded:
         coord_mod.get_manager_for_kv_cache_spec is mgr_mod.get_manager_for_kv_cache_spec
     ), "coordinator bound a different manager factory -- load order"
 
+    # The registry entry BEFORE any manager is built. In DSpark mode patch6's
+    # MNT-11 hook imports kvmgr and registers it on the first manager built, so
+    # by the time a suite looks, the map may already hold our class.
+    global STOCK_MLA_MANAGER
+    STOCK_MLA_MANAGER = mgr_mod.spec_manager_map[
+        sys.modules["vllm.v1.kv_cache_interface"].MLAAttentionSpec]
     _loaded = Loaded(utils, pool_mod, mgr_mod, coord_mod)
+    if DSPARK:
+        # What register() does in production: bridge patch6 to kvmgr's flags.
+        # kv_offload first, because the bridge wires patch6's pending-blocks
+        # hook to kvmgr.diskspec, which imports it.
+        load_kv_offload()
+        from kvmgr.compat import dspark as _bridge
+
+        assert _bridge.install(), "DSPARK mode but the bridge found no patch6"
     return _loaded
+
+
+def invalidate_flags() -> None:
+    """Make the next knob read re-open the flags file, in every reader."""
+    from kvmgr import flags as _kf
+
+    _kf.invalidate_file_cache()
+    mod = sys.modules.get("vllm.v1.core.single_type_kv_cache_manager")
+    if mod is not None and hasattr(mod, "_flags_checked_at"):
+        mod._flags_checked_at = -1.0
 
 
 def make_pool(num_gpu_blocks: int = LIVE_NUM_GPU_BLOCKS, enable_caching: bool = True,
@@ -262,10 +332,14 @@ def make_live_groups(pool=None, max_model_len: int = LIVE_MAX_MODEL_LEN,
 # flags-file control, so a test can flip a knob the way an operator does
 # ---------------------------------------------------------------------------
 class Flags:
-    """Point patch6's `_flag()` at a temp file and drive it.
+    """Point the flags-file reader at a temp file and drive it.
 
-    `_flag()` caches for `_FLAGS_TTL_S` (1.0s) against `time.monotonic()`, so a
-    test that writes the file and reads immediately gets the OLD value.  This
+    The reader is kvmgr's (``kvmgr.flags.file_flags``); in DSpark mode patch6's
+    ``_flags`` IS that reader via the bridge, and patch6's own path is pointed
+    at the file too so an unbridged read agrees.
+
+    The reader caches for 1.0s against ``time.monotonic()``, so a test that
+    writes the file and reads immediately gets the OLD value.  This
     invalidates the cache explicitly rather than sleeping -- a one-second sleep
     per assertion is how a suite stops being run.
     """
@@ -274,7 +348,11 @@ class Flags:
         self.path = path
         H = load()
         self.mod = H.mgr_mod
-        self.mod._FLAGS_PATH = path
+        from kvmgr import flags as _kf
+
+        _kf.FLAGS_PATH = path
+        if hasattr(self.mod, "_FLAGS_PATH"):
+            self.mod._FLAGS_PATH = path
 
     def write(self, **kw) -> None:
         import json
@@ -296,7 +374,7 @@ class Flags:
         self.invalidate()
 
     def invalidate(self) -> None:
-        self.mod._flags_checked_at = -1.0
+        invalidate_flags()
 
     def __enter__(self):
         return self
