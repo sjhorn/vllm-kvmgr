@@ -19,6 +19,16 @@ warm 770K-token prefix costs 0.9s, and the same prefix arrived at cold costs
 and 11s after a full restart of both nodes (54x)**, with every lookup a hit.
 A conversational prefix comes back at 98.7% after the GPU cache is dropped.
 
+> **Where this lives.** This repository is the source of truth for kvmgr, with
+> its full history carried over from the DSpark recipe repo, where it was
+> developed. Releases are git tags (`v0.2.0` and on), each naming the vLLM
+> build it is proven on. **If you are reading this inside the DSpark recipe
+> at `packages/vllm-kvmgr/`, you are reading a vendored copy** — a squashed
+> `git subtree` of one tag here, kept there because the cluster deploys by
+> pushing that repo to its nodes. Do not edit the copy: change it here, tag,
+> and `git subtree pull --prefix=packages/vllm-kvmgr <this repo> <tag> --squash`
+> from the DSpark root.
+
 ## Requirements
 
 - **vLLM `0.21.1rc1.dev339+g1967a5627bc3`.** That is the build it is proven on.
