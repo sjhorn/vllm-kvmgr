@@ -1,6 +1,6 @@
 """test_phase1d_disk.py -- the on-disk FINGERPRINT, and the fork that killed restore.
 
-    python3.12 local-ops/kvharness/test_phase1d_disk.py
+    python3.12 packages/vllm-kvmgr/tests/test_phase1d_disk.py
 
 *** THE BUG THIS FILE EXISTS FOR. *** Measured live 2026-10-07: the worker wrote
 943 files per rank under `..._06be92914bd2_r0` while the engine core's manifest
@@ -27,8 +27,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(REPO, "patches", "kvmgr_plugin"))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the PACKAGE root
+sys.path.insert(0, os.path.join(REPO, "src"))
 
 import harness  # noqa: E402
 
@@ -227,7 +227,7 @@ print("\n--- the hang dump: no ptrace, and it must NOT kill the process ---")
 # that wrong in-process would take the test runner down with it.
 import subprocess  # noqa: E402
 
-_PLUG = os.path.join(REPO, "patches", "kvmgr_plugin")
+_PLUG = os.path.join(REPO, "src")
 _STUB = (
     "import sys, types, logging\n"
     "_v = types.ModuleType('vllm'); _l = types.ModuleType('vllm.logger')\n"
@@ -850,11 +850,10 @@ print("== the reload must RE-ARM every installer, audited not listed ==")
 import re as _re4
 import os as _os4
 
-_REPO4 = _os4.path.dirname(_os4.path.dirname(_os4.path.dirname(
-    _os4.path.abspath(__file__))))
-_reg_src = open(_os4.path.join(_REPO4, "patches", "kvmgr_plugin", "kvmgr",
+_REPO4 = _os4.path.dirname(_os4.path.dirname(_os4.path.abspath(__file__)))
+_reg_src = open(_os4.path.join(_REPO4, "src", "kvmgr",
                                "register.py")).read()
-_ctl_src = open(_os4.path.join(_REPO4, "patches", "kvmgr_plugin", "kvmgr",
+_ctl_src = open(_os4.path.join(_REPO4, "src", "kvmgr",
                                "control.py")).read()
 
 _EXEMPT = {
@@ -898,7 +897,7 @@ print("== the reload must cover every MODULE, audited not listed ==")
 # behave identically; it surfaced only when a CHANGE to register.py had to
 # take effect, and three reloads reported success while running the previous
 # code. Same shape as the installer audit above, one level up.
-_pkg = _os4.path.join(_REPO4, "patches", "kvmgr_plugin", "kvmgr")
+_pkg = _os4.path.join(_REPO4, "src", "kvmgr")
 _mods = sorted(f[:-3] for f in _os4.listdir(_pkg)
                if f.endswith(".py") and f != "__init__.py")
 check("the module audit found modules at all", len(_mods) >= 5, _mods)

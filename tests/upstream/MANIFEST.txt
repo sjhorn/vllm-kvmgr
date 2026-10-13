@@ -1,0 +1,40 @@
+# tests/upstream/ -- vLLM sources the offline tests load, vendored
+#
+# Copied 2026-10-13 from the DSpark repo's patches/pristine/, which captured them
+# from the runtime image by `docker run --rm --entrypoint cat <image> <path>`
+# (never through a bind mount, which returns the patched file). Apache-2.0, same
+# as vLLM. Only the KV-relevant files are vendored.
+#
+# "Pristine" means unpatched by the DSpark fork's MNT-* overlays. It is the vLLM
+# build kvmgr is proven on, not necessarily upstream main.
+#
+image=vllm-dspark-runtime:dspark-nvfp4-stage-c
+vllm_version=0.21.1rc1.dev339+g1967a5627bc3
+captured=2026-09-20 (core), 2026-10-07 (kv_offload, connector, executor)
+#
+# These files are the CONTRACT the tests pin. To port kvmgr to another vLLM,
+# re-vendor from that build and let the named failures say what moved.
+#
+# sha256  lines  path
+b7e83ac78d50ea8652227eb1f245206c37dbd692597cf08348fef1e6df032025    207  vllm/distributed_kv_connector_offloading_connector.py
+eeac5a2da73684293959ee2eaef03c38b455eece02d6d7db8c4abd0ed960254c     60  vllm/kv_connector_offloading/common.py
+5ab3c65af3c0f78b0696bcc60c68ecfe51332c6d5f6684bb2cfa0e0ea9677d73    165  vllm/kv_connector_offloading/metrics.py
+3efd44a633890b3a81f29eb8ee170cb7dc31c3eea5b60093119ad2d43a3228a6    996  vllm/kv_connector_offloading/scheduler.py
+2537f6bee1327c01d3763207d11e26dfd1d0466c7a04b2ddc19c1c72b50df930    316  vllm/kv_connector_offloading/worker.py
+36a1683a7341a27862b0301e991e76734d968701632775932fbeb0420e894283    520  vllm/v1/core/block_pool.py
+d152b52dd908e37eb413c2dc19d63cd54a718f0b398923f520e3425039d6f860    689  vllm/v1/core/kv_cache_coordinator.py
+85563fd2bd5ada624fdd3f25e53c5ac9285620d2ae8f9b4033ec3d0e1d4514c3    601  vllm/v1/core/kv_cache_manager.py
+b02f18a8bf5b3fe016a5756d4868dfe0ba98c8d89bb128ecc6b55d28621cf66f   2149  vllm/v1/core/kv_cache_utils.py
+825073826b5be7fbe78e97c6e8fefa14636ca1cb2208f010f9da5acbdcb0a5a2   2369  vllm/v1/core/sched/scheduler.py
+fc68b4ca9914f7c81bda8cc4d0f7495d0665b1165f29d3b08fbc106064ecfb47   1421  vllm/v1/core/single_type_kv_cache_manager.py
+2cca69138a2fdfe0c08cc3b3767964f63ae24e3f5bfbb2ac6826fa70c295458f   1037  vllm/v1/executor/multiproc_executor.py
+af70c723898631e5461cc2873629a3bbd4b75492996e60be573686355d618f2a    411  vllm/v1/kv_offload/base.py
+d220dbad866029d598e06d44eb979164ccecabd72208091bbafad13fc19cd585     13  vllm/v1/kv_offload/cpu/common.py
+d0f3b1847a61466e7b23ea3d0c226a84b5926340c50b0e769170fae97f90e0e9    452  vllm/v1/kv_offload/cpu/gpu_worker.py
+c2e2a457dbe7a69281a8d06fef8bbd5ef849ea96e4c69042548e53f6250e45d1    103  vllm/v1/kv_offload/cpu/spec.py
+2e389bfd245dc41ccc3ddbc03897e09c9b95fab0676850fd73294c1b7a2353f5     63  vllm/v1/kv_offload/factory.py
+2d968749832c17dd4206dab9702c31402c312fe5eaf463faff3edee417f51d9d    126  vllm/v1/kv_offload/file_mapper.py
+4900265b4a1a812e20b9022c399f2175da08e25d1a10582cc31aef93a562a8c1    150  vllm/v1/kv_offload/tiering/fs/manager.py
+293bb15ae2e13a1d80d6bf7e2c1e4e072b3687720ab3edea86b52eb90b675f55    505  vllm/v1/kv_offload/tiering/manager.py
+a4910931830aa0f114e19ee3d498a6ed628f7674316518721576e67affc031a8    186  vllm/v1/kv_offload/tiering/spec.py
+1fbf4a7b3c2ee9c995f1163c7fc157e37289a676a8c21368a4efaa5afe9bacfa    176  vllm/v1/kv_offload/worker/worker.py

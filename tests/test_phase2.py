@@ -1,6 +1,6 @@
 """test_phase2.py -- the counters say what happened, and WHY the victim went.
 
-    python3.12 local-ops/kvharness/test_phase2.py
+    python3.12 packages/vllm-kvmgr/tests/test_phase2.py
 
 Today eviction is only INFERRED, after the fact, from engine_cached_tokens on
 the proxy side. These are the assertions that it is now observed:
@@ -23,8 +23,8 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(REPO, "patches", "kvmgr_plugin"))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the PACKAGE root
+sys.path.insert(0, os.path.join(REPO, "src"))
 
 import harness  # noqa: E402
 
@@ -518,25 +518,27 @@ print("== EVERY KNOB READ MUST BE DECLARED, AND EVERY DECLARED KNOB PUBLISHED ==
 import re as _reA
 import os as _osA
 
-_REPO_A = _osA.path.dirname(_osA.path.dirname(_osA.path.dirname(
-    _osA.path.abspath(__file__))))
+import glob as _globA
 
 
-def _src(*names):
-    out = ""
-    for n in names:
-        fp = _osA.path.join(_REPO_A, "patches", n)
-        if _osA.path.isfile(fp):
-            out += open(fp).read()
-    return out
+def _src(*paths):
+    # *** A MISSING FILE RAISES. *** This helper used to skip one with
+    # `if isfile`, which after the move into packages/ would have fed the
+    # audit below an EMPTY STRING -- and an audit of nothing passes.
+    return "".join(open(fp).read() for fp in paths)
 
 
-_plugin = _src(*["kvmgr_plugin/kvmgr/%s.py" % m for m in
-                 ("diskio", "diskspec", "manager", "policy", "control",
-                  "stats", "offload", "register", "serve")])
-_patches = _src("patch6-single_type_kv_cache_manager.py",
-                "patch7-block_pool-dedupe.py",
-                "patch8-kv_cache_utils.py")
+# ENUMERATED from the package, never listed by hand: a hand-written list is how
+# a module goes unaudited (the old one named 9 of the package's modules).
+_plugin_files = sorted(_globA.glob(_osA.path.join(harness.KVMGR_DIR, "**", "*.py"),
+                                   recursive=True))
+check("the knob audit found the package's modules to read",
+      len(_plugin_files) >= 10, f"{len(_plugin_files)} files")
+_plugin = _src(*_plugin_files)
+_patches = _src(*[_osA.path.join(harness.PATCHES, n) for n in
+                  ("patch6-single_type_kv_cache_manager.py",
+                   "patch7-block_pool-dedupe.py",
+                   "patch8-kv_cache_utils.py")]) if harness.DSPARK else ""
 
 _declared = set(flags.DEFAULTS)
 check("the declaration table was found and is not tiny", len(_declared) >= 10,

@@ -1,6 +1,6 @@
 """test_phase1.py -- our manager is behaviour-identical, and every knob is HOT.
 
-    python3.12 local-ops/kvharness/test_phase1.py
+    python3.12 packages/vllm-kvmgr/tests/test_phase1.py
 
 Two jobs, and the second is the one that catches the failure this work is most
 likely to ship:
@@ -22,8 +22,8 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(harness_dir := os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "patches", "kvmgr_plugin"))
+sys.path.insert(0, os.path.join(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))), "src"))
 
 import harness  # noqa: E402
 
@@ -164,8 +164,8 @@ eq("and the per-group windows, which by_need needs",
 # INVISIBLE -- indistinguishable from the plugin never having loaded.
 import glob  # noqa: E402
 
-_plugin_dir = os.path.join(REPO_ROOT := os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__)))), "patches", "kvmgr_plugin", "kvmgr")
+_plugin_dir = harness.KVMGR_DIR
+REPO_ROOT = harness.DSPARK_REPO
 _mods = sorted(glob.glob(os.path.join(_plugin_dir, "*.py")))
 check("found the plugin modules", len(_mods) >= 6, f"{len(_mods)}")
 for _m in _mods:
@@ -532,10 +532,7 @@ check("disk_restore is NOT in BLOCKED any more",
       "disk_restore" not in flags.BLOCKED)
 check("*** and the restore gates use a VALIDATED read, so a future BLOCKED "
       "entry would actually block ***",
-      'flags.raw("disk_restore")' not in open(os.path.join(
-          os.path.dirname(os.path.dirname(os.path.dirname(
-              os.path.abspath(__file__)))),
-          "patches", "kvmgr_plugin", "kvmgr", "diskspec.py")).read())
+      'flags.raw("disk_restore")' not in harness.kvmgr_source("diskspec"))
 for _k in sorted(flags.BLOCKED):
     check(f"{_k}'s refusal still POINTS somewhere",
           "diskspec.py" in flags.BLOCKED[_k])

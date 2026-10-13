@@ -28,8 +28,8 @@ import ast
 import pathlib
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
-CONTROL = ROOT / "patches" / "kvmgr_plugin" / "kvmgr" / "control.py"
+ROOT = pathlib.Path(__file__).resolve().parents[1]  # the package root
+CONTROL = ROOT / "src" / "kvmgr" / "control.py"
 
 checks = 0
 

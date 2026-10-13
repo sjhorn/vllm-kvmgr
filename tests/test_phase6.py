@@ -1,6 +1,6 @@
 """test_phase6.py -- the HTTP control plane's foundation: the in-memory override.
 
-    python3.12 local-ops/kvharness/test_phase6.py
+    python3.12 packages/vllm-kvmgr/tests/test_phase6.py
 
 *** THE CONSTRAINT THIS FILE ENFORCES: a hot knob must not DEPEND on disk or
 container injection. *** Every knob today is reached through
@@ -21,8 +21,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(REPO, "patches", "kvmgr_plugin"))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the PACKAGE root
+sys.path.insert(0, os.path.join(REPO, "src"))
 
 import harness  # noqa: E402
 
@@ -344,7 +344,7 @@ print("\n== (13) every ROUTE ANNOTATION must resolve from MODULE globals ==")
 # needs no fastapi and no box.
 import ast as _ast  # noqa: E402
 
-_cpath = os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr", "control.py")
+_cpath = os.path.join(REPO, "src", "kvmgr", "control.py")
 _tree = _ast.parse(open(_cpath).read())
 
 _module_names = set()
@@ -572,7 +572,7 @@ check("*** a failed sync REPORTS rather than raising, so a boot survives it ***"
       str(rep2["errors"])[:70])
 
 # the wrap must be idempotent -- plugins load more than once per process
-_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_src = open(os.path.join(REPO, "src", "kvmgr",
                          "control.py")).read()
 # *** SLICE TO THE REAL FUNCTION BOUNDARY, not a fixed character window. ***
 # This read `_src[i:i+1400]` and passed until the function grew a longer
@@ -617,7 +617,7 @@ print("\n== (16) the sync hook: EVERY step entry point, ONE shot ==")
 # So every candidate is wrapped, sharing ONE one-shot flag. A scheduling-mode
 # change must not be able to silently disable this -- the symptom when it does
 # is behaviour differing by node with nothing in any log.
-_src6 = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_src6 = open(os.path.join(REPO, "src", "kvmgr",
                           "control.py")).read()
 
 
@@ -735,7 +735,7 @@ _f17.clear_override()
 # And the general property, asserted so the NEXT module-level state is not
 # forgotten: every mutable module-level container in kvmgr must be either
 # restored by reload_modules or provably not state.
-_csrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_csrc = open(os.path.join(REPO, "src", "kvmgr",
                           "control.py")).read()
 # *** AUDIT THE MODULES AGAINST THE TABLE, DO NOT NAME THE FIELDS. *** The
 # first version listed two names by hand and passed while three more stateful
@@ -759,7 +759,7 @@ _EXEMPT = {
     "__init__.__all__": "an export list, not state",
 }
 
-_kvdir = os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr")
+_kvdir = os.path.join(REPO, "src", "kvmgr")
 _missing = []
 for _f in sorted(os.listdir(_kvdir)):
     if not _f.endswith(".py"):
@@ -830,7 +830,7 @@ for name in ("_LIVE_HANDLERS", "_OVERRIDE", "_LIVE_MANAGER", "_groups"):
 # path used the obvious spelling and raised AttributeError on all three
 # processes live. Any module that re-resolves a kvmgr submodule at runtime must
 # use importlib.import_module, which ignores what the package re-exports.
-_ctl_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_ctl_src = open(os.path.join(REPO, "src", "kvmgr",
                              "control.py")).read()
 _shadowed = {"register"}  # the names __init__.py re-exports
 _bad = []

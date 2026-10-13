@@ -28,8 +28,8 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(REPO, "patches", "kvmgr_plugin"))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the PACKAGE root
+sys.path.insert(0, os.path.join(REPO, "src"))
 
 import harness  # noqa: E402
 
@@ -335,7 +335,7 @@ def code_only(path, blank_strings=True):
     return "".join(out)
 
 
-_dspath = os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr", "diskspec.py")
+_dspath = os.path.join(REPO, "src", "kvmgr", "diskspec.py")
 _src = open(_dspath).read()
 _code = code_only(_dspath)
 # *** AND A SECOND VIEW, WITH STRINGS KEPT. *** A check about a dict LOOKUP --
@@ -596,7 +596,7 @@ check("...which is in turn above the absolute code minimum",
 
 print()
 print("== (9w) the worker RPC is declared, and applied locally as a NO-OP ==")
-_csrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_csrc = open(os.path.join(REPO, "src", "kvmgr",
                           "control.py")).read()
 check("kvmgr_verify_presence is installed on Worker",
       "Worker.kvmgr_verify_presence = kvmgr_verify_presence" in _csrc)

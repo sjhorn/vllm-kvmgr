@@ -1,6 +1,6 @@
 """test_phase3.py -- the two policies, and the failure they are for.
 
-    python3.12 local-ops/kvharness/test_phase3.py
+    python3.12 packages/vllm-kvmgr/tests/test_phase3.py
 
 The measured case this reproduces: three conversations, the oldest idle, a cap
 that cannot hold all three. Today the oldest loses its prefix ENTIRELY -- a
@@ -25,8 +25,8 @@ import tempfile
 from collections import OrderedDict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(REPO, "patches", "kvmgr_plugin"))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the PACKAGE root
+sys.path.insert(0, os.path.join(REPO, "src"))
 
 import harness  # noqa: E402
 

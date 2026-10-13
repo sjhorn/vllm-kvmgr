@@ -1,6 +1,6 @@
 """test_phase1_disk.py -- the scheduler-side half of our disk spec.
 
-    python3.12 local-ops/kvharness/test_phase1_disk.py
+    python3.12 packages/vllm-kvmgr/tests/test_phase1_disk.py
 
 Phase 1a is the SPEC, the MANAGER and the path arithmetic -- everything that
 decides *what* gets written and *where*. The transfer itself (Phase 1b) is the
@@ -19,8 +19,8 @@ import json
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(REPO, "patches", "kvmgr_plugin"))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the PACKAGE root
+sys.path.insert(0, os.path.join(REPO, "src"))
 
 import harness  # noqa: E402
 
@@ -196,12 +196,12 @@ print("== (1g) complete_store is the ALL-RANKS edge, and it is free ==")
 # workers, and the scheduler "processes a transfer completion only when count
 # reaches num_workers". So presence recorded HERE is all-ranks correct with no
 # protocol of ours. Pinned against the pristine source, not just asserted.
-common = open(os.path.join(REPO, "patches", "pristine", "vllm",
+common = open(os.path.join(REPO, "tests", "upstream", "vllm",
                            "kv_connector_offloading", "common.py")).read()
 check("the framework really does gate on num_workers",
       "only when count reaches num_workers" in common)
 check("...by summing per-worker reports", "aggregate" in common)
-sched = open(os.path.join(REPO, "patches", "pristine", "vllm",
+sched = open(os.path.join(REPO, "tests", "upstream", "vllm",
                           "kv_connector_offloading", "scheduler.py")).read()
 check("...and the scheduler sets pending_count from num_workers",
       "pending_count=self.config.num_workers" in sched)
@@ -393,7 +393,7 @@ for _attr in _OPTIONAL_ATTRS:
 # The lint that generalises: every read of an optional attribute must go
 # through getattr, because a direct `self._x` is what fails on a rebind. A
 # test of one attribute would pass again while the next one broke the engine.
-_dsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_dsrc = open(os.path.join(REPO, "src", "kvmgr",
                           "diskspec.py")).read()
 for _attr in _OPTIONAL_ATTRS:
     # Exclude the declaration itself. It is an ANNOTATED assignment
@@ -1052,14 +1052,14 @@ print("== (5i) the eviction log must be THROTTLED at steady state ==")
 # interesting first eviction (100,665 keys / 71.8 GB) arrives on.
 check("there is a throttle interval, and it is not sub-second",
       diskspec.DiskPresenceManager.EVICT_LOG_S >= 10)
-_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_src = open(os.path.join(REPO, "src", "kvmgr",
                          "diskspec.py")).read()
 check("*** the first eviction still logs in full -- dropping 71.8 GB IS an "
       "event ***", "first = not getattr(self, \"_evict_logged\"" in _src)
 check("...and later lines carry the TOTALS, which is what a steady-state "
       "reader wants", "evicted in total" in _src)
 
-_dsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_dsrc = open(os.path.join(REPO, "src", "kvmgr",
                           "diskio.py")).read()
 check("the worker's unlink line is throttled too", "_del_log_at" in _dsrc)
 check("*** but an unlink FAILURE is never throttled -- that is the thing "
@@ -1230,7 +1230,7 @@ def _normalise_p4(src):
     return _reP4.sub(r"[ \t]+", " ", "".join(out))
 
 
-_diskio_src = open(os.path.join(REPO, "patches", "kvmgr_plugin",
+_diskio_src = open(os.path.join(REPO, "src",
                                    "kvmgr", "diskio.py")).read()
 
 
@@ -1277,7 +1277,7 @@ check("...and a real code change moves it",
 print("== (P4) the format version is INSIDE the fingerprint, not beside it ==")
 eq("the root directory carries the version", diskspec.DISK_FORMAT_ROOT,
    "dspark-kv-v%d" % diskspec.DISK_FORMAT_VERSION)
-_fp_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_fp_src = open(os.path.join(REPO, "src", "kvmgr",
                                "diskspec.py")).read()
 check("*** and so does the HASH -- a root name alone can be sidestepped by "
       "anything that computes a base path itself ***",
@@ -1374,7 +1374,7 @@ print("== (P4) the hub lookup must not assume THIS box's layout ==")
 # would quietly degrade to `unknown` -- the protection silently absent rather
 # than announced. huggingface_hub's own default is ~/.cache/huggingface/hub, so
 # that has to be tried before the local convention.
-_pt_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_pt_src = open(os.path.join(REPO, "src", "kvmgr",
                             "diskspec.py")).read()
 # *** AND THE FIRST VERSION OF THIS CHECK FAILED FOR THE WRONG REASON. ***
 # It compared raw substring positions, and "/models/hub" appears in the COMMENT

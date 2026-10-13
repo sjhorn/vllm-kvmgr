@@ -22,9 +22,36 @@ from dataclasses import dataclass
 
 import vllm_stubs
 
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-PATCHES = os.path.join(REPO, "patches")
-PRISTINE = os.path.join(PATCHES, "pristine")
+# *** EVERY PATH A SUITE OPENS COMES FROM HERE. *** The suites used to build
+# their own from `REPO`, five different spellings of it, and one of them read
+# sources through a helper that SKIPPED a missing file -- so the move into
+# packages/ would have left a knob audit auditing an empty string, green.
+PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # packages/vllm-kvmgr
+SRC = os.path.join(PKG, "src")
+KVMGR_DIR = os.path.join(SRC, "kvmgr")
+# The vLLM sources the tests load, vendored from the image kvmgr is proven on.
+UPSTREAM = os.path.join(PKG, "tests", "upstream")
+PRISTINE = UPSTREAM  # the old name, kept because the suites use it
+
+# The DSpark fork's patch overlays, needed only for --with-dspark-patches.
+# Located by env, else by this package's place inside the DSpark repo.
+DSPARK_REPO = os.environ.get("KVMGR_DSPARK_REPO") or os.path.dirname(
+    os.path.dirname(PKG))
+PATCHES = os.path.join(DSPARK_REPO, "patches")
+REPO = DSPARK_REPO  # the old name, for the few checks that read the compose
+
+# Which vLLM the suites run against. True: the DSpark fork's patch6/7/8 over the
+# vendored sources (what the box runs). Step 3.1 adds the pristine-only mode.
+DSPARK = True
+
+
+def kvmgr_source(name: str) -> str:
+    """The text of one kvmgr module, by bare name ("diskio") or relative path.
+
+    Raises rather than returning "" -- a lint fed an empty string passes."""
+    rel = name if name.endswith(".py") else name + ".py"
+    with open(os.path.join(KVMGR_DIR, rel)) as fh:
+        return fh.read()
 
 # The five live KV groups, in group order, as tokens per block.  Backed out of
 # the engine's own "legacy cap" lines; `--block-size 256` is group 0's only.
@@ -146,8 +173,7 @@ def load(force: bool = False) -> Loaded:
     # geometry hook wraps its __init__, and the fixed-point hit loop that makes
     # a group-0-only disk restore pointless lives here.
     coord_mod = _load_file(
-        os.path.join(REPO, "patches", "pristine", "vllm", "v1", "core",
-                     "kv_cache_coordinator.py"),
+        os.path.join(UPSTREAM, "vllm", "v1", "core", "kv_cache_coordinator.py"),
         "vllm.v1.core.kv_cache_coordinator",
     )
 

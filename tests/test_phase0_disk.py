@@ -1,7 +1,7 @@
 """test_phase0_disk.py -- PIN THE CONTRACT our own disk OffloadingSpec will
 implement, before a line of it is written.
 
-    python3.12 local-ops/kvharness/test_phase0_disk.py
+    python3.12 packages/vllm-kvmgr/tests/test_phase0_disk.py
 
 WHY THIS FILE EXISTS. Upstream's tiering offload cannot capture half of this
 cluster's KV: it consolidates every rank's shard into ONE SHARED HOST memory
@@ -32,7 +32,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the PACKAGE root
 
 import harness  # noqa: E402
 
@@ -99,7 +99,7 @@ OUR_MEDIUM = "DSPARK_DISK"
 # With a used string the duplicate-pair assert below does fire -- but as a bare
 # traceback with no name, which is this repo's "fails for the wrong reason" trap.
 # Scanned out of the pristine tree so a medium added upstream is picked up.
-_PRISTINE_KVO = os.path.join(REPO, "patches", "pristine", "vllm", "v1", "kv_offload")
+_PRISTINE_KVO = os.path.join(REPO, "tests", "upstream", "vllm", "v1", "kv_offload")
 UPSTREAM_MEDIA = set()
 for _dir, _, _files in os.walk(_PRISTINE_KVO):
     for _f in _files:
@@ -225,7 +225,7 @@ print("== (0g) OUR SPEC NEEDS NO HYBRID SHIM, which is the find of this phase ==
 # `offload_allow_hybrid` exists only because TieringOffloadingSpec adds
 # `assert len(self.gpu_block_size) == 1`. The BASE asserts something weaker that
 # our five groups already satisfy, so a spec of our own inherits no such limit.
-tier_src = open(os.path.join(REPO, "patches", "pristine", "vllm", "v1",
+tier_src = open(os.path.join(REPO, "tests", "upstream", "vllm", "v1",
                              "kv_offload", "tiering", "spec.py")).read()
 base_src = inspect.getsource(base.OffloadingSpec.__init__)
 check("TieringOffloadingSpec is the one asserting a single block size",
@@ -289,13 +289,13 @@ except ValueError:
 check("our name registers, and re-registering is refused", clash)
 check("the two upstream specs are still there",
       "CPUOffloadingSpec" in open(os.path.join(
-          REPO, "patches", "pristine", "vllm", "v1", "kv_offload",
+          REPO, "tests", "upstream", "vllm", "v1", "kv_offload",
           "factory.py")).read())
 
 print()
 print("== (0k) what the CONNECTOR already gives us -- the control channel ==")
 
-conn = open(os.path.join(REPO, "patches", "pristine", "vllm",
+conn = open(os.path.join(REPO, "tests", "upstream", "vllm",
                          "distributed_kv_connector_offloading_connector.py")).read()
 for sym, why in [
     ("build_connector_meta", "the scheduler's per-step decisions"),
@@ -320,7 +320,7 @@ print("== (0l) *** UPSTREAM DOES NOT SUPPORT TRANSFER FAILURE *** ==")
 # Pinned because an upstream bump that adds real failure handling would change
 # the design space, and because somebody reading our handler might otherwise
 # "soften" a refusal without realising what it costs.
-wkr = open(os.path.join(REPO, "patches", "pristine", "vllm",
+wkr = open(os.path.join(REPO, "tests", "upstream", "vllm",
                         "kv_connector_offloading", "worker.py")).read()
 check("the worker ASSERTS on a failed transfer",
       "assert transfer_result.success" in wkr)
@@ -329,7 +329,7 @@ check("...and says so in its own comment",
 check("...and marks the job completed REGARDLESS of our stats fields",
       "mark_completed(job_id)" in wkr)
 
-sch = open(os.path.join(REPO, "patches", "pristine", "vllm",
+sch = open(os.path.join(REPO, "tests", "upstream", "vllm",
                         "kv_connector_offloading", "scheduler.py")).read()
 _flat = "".join(sch.split())
 check("and the scheduler has NO success/failure branch at all -- it only "

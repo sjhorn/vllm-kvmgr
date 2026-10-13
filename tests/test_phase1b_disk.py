@@ -1,6 +1,6 @@
 """test_phase1b_disk.py -- the pure core of the disk write path.
 
-    python3.12 local-ops/kvharness/test_phase1b_disk.py
+    python3.12 packages/vllm-kvmgr/tests/test_phase1b_disk.py
 
 Everything here runs with no torch and no GPU, because everything here is where
 a SILENT KV corruption would live: which bytes go in which file, which staging
@@ -16,8 +16,8 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(REPO, "patches", "kvmgr_plugin"))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the PACKAGE root
+sys.path.insert(0, os.path.join(REPO, "src"))
 
 import harness  # noqa: E402
 
@@ -325,7 +325,7 @@ def _dsrc_take():
     happens to be zero today.
     """
     import os as _os
-    src = open(_os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+    src = open(_os.path.join(REPO, "src", "kvmgr",
                              "diskio.py")).read()
     out = []
     for i in range(len(src)):
@@ -964,7 +964,7 @@ check("a zero-length interval floors above zero rather than reading 0.0",
 
 # And the lint: the bare memoryview assignment must not come back. It is one
 # subscript, it looks right, and it only fails in the load direction.
-_dpath = os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr", "diskio.py")
+_dpath = os.path.join(REPO, "src", "kvmgr", "diskio.py")
 _dsrc = open(_dpath).read()
 
 
@@ -1095,7 +1095,7 @@ try:
     # wiring is asserted on the SOURCE. Without this line the counters above are
     # all reachable in a test and permanently None on the box -- a guard that
     # passes offline and fails live is the shape the fixture lesson is about.
-    _sp = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+    _sp = open(os.path.join(REPO, "src", "kvmgr",
                             "diskspec.py")).read()
     check("*** get_manager PUBLISHES the instance, or /kv stays None on the box ***",
           "_LIVE_MANAGER = self._manager" in _sp
@@ -1350,7 +1350,7 @@ check("an empty set is a no-op", (_time.monotonic() - t0) < 0.5)
 # The LOAD handler has the identical bug and the identical fix. Asserted on the
 # SOURCE because constructing one needs torch; what must never drift is that
 # BOTH filter to their own `_jobs` before looping.
-_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_src = open(os.path.join(REPO, "src", "kvmgr",
                          "diskio.py")).read()
 _waits = _re.findall(r"def wait\(self, job_ids: set\) -> None:(.*?)(?=\n    def )",
                      _src, _re.S)
@@ -1374,7 +1374,7 @@ print("\n== (b14) the fence counters, and the fixture that must keep up ==")
 # key is better than a traceback -- so the two are compared directly.
 import re as _re14
 
-_src14 = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_src14 = open(os.path.join(REPO, "src", "kvmgr",
                            "diskio.py")).read()
 _i14 = _src14.index("self.stats = {")
 _j14 = _src14.index("}", _src14.index('"saturations"', _i14))
@@ -1708,7 +1708,7 @@ eq("...and a second report is empty, so nothing is double-counted",
 
 # the structural guard: get_finished must be the ONLY thing that clears the
 # buffer, because a drain anywhere else is unreportable and invisible.
-_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_src = open(os.path.join(REPO, "src", "kvmgr",
                          "diskio.py")).read()
 _drains = [ln.strip() for ln in _src.splitlines()
            if "self._ready = []" in ln and not ln.strip().startswith("#")]
@@ -1804,7 +1804,7 @@ eq("an unreadable knob falls back to the documented default, it does not raise",
 # is the documented "a hot knob read on an IDLE engine shows the OLD derived
 # figure" in a new costume, and the structural guard is that `_collect` (called
 # once per step via get_finished) is what reconciles it.
-_dsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_dsrc = open(os.path.join(REPO, "src", "kvmgr",
                           "diskio.py")).read()
 _collect_body = _dsrc[_dsrc.index("def _collect(self) -> None:"):]
 _collect_body = _collect_body[:_collect_body.index("\n    def ")]
@@ -1949,7 +1949,7 @@ eq("...and a real row count is reported as itself", _Tiny()._bounds(), (7, 7))
 # want opposite responses. The load path is where the 0-bound crash happened,
 # so it is the one that most needs to be readable. Asserted against the SOURCE,
 # because a snapshot needs a live handler to call.
-_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_src = open(os.path.join(REPO, "src", "kvmgr",
                          "diskio.py")).read()
 eq("both handler snapshots report gpu_rows", _src.count("gpu_rows=self._bounds()[0]"), 2)
 eq("...and staging_rows", _src.count("staging_rows=self._bounds()[1]"), 2)
@@ -2194,7 +2194,7 @@ flags.reset_for_tests()
 # A lint is the only thing here that can fail if somebody restores the sharing,
 # and a revert is exactly the mistake to guard against, because sharing is the
 # cheaper-looking option and its comment argued for it persuasively for weeks.
-_lsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_lsrc = open(os.path.join(REPO, "src", "kvmgr",
                           "diskio.py")).read()
 _load_init = _lsrc[_lsrc.index("class DiskLoadHandler"):]
 _load_init = _load_init[:_load_init.index("\n    def _write_row")]
@@ -2243,7 +2243,7 @@ check("...and staging_load_slots is a declared knob, not an invented name",
 # shape of defect.
 import ast as _ast  # noqa: E402
 
-_src = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_src = open(os.path.join(REPO, "src", "kvmgr",
                          "diskio.py")).read()
 _tree = _ast.parse(_src)
 
@@ -2300,7 +2300,7 @@ for _name in ("DiskStoreHandler", "DiskLoadHandler"):
 # The configuration that worked before this was staging_load_blocks=64 -- an
 # arbitrary quarter of the store's pool that happened to sit under the limit.
 # That is not a safety property, so the cap is explicit and independent now.
-_bsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_bsrc = open(os.path.join(REPO, "src", "kvmgr",
                           "diskio.py")).read()
 _ns_cap = {}
 exec(compile(_bsrc[_bsrc.index("def _load_batch_max"):
@@ -2398,7 +2398,7 @@ check("stall_fail_after_s is a declared knob, so the deadline is hot",
 check("...and the default is INSIDE NCCL's 600s budget, which is the whole point",
       0 < flags.DEFAULTS["stall_fail_after_s"] < 600)
 
-_fsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_fsrc = open(os.path.join(REPO, "src", "kvmgr",
                           "diskio.py")).read()
 _fns = {}
 exec(compile(_fsrc[_fsrc.index("def stall_action"):
@@ -2474,7 +2474,7 @@ check("load_inflight_max is a declared knob, so it is hot",
 check("...and the default is SMALL -- a less parallel restore beats a dead "
       "worker", 0 < flags.DEFAULTS["load_inflight_max"] <= 8)
 
-_csrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_csrc = open(os.path.join(REPO, "src", "kvmgr",
                           "diskio.py")).read()
 _cload = _csrc[_csrc.index("class DiskLoadHandler"):]
 check("*** the LOAD pump bounds rounds in flight before taking slots ***",
@@ -2531,7 +2531,7 @@ check("*** hitting the bound RETURNS rather than failing the job -- the work "
 # 384 ops for a 2-ref group and 5,760 for a 30-ref one. Group 0 has the most
 # layers and the largest block size, so it reaches any descriptor limit first,
 # and a single cap in blocks cannot express that. My cap bounded the wrong unit.
-_osrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_osrc = open(os.path.join(REPO, "src", "kvmgr",
                           "diskio.py")).read()
 _ons = {}
 exec(compile(_osrc[_osrc.index("def load_ops_for"):
@@ -2671,7 +2671,7 @@ check("a dump survives being handed nothing", True)
 #    because the two rings are duplicated per class and this project's record
 #    is that duplicated pairs drift. A post-mortem path that exists on one
 #    direction only is the half-instrumented case that is worst to debug.
-_lsrc = open(os.path.join(REPO, "patches", "kvmgr_plugin", "kvmgr",
+_lsrc = open(os.path.join(REPO, "src", "kvmgr",
                           "diskio.py")).read()
 _lsrc_nc = _strip_comments(_lsrc) if "_strip_comments" in dir() else _lsrc
 for _want in ("store transfer reported FAILURE", "load transfer reported FAILURE",
