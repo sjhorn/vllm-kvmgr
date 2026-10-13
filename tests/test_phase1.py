@@ -361,6 +361,15 @@ PROBE = {
     "disk_free_evict_step_gb": (0.1, 50.0),
     "disk_free_check_s": (0.5, 300.0),
     "disk_free_rpc_s": (1.0, 3600.0),
+    # The diagnostics (kvmgr.diag). The VALUE re-reads hot like every knob;
+    # the EFFECT is boot-time, because each is installed at plugin load --
+    # the same caveat kvmgr_control_plane carries above.
+    "diag_hang_dump": (0, 1),
+    "diag_transfer_ledger": (0, 1),
+    "diag_serializer_walk": (0, 1),
+    "diag_geometry_snapshot": (0, 1),
+    "diag_tiering_shims": (0, 1),
+    "diag_hot_reload": (0, 1),
 }
 # *** THIS ASSERTION IS WHY A NEW KNOB CANNOT SHIP UNPROVEN, and it caught one
 # on 2026-10-08. *** `disk_store_paused` was added to DEFAULTS and not here, and

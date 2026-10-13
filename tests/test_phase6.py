@@ -187,6 +187,11 @@ eq("...and clearing returns the delegation", flags.raw("protected_fraction"), 0.
 print("\n== (8) apply_knob / clear_knob: the per-process RPC body ==")
 
 from kvmgr import control  # noqa: E402
+import importlib as _il_rl  # noqa: E402
+
+# Hot reload is a diagnostic now (kvmgr.diag.reload, off by default); these
+# sections test the machinery itself, so they drive it directly.
+_RL = _il_rl.import_module("kvmgr.diag.reload")
 
 flags.reset_for_tests()
 F.write()
@@ -476,7 +481,7 @@ try:
         "    def added_later(self):\n"
         "        return 'new'\n")
 
-    rep = control.reload_modules()
+    rep = _RL.reload_modules()
     eq("*** it FOUND them all, because it snapshots before reloading ***",
        rep.get("found", {}).get("handlers"), 3)
     eq("...re-pointing all three", len([r for r in rep["rebound"]
@@ -497,7 +502,7 @@ try:
 
     eq("*** and the registry is restored, so a SECOND reload still finds them ***",
        len(_dio2._LIVE_HANDLERS), 3)
-    rep2 = control.reload_modules()
+    rep2 = _RL.reload_modules()
     eq("...proved by doing it twice", rep2.get("found", {}).get("handlers"), 3)
 finally:
     from kvmgr import diskio as _dio3
@@ -506,7 +511,7 @@ finally:
 
 # `found` must be in the response at all: `instances: []` was indistinguishable
 # from "there was nothing to rebind", which is why the live bug read as normal.
-rep3 = control.reload_modules()
+rep3 = _RL.reload_modules()
 check("the response always says what it FOUND, so empty is not ambiguous",
       "found" in rep3 and isinstance(rep3["found"], dict), str(rep3)[:90])
 
@@ -709,7 +714,7 @@ eq("two overrides set before the reload", sorted(flags._OVERRIDE),
    ["evict_order", "kvmgr_log_level"])
 eq("...and winning", flags.raw("evict_order"), "lru_tail_first")
 
-rep17 = control.reload_modules()
+rep17 = _RL.reload_modules()
 check("the reload reports ok", rep17.get("ok") is True, str(rep17.get("errors"))[:80])
 
 # re-import, because the reload replaced the module object's contents
@@ -742,11 +747,11 @@ _csrc = open(os.path.join(REPO, "src", "kvmgr",
 # globals were silently not restored -- `diskspec._LIVE_MANAGER`,
 # `stats._groups` (every observability counter) and `offload._real_odirect`.
 # A hand-written list of things to remember is the thing that needs
-# remembering, so control._PRESERVE is the table and this parses the kvmgr
+# remembering, so _RL._PRESERVE is the table and this parses the kvmgr
 # package to check nothing is missing from it.
 import ast as _ast6  # noqa: E402
 
-_preserved = {f"{m[len('kvmgr.'):]}.{a}" for m, a, _ in control._PRESERVE}
+_preserved = {f"{m[len('kvmgr.'):]}.{a}" for m, a, _ in _RL._PRESERVE}
 
 # Constants and caches are NOT state: re-executing them restores the same
 # value, or losing them costs at most one log line. Named so the exemption is
@@ -827,14 +832,14 @@ eq("*** every stateful module global is in _PRESERVE or explicitly exempt ***",
 # table legitimately changes (as it just was, for _watchdog_started). Asserting
 # a floor rather than equality keeps the guard without the chore.
 check("...and _PRESERVE names at least the seven we know about",
-      len(control._PRESERVE) >= 7)
+      len(_RL._PRESERVE) >= 7)
 check("...and names no duplicates (a dup would silently restore twice)",
-      len({(m, a) for m, a, _ in control._PRESERVE}) == len(control._PRESERVE))
+      len({(m, a) for m, a, _ in _RL._PRESERVE}) == len(_RL._PRESERVE))
 check("...every entry carrying one",
-      all(isinstance(w, str) and w for _, _, w in control._PRESERVE))
+      all(isinstance(w, str) and w for _, _, w in _RL._PRESERVE))
 for name in ("_LIVE_HANDLERS", "_OVERRIDE", "_LIVE_MANAGER", "_groups"):
     check(f"_PRESERVE covers {name}",
-          any(a == name for _, a, _ in control._PRESERVE))
+          any(a == name for _, a, _ in _RL._PRESERVE))
 
 # *** `from kvmgr import <submodule>` IS A TRAP IN THIS PACKAGE. ***
 # __init__.py does `from .register import register`, so the package attribute
@@ -842,8 +847,8 @@ for name in ("_LIVE_HANDLERS", "_OVERRIDE", "_LIVE_MANAGER", "_groups"):
 # path used the obvious spelling and raised AttributeError on all three
 # processes live. Any module that re-resolves a kvmgr submodule at runtime must
 # use importlib.import_module, which ignores what the package re-exports.
-_ctl_src = open(os.path.join(REPO, "src", "kvmgr",
-                             "control.py")).read()
+_ctl_src = (open(os.path.join(REPO, "src", "kvmgr", "control.py")).read()
+            + open(os.path.join(REPO, "src", "kvmgr", "diag", "reload.py")).read())
 _shadowed = {"register"}  # the names __init__.py re-exports
 _bad = []
 for _line in _ctl_src.splitlines():
@@ -853,7 +858,7 @@ for _line in _ctl_src.splitlines():
     for _name in _shadowed:
         if _t.startswith(f"from kvmgr import {_name}"):
             _bad.append(_t)
-eq("control.py never does `from kvmgr import <a re-exported name>`", _bad, [])
+eq("control.py and diag/reload.py never do `from kvmgr import <a re-exported name>`", _bad, [])
 check("...and it reaches submodules via import_module instead",
       'import_module("kvmgr.register")' in _ctl_src)
 

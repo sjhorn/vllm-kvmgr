@@ -41,6 +41,12 @@ def eq(name, got, want):
 
 base = harness.load_kv_offload()
 from kvmgr import diskio, diskspec, flags  # noqa: E402
+import importlib as _il_led  # noqa: E402
+
+# The transfer ledger is a diagnostic (kvmgr.diag.ledger), ON by default, so
+# register() installs it in production; these suites build handlers directly.
+_LED = _il_led.import_module("kvmgr.diag.ledger")
+_LED.install()
 
 F = harness.Flags(os.path.join(tempfile.mkdtemp(prefix="kv1b-"), "flags.json"))
 
@@ -582,9 +588,13 @@ fake_spec = type("S", (), {"rank": 1, "world_size": 2, "block_size_factor": 1,
                            "gpu_block_size": (256, 64, 64, 4, 8),
                            "hash_block_size": 4})()
 
+# The snapshot is a diagnostic now (kvmgr.diag.geometry); tested there.
+import importlib as _il_geo  # noqa: E402
+_GEO = _il_geo.import_module("kvmgr.diag.geometry")
+
 # (a) groups SHARE tensor 2 -- the redundancy answer
 shared_kv = FakeKV([FakeT(100, 4096), FakeT(100, 4096), FakeT(100, 1024)], REFS)
-gs = diskio.geometry(shared_kv, fake_spec)
+gs = _GEO.geometry(shared_kv, fake_spec)
 eq("the snapshot carries the rank, so the two nodes are distinguishable",
    gs["rank"], 1)
 eq("...and the derived page we write", gs["page_size_per_worker"], 1051776)
@@ -601,7 +611,7 @@ eq("rows are reported, which is the OTHER candidate explanation",
 # (b) groups DISJOINT -- then differing row counts must be the explanation
 disjoint = [[REFS[0][0]], [REFS[1][0]], [REFS[3][0]]]
 dj = FakeKV([FakeT(100, 4096), FakeT(50, 1024), FakeT(25, 64)], disjoint)
-gd = diskio.geometry(dj, fake_spec)
+gd = _GEO.geometry(dj, fake_spec)
 eq("*** with disjoint groups, shared_tensors is EMPTY ***",
    gd["shared_tensors"], {})
 eq("...and the differing row counts are visible instead",
@@ -609,7 +619,7 @@ eq("...and the differing row counts are visible instead",
 
 # It is written atomically and never breaks a boot.
 sd = tempfile.mkdtemp(prefix="kvgeo-")
-pth = diskio.write_geometry(shared_kv, fake_spec, os.path.join(sd, "sub"))
+pth = _GEO.write_geometry(shared_kv, fake_spec, os.path.join(sd, "sub"))
 check("the snapshot is written, creating its directory", pth and os.path.exists(pth))
 check("...named by rank, so rank 0 and rank 1 cannot overwrite each other",
       os.path.basename(pth) == "geometry-r1.json")
@@ -619,7 +629,7 @@ eq("...and is valid JSON holding the answer",
    json.load(open(pth))["shared_tensors"], {"2": [1, 2]})
 check("*** a snapshot failure returns None rather than raising -- it must "
       "never be able to break a boot ***",
-      diskio.write_geometry(object(), fake_spec, sd) is None)
+      _GEO.write_geometry(object(), fake_spec, sd) is None)
 
 print()
 print("== (b11) read_chunks: the size check BEFORE any byte is read ==")
@@ -1995,11 +2005,11 @@ eq("...and the recent ring records shape, not data",
 check("...with a wall-clock stamp as the 8th field, for Xid attribution",
       len(_ring_e) == 8 and abs(_ring_e[7] - __import__("time").time()) < 60)
 check("the ring is bounded, so a 180K prefill cannot grow it without limit",
-      diskio._LEDGER_RING <= 64)
-for _i in range(diskio._LEDGER_RING * 3):
+      _LED._LEDGER_RING <= 64)
+for _i in range(_LED._LEDGER_RING * 3):
     hl._ledger_note("store", 0, [_i], [0])
 check("...and stays bounded in practice",
-      len(hl._ledger["recent"]) <= diskio._LEDGER_RING)
+      len(hl._ledger["recent"]) <= _LED._LEDGER_RING)
 _ok = True
 try:
     hl._ledger_note("store", 0, None, None)   # hostile input
@@ -2604,6 +2614,7 @@ class _CapLog:
 _cap = _CapLog()
 _real_logger = diskio.logger
 diskio.logger = _cap
+_real_led_logger, _LED.logger = _LED.logger, _cap
 
 # 1. THE TIME FLOOR: a handful of transfers must still produce a line
 _hl = mkhandler(8)
@@ -2620,7 +2631,7 @@ eq("...but it does not emit per transfer -- 15s floor, not a line each",
    len([l for l in _cap.lines if "transfer ledger" in l]), 0)
 # ...and it emits again once the floor has passed
 _hl._ledger["last_log"] = _hl._ledger.get("last_log", 0.0) - (
-    diskio._LEDGER_EVERY_S + 1)
+    _LED._LEDGER_EVERY_S + 1)
 _hl._ledger_note("store", 0, [7], [1])
 check("...and emits again once 15s have passed",
       len([l for l in _cap.lines if "transfer ledger" in l]) >= 1)
@@ -2681,6 +2692,7 @@ eq("...and the watchdog dumps in BOTH handlers, not one",
    _lsrc_nc.count("watchdog failed %d stalled job(s)"), 2)
 
 diskio.logger = _real_logger
+_LED.logger = _real_led_logger
 
 # ---------------------------------------------------------------------------
 # *** EVERY IMPORT-FAILED LITERAL MUST AGREE WITH ITS DECLARATION. ***

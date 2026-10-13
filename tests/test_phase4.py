@@ -75,7 +75,7 @@ install_stub()
 from kvmgr import flags  # noqa: E402
 import importlib  # noqa: E402
 
-offload = importlib.import_module("kvmgr.offload")
+offload = importlib.import_module("kvmgr.diag.tiering")
 stats = importlib.import_module("kvmgr.stats")
 
 F = harness.Flags(os.path.join(tempfile.mkdtemp(prefix="kvmgr4-"), "flags.json"))
@@ -146,7 +146,7 @@ class Raiser(StubSpec):
 
 
 sys.modules["vllm.v1.kv_offload.tiering.spec"].TieringOffloadingSpec = Raiser
-import kvmgr.offload as _off  # noqa: E402
+import kvmgr.diag.tiering as _off  # noqa: E402
 
 _off.install()
 r = Raiser(LIVE)

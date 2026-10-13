@@ -1,4 +1,14 @@
-"""kvmgr.offload -- let a HYBRID KV layout reach the disk tier.
+"""kvmgr.diag.tiering -- let a HYBRID KV layout reach upstream's tiering tier.
+
+*** A DIAGNOSTIC NOW, OFF BY DEFAULT (``diag_tiering_shims``), moved from
+kvmgr.offload on 2026-10-13. *** Every shim here patches upstream's
+``TieringOffloadingSpec`` and its fs tier; kvmgr's own disk tier
+(``DSparkDiskOffloadingSpec``) uses none of them, because upstream's tiering
+cannot capture rank 1's half on a one-rank-per-node cluster. They are kept for
+anyone running that spec, and so the offload_* knobs still mean something
+when it is installed. The original header follows.
+
+Original title: let a HYBRID KV layout reach the disk tier.
 
 THE ONE LINE THAT BLOCKS IT, measured on the box 2026-10-07 after the engine got
 three steps further than the 2026-09-14 probe ever did:
@@ -63,8 +73,8 @@ from __future__ import annotations
 
 from vllm.logger import init_logger
 
-from . import flags
-from . import stats
+from .. import flags
+from .. import stats
 
 logger = init_logger("vllm." + __name__)
 

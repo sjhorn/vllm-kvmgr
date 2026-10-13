@@ -1234,21 +1234,31 @@ _diskio_src = open(os.path.join(REPO, "src",
                                    "kvmgr", "diskio.py")).read()
 
 
-def _layout_hash():
+def _layout_hash(src=None):
+    # *** THE FUNCTION'S OWN SOURCE, BY AST -- NOT A REGEX TO THE NEXT `def`. ***
+    # The regex version also hashed whatever module-level code FOLLOWED a
+    # layout function, so moving `geometry()` out of diskio (2026-10-13) changed
+    # the pin while all three functions stayed byte-identical: a guard failing
+    # for the wrong reason. Proven before re-pinning: this AST hash of the
+    # pre-move file and of the post-move file are equal.
+    import ast as _astP4
+
+    src = _diskio_src if src is None else src
+    defs = {n.name: n for n in _astP4.parse(src).body
+            if isinstance(n, _astP4.FunctionDef)}
     h = _hlP4.sha256()
     missing = []
     for n in diskspec.DISK_LAYOUT_FUNCTIONS:
-        m = _reP4.search(r"^def %s\(.*?(?=\n(?:def |class |@)|\Z)" % n,
-                         _diskio_src, _reP4.S | _reP4.M)
-        if not m:
+        node = defs.get(n)
+        if node is None:
             missing.append(n)
             continue
-        h.update(_normalise_p4(m.group(0)).encode())
+        h.update(_normalise_p4(_astP4.get_source_segment(src, node)).encode())
     return h.hexdigest()[:16], missing
 
 
 # *** PINNED. Bump DISK_FORMAT_VERSION and re-pin only when the LAYOUT changed.
-LAYOUT_HASH_PINNED = "b961b152f2676405"
+LAYOUT_HASH_PINNED = "a9be5f5af071c7c0"  # AST hash; equal for the pre- and post-diag-move diskio
 LAYOUT_VERSION_PINNED = 1
 
 _lh, _miss = _layout_hash()

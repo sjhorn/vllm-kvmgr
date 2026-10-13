@@ -601,16 +601,16 @@ DEFAULTS: dict[str, Any] = {
     # because a boolean said so. Same convention as METER_TAP_PORT.
     "kvmgr_stats_port": 0,
     # Relax TieringOffloadingSpec's UNCONDITIONAL single-block-size assert so a
-    # hybrid KV layout can reach the disk tier. See kvmgr/offload.py for why
+    # hybrid KV layout can reach the disk tier. See kvmgr/diag/tiering.py for why
     # that is defensible and -- more importantly -- what it does NOT prove.
     "offload_allow_hybrid": False,
     # The fs tier opens every block with O_DIRECT, which needs 512-aligned
     # lengths; our 2,103,552-byte blocks are not (mod 512 = 256), so every
-    # write failed with EINVAL. False drops the flag. See kvmgr/offload.py.
+    # write failed with EINVAL. False drops the flag. See kvmgr/diag/tiering.py.
     "offload_odirect": False,
     # Round-trip every disk write and byte-compare it. A TEST MODE: it doubles
     # store I/O. Exists because this engine's OUTPUT is not deterministic, so an
-    # output-equivalence gate proves nothing -- see kvmgr/offload.install_verify.
+    # output-equivalence gate proves nothing -- see kvmgr/diag/tiering.install_verify.
     "offload_verify": False,
     # *** DROP THE GPU PREFIX CACHE WITHOUT A REBOOT, by bumping this integer.
     # *** The point is the DISK TIER SURVIVES: block_pool.reset_prefix_cache()
@@ -639,6 +639,18 @@ DEFAULTS: dict[str, Any] = {
     # deliberate keystroke. It is a TEST lever -- no production path drops the
     # prefix cache -- so gating it costs nothing a workload needs.
     "gpu_cache_drop_allowed": False,
+    # *** THE DIAGNOSTICS, ISOLATED IN kvmgr.diag (2026-10-13). *** Each is
+    # installed at plugin load only when its knob is on, so these are boot-time
+    # knobs: the value re-reads hot, the effect needs a restart. Two are ON
+    # because they cost nothing until needed and their absence has cost us;
+    # the rest are OFF because they patch, write or reload things a production
+    # engine has no need to.
+    "diag_hang_dump": True,          # SIGUSR1 / fatal-signal stack dumps
+    "diag_transfer_ledger": True,    # index ranges per transfer; survives an async Xid
+    "diag_serializer_walk": False,   # name a numpy scalar's producer (coercion is core)
+    "diag_geometry_snapshot": False, # KV geometry JSON written at handler build
+    "diag_tiering_shims": False,     # O_DIRECT / hybrid / verify shims for upstream's tiering
+    "diag_hot_reload": False,        # /kv/reload and Worker.kvmgr_reload
 }
 
 # Knobs whose value must stay OUT of .env.dspark or the file cannot move them.

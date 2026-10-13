@@ -241,7 +241,7 @@ _child = _STUB + r"""
 import os, signal, sys
 import importlib
 R = importlib.import_module("kvmgr.register")
-R._install_hang_dump()
+importlib.import_module("kvmgr.diag.hangdump").install()
 
 def deep(n):
     if n:
@@ -270,7 +270,7 @@ import signal
 del signal.SIGUSR1           # a platform without it
 import importlib
 R = importlib.import_module("kvmgr.register")
-R._install_hang_dump()
+importlib.import_module("kvmgr.diag.hangdump").install()
 print("BOOTED", flush=True)
 """
 proc2 = subprocess.run([sys.executable, "-c", _child_bad], capture_output=True,
@@ -286,7 +286,7 @@ import os, signal, sys, importlib
 seen = []
 signal.signal(signal.SIGUSR1, lambda *a: seen.append(1))
 R = importlib.import_module("kvmgr.register")
-R._install_hang_dump()
+importlib.import_module("kvmgr.diag.hangdump").install()
 os.kill(os.getpid(), signal.SIGUSR1)
 print("CHAINED" if seen else "LOST", flush=True)
 """
@@ -429,7 +429,7 @@ print("== the producer walk: name the FIELD, not just the value ==")
 # so the only way to name the producer is to walk the object being encoded.
 import importlib as _il2
 _reg2 = _il2.import_module("kvmgr.register")
-_walk = _reg2._numpy_paths
+_walk = importlib.import_module("kvmgr.diag.serializer")._numpy_paths
 
 
 class _NpInt(int):
@@ -580,6 +580,9 @@ _s3.modules["numpy"] = _np3
 _s3.modules["vllm.v1.serial_utils"] = _su3
 try:
     reg3 = _il3.import_module("kvmgr.register")
+    # The producer scan is a DIAGNOSTIC now (kvmgr.diag.serializer); the
+    # coercion stays in core. These tests are about the scan, so install both.
+    _SER3 = _il3.import_module("kvmgr.diag.serializer")
 
     class _Clock:
         def __init__(self):
@@ -590,6 +593,7 @@ try:
 
     _clk = _Clock()
     _real_time, reg3._time = reg3._time, _clk
+    _real_time_s, _SER3._time = _SER3._time, _clk
     # info() is CAPTURED, not discarded: the arm and exhausted lines are the
     # evidence that the scan ran, and a test that threw them away could not
     # tell a clean output path from a scan that never fired.
@@ -598,8 +602,10 @@ try:
         warning=lambda *a, **k: _warned.append(a[0] % tuple(a[1:])),
         info=lambda *a, **k: _infoed.append(a[0] % tuple(a[1:])),
         exception=lambda *a, **k: _warned.append("EXCEPTION"))
+    # The scan logs from its own module now; capture both, into the same lists.
+    _real_log_s, _SER3.logger = _SER3.logger, reg3.logger
     try:
-        reg3._install_serializer_shim()
+        reg3._install_serializer_shim(); _SER3.install()
         enc3 = _Enc3()
         buf = bytearray()
 
@@ -648,7 +654,7 @@ try:
         _infoed.clear()
         _warned.clear()
         _clk2 = _Clock()
-        _real_lim, reg3._SCAN_LIMIT = reg3._SCAN_LIMIT, 3
+        _real_lim, _SER3._SCAN_LIMIT = _SER3._SCAN_LIMIT, 3
 
         class _Enc5:
             def enc_hook(self, obj):
@@ -658,9 +664,9 @@ try:
                 return b""
 
         _su3.MsgpackEncoder = _Enc5
-        reg3._time = _clk2
+        reg3._time = _SER3._time = _clk2
         try:
-            reg3._install_serializer_shim()
+            reg3._install_serializer_shim(); _SER3.install()
             enc5 = _Enc5()
             for _ in range(6):
                 _clk2.t += 6.0
@@ -672,19 +678,20 @@ try:
             eq("...and found nothing, so no PRODUCER line", 
                [w for w in _warned if "PRODUCER" in w], [])
         finally:
-            reg3._SCAN_LIMIT = _real_lim
-            reg3._time = _clk
+            _SER3._SCAN_LIMIT = _real_lim
+            reg3._time = _SER3._time = _clk
     finally:
         reg3._time, reg3.logger = _real_time, _real_log
+        _SER3._time, _SER3.logger = _real_time_s, _real_log_s
 
     # THE SPACING, verified the same way: without it a busy output thread pays
     # a walk per encode. Drive many encodes inside one spacing interval.
     _warned2 = []
     _scans = []
-    _real_walk = reg3._numpy_paths
+    _real_walk = _SER3._numpy_paths
     _real_time2, reg3._time = reg3._time, _clk
     try:
-        reg3._numpy_paths = lambda o, **k: (_scans.append(1), [])[1]
+        _SER3._numpy_paths = lambda o, **k: (_scans.append(1), [])[1]
         # A fresh shim needs a class with its OWN methods. *** SUBCLASSING
         # _Enc3 INHERITED `_kvmgr_wrapped`, so the install returned early and
         # this drove the PREVIOUS shim -- whose root already had found=True, so
@@ -696,7 +703,7 @@ try:
             def encode_into(self, obj, buf, *a, **kw):
                 return b""
         _su3.MsgpackEncoder = _Enc4
-        reg3._install_serializer_shim()
+        reg3._install_serializer_shim(); _SER3.install()
         enc4 = _Enc4()
         _clk.t += 100.0
         for n in range(40):
@@ -715,7 +722,7 @@ try:
         # could not fail. The discriminator is IDENTITY: a real re-install
         # leaves a different function object on the class.
         _before = _Enc4.encode_into
-        reg3._install_serializer_shim()
+        reg3._install_serializer_shim(); _SER3.install()
         check("*** a re-install REPLACES encode_into -- otherwise the class "
               "keeps the old closure and the shim cannot be updated without a "
               "restart, which is the whole point ***",
@@ -730,7 +737,7 @@ try:
         check("...and one encode still costs one walk", len(_scans) == 1,
               len(_scans))
     finally:
-        reg3._numpy_paths = _real_walk
+        _SER3._numpy_paths = _real_walk
         reg3._time = _real_time2
 finally:
     for _k, _v in _sv3.items():
@@ -790,12 +797,14 @@ _s5.modules["numpy"] = _np5
 _s5.modules["vllm.v1.serial_utils"] = _su5
 try:
     reg5 = _il5.import_module("kvmgr.register")
+    _SER3 = _il5.import_module("kvmgr.diag.serializer")
     _rl5, reg5.logger = reg5.logger, _t5.SimpleNamespace(
         warning=lambda *a, **k: _warn5.append(a[0] % tuple(a[1:])),
         info=lambda *a, **k: None,
         exception=lambda *a, **k: _warn5.append("EXCEPTION"))
+    _rl5s, _SER3.logger = _SER3.logger, reg5.logger
     try:
-        reg5._install_serializer_shim()
+        reg5._install_serializer_shim(); _SER3.install()
         check("the encode() path is wrapped at all -- it was not, and that is "
               "the whole defect", getattr(_Enc6.encode, "_kvmgr_wrapped", False))
         e6 = _Enc6()
@@ -825,6 +834,7 @@ try:
               any("via obj_encode" in w for w in _pp), _pp)
     finally:
         reg5.logger = _rl5
+        _SER3.logger = _rl5s
 finally:
     for _k, _v in _sv5.items():
         if _v is not None:
@@ -853,8 +863,10 @@ import os as _os4
 _REPO4 = _os4.path.dirname(_os4.path.dirname(_os4.path.abspath(__file__)))
 _reg_src = open(_os4.path.join(_REPO4, "src", "kvmgr",
                                "register.py")).read()
-_ctl_src = open(_os4.path.join(_REPO4, "src", "kvmgr",
-                               "control.py")).read()
+# The re-arm block and the reload tuple live in kvmgr.diag.reload since the
+# hot reload became an opt-in diagnostic (2026-10-13).
+_ctl_src = open(_os4.path.join(_REPO4, "src", "kvmgr", "diag",
+                               "reload.py")).read()
 
 _EXEMPT = {
     # Wraps EngineCore.step one-shot to find the offload scheduler. The wrap
@@ -919,6 +931,7 @@ _MOD_EXEMPT = {
     "__init__",
     # Subpackage markers holding only a docstring: nothing to rebind.
     "compat.__init__",
+    "diag.__init__",
 }
 # *** AND THE FIRST VERSION OF THIS CHECK COULD NOT FAIL. *** It searched the
 # WHOLE of control.py for the module name, and `"kvmgr.offload"` /

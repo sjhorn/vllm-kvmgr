@@ -1077,9 +1077,14 @@ check("...the lint can see sibling routes, so it is looking at real code",
 ct_raw = open(CT).read()
 check("...but the reason survives as a comment, rather than vanishing",
       "/kv/verify" in ct_raw and "9199" in ct_raw)
+# The TABLE itself, not a string search of whichever file holds it (it moved
+# to kvmgr.diag.reload when hot reload became an opt-in diagnostic).
+import importlib as _il9  # noqa: E402
+
+_pres9 = {(m, a) for m, a, _ in _il9.import_module("kvmgr.diag.reload")._PRESERVE}
 for g in ("_VERIFY_REQUEST", "_VERIFY_LAST", "_VERIFY_SEQ"):
     check(f"`{g}` is in _PRESERVE -- a reload between the hand-off and the "
-          f"take would lose a 202'd request", f'"{g}"' in ct_raw)
+          f"take would lose a 202'd request", ("kvmgr.diskspec", g) in _pres9)
 
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")
