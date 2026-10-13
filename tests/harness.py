@@ -24,7 +24,9 @@ import vllm_stubs
 
 # kvmgr itself, from the package's src/ -- never an installed copy.
 _SRC_FOR_IMPORT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
-if _SRC_FOR_IMPORT not in sys.path:
+# KVMGR_TEST_INSTALLED=1 tests an INSTALLED kvmgr (a wheel in a venv) instead,
+# which is how the packaging suite proves the wheel is complete.
+if os.environ.get("KVMGR_TEST_INSTALLED") != "1" and _SRC_FOR_IMPORT not in sys.path:
     sys.path.insert(0, _SRC_FOR_IMPORT)
 
 # *** EVERY PATH A SUITE OPENS COMES FROM HERE. *** The suites used to build

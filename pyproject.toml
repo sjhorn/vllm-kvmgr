@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-kvmgr"
+version = "0.2.0"
+description = "A hot-configurable KV cache manager and a disk-backed, cross-node prefix cache for vLLM"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# PROVEN ON 0.21.1rc1.dev339+g1967a5627bc3 ONLY. The window below is the
+# floor of that line and the next minor; kvmgr wraps private vLLM internals
+# (see README "What it touches"), so a version inside the window is not a
+# promise -- re-vendor tests/upstream/ from the target build and run the tests.
+# The image's own build (0.21.1rc1.dev339) satisfies this, so pip has nothing
+# to replace there; install with --no-deps anyway to be certain it never
+# re-resolves vLLM inside a tuned image.
+dependencies = ["vllm>=0.21.1rc1.dev0,<0.22"]
+
+[project.entry-points."vllm.general_plugins"]
+kvmgr = "kvmgr:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]

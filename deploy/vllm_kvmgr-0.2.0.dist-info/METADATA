@@ -1,0 +1,6 @@
+Metadata-Version: 2.1
+Name: vllm-kvmgr
+Version: 0.2.0
+Summary: A hot-configurable KV cache manager and a disk-backed, cross-node prefix cache for vLLM
+Requires-Python: >=3.10
+Requires-Dist: vllm>=0.21.1rc1.dev0,<0.22
