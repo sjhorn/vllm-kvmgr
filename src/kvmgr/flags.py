@@ -31,11 +31,11 @@ WHAT THIS ADDS over bare ``_flag()``:
 THE TRAP THIS FILE CANNOT FIX, only document: ``_flag()`` checks
 ``VLLM_<NAME>`` FIRST.  So any knob also present in ``.env.dspark`` cannot be
 moved from the file -- you would edit it, see nothing change, and get no
-indication why.  ``VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION=0.75`` is set in
-``.env.dspark`` on both nodes TODAY and must be removed from it when this
-lands, or ``protected_fraction`` is hot in name only.  ``audit_env()`` reports
-exactly that, and the manager calls it once at startup so it is in the log
-rather than in somebody's memory.
+indication why.  (``VLLM_PROTECTED_PROMPT_BLOCKS_FRACTION`` was pinned that
+way on the DSpark nodes until 2026-10-07, which made ``protected_fraction``
+hot in name only.)  ``audit_env()`` reports every env-pinned knob, and the
+manager calls it once at startup so it is in the log rather than in
+somebody's memory.
 """
 
 from __future__ import annotations
@@ -145,7 +145,7 @@ def _protected_fraction() -> float:
 DEFAULTS: dict[str, Any] = {
     # ours
     "kvmgr_enabled": False,       # our policy vs upstream's, per call (see manager)
-    "protected_fraction": 0.30,   # patch6's own default; .env.dspark pins 0.75 today
+    "protected_fraction": 0.30,   # patch6's own default; the DSpark file sets 0.75
     "protect_alloc": "equal",     # equal (today's /num_managers) | by_need
     "evict_order": "fifo",        # fifo (today) | lru | lru_tail_first
     "disk_enabled": False,
@@ -695,12 +695,11 @@ BLOCKED: dict[str, str] = {
     # offload consolidating every rank's shard into ONE SHARED HOST region,
     # which is single-host TP by construction while ours is one rank per node.
     "disk_enabled": (
-        "superseded. The write path works and is being replaced rather than "
-        "unblocked: kvmgr/diskspec.py puts the disk transfer WORKER-SIDE so "
-        "each rank persists its own slice. Until that spec is the live one, "
-        "this knob toggles nothing, because what writes today is upstream's "
-        "tiering tier via KV_TRANSFER_CONFIG and not a flag. "
-        "See kvmgr/diskspec.py and docs/history/KVMGR-PHASE45-20261007.md"
+        "superseded, and it governs nothing. The disk tier is switched on by "
+        "KV_TRANSFER_CONFIG naming spec_name DSparkDiskOffloadingSpec (or its "
+        "alias KvmgrDiskOffloadingSpec); its write path is paused with "
+        "disk_store_paused and its read path gated by disk_restore. "
+        "See kvmgr/diskspec.py and the package README"
     ),
     # *** disk_budget_gb IS OUT OF HERE: Phase 5 built it. *** The old reason
     # said "nothing we control writes to disk yet", which stopped being true

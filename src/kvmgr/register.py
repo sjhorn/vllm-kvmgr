@@ -27,7 +27,6 @@ every group's block size, and a single manager only knows its own.
 
 from __future__ import annotations
 
-import time as _time
 
 from vllm.logger import init_logger
 
@@ -118,17 +117,18 @@ def register() -> None:
     try:
         from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 
-        from kvmgr.diskspec import DSPARK_SPEC_NAME
-        OffloadingSpecFactory.register_spec(
-            DSPARK_SPEC_NAME, "kvmgr.diskspec",
-            DSPARK_SPEC_NAME,
-        )
+        from kvmgr.diskspec import DSPARK_SPEC_NAME, SPEC_NAMES
+        for _name in SPEC_NAMES:
+            try:
+                # Every name resolves to the ONE class.
+                OffloadingSpecFactory.register_spec(
+                    _name, "kvmgr.diskspec", DSPARK_SPEC_NAME)
+            except ValueError:
+                pass  # already registered: register() ran twice in one process
         logger.info(
-            "kvmgr: registered DSparkDiskOffloadingSpec (inert until "
-            "KV_TRANSFER_CONFIG names it as spec_name)"
-        )
-    except ValueError:
-        pass          # already registered: register() ran twice in one process
+            "kvmgr: registered the disk offloading spec as %s (inert until "
+            "KV_TRANSFER_CONFIG names one of them as spec_name)",
+            " / ".join(SPEC_NAMES))
     except Exception:
         # A missing kv_offload is not a reason to lose the KV manager, which is
         # what this plugin is actually for.

@@ -381,17 +381,17 @@ def _disk_spec_is_live() -> bool:
     try:
         import json
         import os
-        from kvmgr.diskspec import DSPARK_SPEC_NAME
+        from kvmgr.diskspec import SPEC_NAMES
     except Exception:
         return False
     raw = os.environ.get("KV_TRANSFER_CONFIG") or ""
     if not raw:
         return False
     try:
-        cfg = json.loads(raw)
+        text = json.dumps(json.loads(raw))
     except Exception:
-        return DSPARK_SPEC_NAME in raw
-    return DSPARK_SPEC_NAME in json.dumps(cfg)
+        text = raw
+    return any(n in text for n in SPEC_NAMES)
 
 def prometheus() -> str:
     """Prometheus text format.

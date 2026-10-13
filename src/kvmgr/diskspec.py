@@ -49,7 +49,7 @@ from vllm.v1.kv_offload.file_mapper import FileMapper
 from . import flags
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Iterable, Iterator
+    from collections.abc import Collection, Iterable, Iterator, Sequence
 
     from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadKey, ReqContext
     from vllm.v1.kv_offload.worker.worker import OffloadingHandler
@@ -224,6 +224,13 @@ def model_content_id(d: "str | None", _hash=None) -> str:
 # register.py registers with. A constant rather than two string
 # literals, because the store path is silently inert if they disagree.
 DSPARK_SPEC_NAME = "DSparkDiskOffloadingSpec"
+# *** THE CLASS NAME IS FROZEN; THE ALIAS IS FOR EVERYBODY ELSE. *** Renaming
+# would not orphan data by itself (the root `dspark-kv-v1` is what sits in the
+# fingerprint path, and is frozen for that reason), but every deployed
+# KV_TRANSFER_CONFIG names the class. So the generic name is registered BESIDE
+# it and resolves to the same class: either spelling selects the same tier.
+GENERIC_SPEC_NAME = "KvmgrDiskOffloadingSpec"
+SPEC_NAMES = (DSPARK_SPEC_NAME, GENERIC_SPEC_NAME)
 
 # The live manager, for the /kv endpoint. None until the connector builds one,
 # which only happens in the process that holds the scheduler -- the same one
@@ -1805,9 +1812,6 @@ class DiskPresenceManager(OffloadingManager):
         return base
 
     def flush_manifest(self, force: bool = False) -> None:
-        import json
-        import os as _os
-
         if not self._manifest:
             return
         # *** A COUNT THRESHOLD ALONE LOSES EVERY SHORT SESSION. *** Measured

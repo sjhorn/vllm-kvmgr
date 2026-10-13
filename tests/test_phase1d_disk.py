@@ -592,7 +592,6 @@ try:
             return self.t
 
     _clk = _Clock()
-    _real_time, reg3._time = reg3._time, _clk
     _real_time_s, _SER3._time = _SER3._time, _clk
     # info() is CAPTURED, not discarded: the arm and exhausted lines are the
     # evidence that the scan ran, and a test that threw them away could not
@@ -664,7 +663,7 @@ try:
                 return b""
 
         _su3.MsgpackEncoder = _Enc5
-        reg3._time = _SER3._time = _clk2
+        _SER3._time = _clk2
         try:
             reg3._install_serializer_shim(); _SER3.install()
             enc5 = _Enc5()
@@ -679,9 +678,9 @@ try:
                [w for w in _warned if "PRODUCER" in w], [])
         finally:
             _SER3._SCAN_LIMIT = _real_lim
-            reg3._time = _SER3._time = _clk
+            _SER3._time = _clk
     finally:
-        reg3._time, reg3.logger = _real_time, _real_log
+        reg3.logger = _real_log
         _SER3._time, _SER3.logger = _real_time_s, _real_log_s
 
     # THE SPACING, verified the same way: without it a busy output thread pays
@@ -689,7 +688,7 @@ try:
     _warned2 = []
     _scans = []
     _real_walk = _SER3._numpy_paths
-    _real_time2, reg3._time = reg3._time, _clk
+    _real_time2, _SER3._time = _SER3._time, _clk
     try:
         _SER3._numpy_paths = lambda o, **k: (_scans.append(1), [])[1]
         # A fresh shim needs a class with its OWN methods. *** SUBCLASSING
@@ -738,7 +737,7 @@ try:
               len(_scans))
     finally:
         _SER3._numpy_paths = _real_walk
-        reg3._time = _real_time2
+        _SER3._time = _real_time2
 finally:
     for _k, _v in _sv3.items():
         if _v is not None:

@@ -191,6 +191,40 @@ else:
     fork.install()
     flags.clear_override()
 
+# ---------------------------------------------------------------------------
+print("\n== (6) BOTH modes: the frozen spec name and its generic alias ==")
+harness.load_kv_offload()
+from vllm.v1.kv_offload.factory import OffloadingSpecFactory  # noqa: E402
+
+from kvmgr import diskspec, stats  # noqa: E402
+
+# register() returns early once our manager is in the map (it is, from (2)),
+# so start from the stock map -- what a fresh process with kv_offload sees.
+stm.spec_manager_map[iface.MLAAttentionSpec] = stm.MLAAttentionManager
+register._REGISTERED = False
+register.register()
+_reg_specs = OffloadingSpecFactory._registry
+check("the frozen name is registered", "DSparkDiskOffloadingSpec" in _reg_specs)
+check("the generic alias is registered", "KvmgrDiskOffloadingSpec" in _reg_specs)
+if all(n in _reg_specs for n in diskspec.SPEC_NAMES):
+    check("*** both resolve to the SAME class ***",
+          _reg_specs["KvmgrDiskOffloadingSpec"]() is
+          _reg_specs["DSparkDiskOffloadingSpec"]() is diskspec.DSparkDiskOffloadingSpec)
+_saved_ktc = os.environ.get("KV_TRANSFER_CONFIG")
+for _n in diskspec.SPEC_NAMES:
+    os.environ["KV_TRANSFER_CONFIG"] = (
+        '{"kv_connector":"OffloadingConnector","kv_connector_extra_config":'
+        '{"spec_name":"%s"}}' % _n)
+    check(f"/kv reports the tier configured when spec_name is {_n}",
+          stats._disk_spec_is_live() is True)
+os.environ["KV_TRANSFER_CONFIG"] = (
+    '{"kv_connector":"OffloadingConnector","kv_connector_extra_config":'
+    '{"spec_name":"CPUOffloadingSpec"}}')
+check("...and NOT for somebody else's spec", stats._disk_spec_is_live() is False)
+os.environ.pop("KV_TRANSFER_CONFIG", None)
+if _saved_ktc is not None:
+    os.environ["KV_TRANSFER_CONFIG"] = _saved_ktc
+
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print("  FAILED:", f)

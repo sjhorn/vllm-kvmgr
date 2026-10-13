@@ -56,7 +56,6 @@ own, and the answer comes back per rank -- which the file can never give.
 
 from __future__ import annotations
 
-import importlib
 from typing import Any
 
 from vllm.logger import init_logger
