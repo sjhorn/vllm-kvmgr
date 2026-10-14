@@ -9,6 +9,7 @@ never the other way round, so switching one off cannot change behaviour.
 |--------------|-------------------------|---------|-----------------------------------------|
 | hangdump     | diag_hang_dump          | on      | zero cost; a hang with it absent cost two wedges |
 | ledger       | diag_transfer_ledger    | on      | a few integers per transfer; the only thing an async Xid leaves |
+|  (file)      | diag_ledger_file        | on      | write-ahead line per GPU transfer + overlap check; hot |
 | serializer   | diag_serializer_walk    | off     | names the producer of a numpy scalar; the COERCION is core |
 | geometry     | diag_geometry_snapshot  | off     | writes the KV tensor geometry to a JSON file at handler build |
 | tiering      | diag_tiering_shims      | off     | shims for upstream's TieringOffloadingSpec, which our spec does not use |

@@ -1375,6 +1375,15 @@ class DiskStoreHandler:
         diagnostic is installed (kvmgr.diag.ledger, ON by default)."""
         hooks.call("ledger_note", self, kind, group, bids, slots)
 
+    def _ledger_submit(self, kind: str, inner: int, job, group: int, bids,
+                       slots) -> None:
+        """Write-ahead: called BEFORE transfer_async, so the transfer an Xid
+        kills is already on disk. A no-op unless kvmgr.diag.ledger is on."""
+        hooks.call("ledger_submit", self, kind, inner, job, group, bids, slots)
+
+    def _ledger_done(self, kind: str, inner: int, ok: bool) -> None:
+        hooks.call("ledger_done", self, kind, inner, ok)
+
     def _apply_deletes(self, spec) -> None:
         """Unlink files the scheduler evicted. THIS rank's copies only.
 
@@ -1625,6 +1634,7 @@ class DiskStoreHandler:
                     gs[g] = len(_sb)
 
                 self._ledger_note("store", g, _sb, _ss)
+                self._ledger_submit("store", inner, job_id, g, _sb, _ss)
                 try:
                     ok = self._inner.transfer_async(
                         inner,
@@ -1635,6 +1645,7 @@ class DiskStoreHandler:
                     logger.exception("kvmgr: inner GPU->staging submit raised")
                     ok = False
                 if not ok:
+                    self._ledger_done("store", inner, False)
                     self._pool.give(_ss)
                     st["failed"] = True
                     return
@@ -1715,6 +1726,7 @@ class DiskStoreHandler:
             ent = self._inner_to_job.pop(res.job_id, None)
             if ent is None:
                 continue
+            self._ledger_done("store", res.job_id, res.success)
             job_id, bkeys, slots, g = ent
             st = self._jobs.get(job_id)
             if st is None:
@@ -2137,6 +2149,15 @@ class DiskLoadHandler:
         diagnostic is installed (kvmgr.diag.ledger, ON by default)."""
         hooks.call("ledger_note", self, kind, group, bids, slots)
 
+    def _ledger_submit(self, kind: str, inner: int, job, group: int, bids,
+                       slots) -> None:
+        """Write-ahead: called BEFORE transfer_async, so the transfer an Xid
+        kills is already on disk. A no-op unless kvmgr.diag.ledger is on."""
+        hooks.call("ledger_submit", self, kind, inner, job, group, bids, slots)
+
+    def _ledger_done(self, kind: str, inner: int, ok: bool) -> None:
+        hooks.call("ledger_done", self, kind, inner, ok)
+
     def transfer_async(self, job_id: int, spec) -> bool:
         from vllm.v1.kv_offload.base import get_offload_group_idx
 
@@ -2314,11 +2335,13 @@ class DiskLoadHandler:
                     st["pending"] -= 1
                 continue
             self._ledger_note("load", g, bids, slots)
+            self._ledger_submit("load", inner, job_id, g, bids, slots)
             ok = self._inner.transfer_async(
                 inner, (CPULoadStoreSpec(slots),
                         GPULoadStoreSpec(bids, group_sizes=gs,
                                          block_indices=[0] * ngroups)))
             if not ok:
+                self._ledger_done("load", inner, False)
                 self._pool.give(slots)
                 if st is not None:
                     st["failed"] = True
@@ -2331,6 +2354,7 @@ class DiskLoadHandler:
             ent = self._inner_to_job.pop(res.job_id, None)
             if ent is None:
                 continue
+            self._ledger_done("load", res.job_id, res.success)
             job_id, slots = ent
             self._pool.give(slots)
             st = self._jobs.get(job_id)

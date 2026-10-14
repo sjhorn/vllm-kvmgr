@@ -36,7 +36,7 @@ for mode in $MODES; do
            test_phase3.py test_phase4.py test_phase6.py \
            test_phase7_dropguard.py test_phase8_journal.py \
            test_phase9_verify.py test_phase10_standalone.py test_phase11_diag.py \
-           test_phase12_packaging.py; do
+           test_phase12_packaging.py test_phase13_ledger.py; do
     out=$("$PY" "$f" 2>&1); rc=$?
     skips=$(printf '%s\n' "$out" | grep -c '^SKIP ')
     if [ "$rc" = "0" ]; then

@@ -45,10 +45,10 @@ A conversational prefix comes back at 98.7% after the GPU cache is dropped.
 
 Into a vLLM image:
 
-    pip install --no-deps vllm_kvmgr-0.2.0-py3-none-any.whl
+    pip install --no-deps vllm_kvmgr-0.3.0-py3-none-any.whl
 
 The DSpark recipe instead bind-mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.2.0.dist-info` into site-packages. The dist-info is
+`deploy/vllm_kvmgr-0.3.0.dist-info` into site-packages. The dist-info is
 **generated** (`python3 deploy/gen-dist-info.py`; `--check` fails when it is
 stale) because the entry point vLLM looks for lives in it.
 
@@ -173,12 +173,22 @@ when deciding how far to trust the rest.
 |---|---|---|
 | hang dump: `faulthandler` on fatal signals plus `kill -USR1` for a live process | `diag_hang_dump` | **on** |
 | transfer ledger: index ranges per transfer, logged on a fault | `diag_transfer_ledger` | **on** |
+| ...its write-ahead file `<tier parent>/diag/ledger-r<rank>.jsonl` (one line per GPU transfer before submit, one on completion) and the live `LEDGER OVERLAP` check; **hot** | `diag_ledger_file` | **on** |
 | numpy-scalar producer walk (the `.item()` **coercion** itself is core) | `diag_serializer_walk` | off |
 | KV geometry snapshot file | `diag_geometry_snapshot` | off |
 | shims for upstream's tiering spec (O_DIRECT, hybrid block sizes, verify) | `diag_tiering_shims` | off |
 | hot reload of kvmgr in a running engine, and `/kv/reload` | `diag_hot_reload` | off |
 
-These are installed at plugin load, so they are boot-time knobs. No functional
+These are installed at plugin load, so they are boot-time knobs (except
+`diag_ledger_file`, read per transfer once the ledger is installed).
+
+**Reading the write-ahead ledger after a fault.** The entries with a `submit`
+and no `done` for the dead process's `pid` are what the GPU had been handed and
+had not been seen to finish; line their `ts` up against `journalctl -k`'s Xid.
+`kvmgr.diag.ledger.open_entries()` does the matching. An entry's span is submit
+to OBSERVED completion (polled once per scheduler step), a superset of the GPU's
+own, so an `overlap` field means the bookkeeping held a block in two transfers
+at once -- necessary for the suspected race, not proof of it. No functional
 module imports `kvmgr.diag`; a test lint enforces that, and another proves that
 with every knob off no diag module is imported at all.
 

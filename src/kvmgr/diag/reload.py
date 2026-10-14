@@ -112,6 +112,14 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     # `_VERIFY_LAST`, so a caller polling for its own request could match
     # somebody else's receipt.
     ("kvmgr.diskspec", "_VERIFY_SEQ", "the request sequence, so a seq is unique"),
+    # The write-ahead ledger (v0.3.0). The in-flight set must survive: a reload
+    # emptying it would make the next overlap invisible and leave its `done`
+    # lines with no submit to close. _WAL holds the open descriptor, and a
+    # fresh one would leak the old. _LOCK with them, for serve._lock's reason.
+    ("kvmgr.diag.ledger", "_INFLIGHT", "GPU transfers in flight, per rank"),
+    ("kvmgr.diag.ledger", "_STATS", "overlap and write-ahead counters"),
+    ("kvmgr.diag.ledger", "_WAL", "the write-ahead file's descriptor and size"),
+    ("kvmgr.diag.ledger", "_LOCK", "the lock guarding the three above"),
 )
 
 

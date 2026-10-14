@@ -164,7 +164,8 @@ _def = _run({})
 eq("defaults: exactly the hang dump and the ledger are imported",
    _def.get("diag"), ["kvmgr.diag", "kvmgr.diag.hangdump", "kvmgr.diag.ledger"])
 eq("...and only the ledger's hooks are registered (the hang dump needs none)",
-   _def.get("hooks"), ["ledger_dump", "ledger_note", "ledger_snapshot"])
+   _def.get("hooks"), ["ledger_done", "ledger_dump", "ledger_note",
+                       "ledger_snapshot", "ledger_submit"])
 
 # ---------------------------------------------------------------------------
 print("\n== (4) off means inert, and says so ==")

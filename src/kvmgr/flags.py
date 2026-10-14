@@ -647,6 +647,11 @@ DEFAULTS: dict[str, Any] = {
     # engine has no need to.
     "diag_hang_dump": True,          # SIGUSR1 / fatal-signal stack dumps
     "diag_transfer_ledger": True,    # index ranges per transfer; survives an async Xid
+    # The ledger's WRITE-AHEAD FILE, <tier parent>/diag/ledger-r<rank>.jsonl:
+    # one line per GPU transfer before it is submitted, one on completion. Hot
+    # (read per transfer); needs diag_transfer_ledger, which installs the hook.
+    # On because the 2026-10-14 Xid could not be attributed without it.
+    "diag_ledger_file": True,
     "diag_serializer_walk": False,   # name a numpy scalar's producer (coercion is core)
     "diag_geometry_snapshot": False, # KV geometry JSON written at handler build
     "diag_tiering_shims": False,     # O_DIRECT / hybrid / verify shims for upstream's tiering

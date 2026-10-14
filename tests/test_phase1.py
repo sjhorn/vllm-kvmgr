@@ -366,6 +366,7 @@ PROBE = {
     # the same caveat kvmgr_control_plane carries above.
     "diag_hang_dump": (0, 1),
     "diag_transfer_ledger": (0, 1),
+    "diag_ledger_file": (0, 1),
     "diag_serializer_walk": (0, 1),
     "diag_geometry_snapshot": (0, 1),
     "diag_tiering_shims": (0, 1),
