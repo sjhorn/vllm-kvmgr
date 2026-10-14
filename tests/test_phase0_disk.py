@@ -1,7 +1,7 @@
 """test_phase0_disk.py -- PIN THE CONTRACT our own disk OffloadingSpec will
 implement, before a line of it is written.
 
-    python3.12 packages/vllm-kvmgr/tests/test_phase0_disk.py
+    python3.12 tests/test_phase0_disk.py
 
 WHY THIS FILE EXISTS. Upstream's tiering offload cannot capture half of this
 cluster's KV: it consolidates every rank's shard into ONE SHARED HOST memory

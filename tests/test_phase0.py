@@ -1,7 +1,7 @@
 """test_phase0.py -- the facts the KV-manager plan rests on, asserted against
 the REAL patched engine code, with no GPU and no cluster.
 
-Run:  python3.12 packages/vllm-kvmgr/tests/test_phase0.py
+Run:  python3.12 tests/test_phase0.py
 
 Every assertion here is a claim the plan makes.  If one fails, the plan is
 wrong -- which is the point: the numbers in the plan were backed out of log

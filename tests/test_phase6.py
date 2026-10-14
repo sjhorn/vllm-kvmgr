@@ -1,6 +1,6 @@
 """test_phase6.py -- the HTTP control plane's foundation: the in-memory override.
 
-    python3.12 packages/vllm-kvmgr/tests/test_phase6.py
+    python3.12 tests/test_phase6.py
 
 *** THE CONSTRAINT THIS FILE ENFORCES: a hot knob must not DEPEND on disk or
 container injection. *** Every knob today is reached through

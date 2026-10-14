@@ -1,6 +1,6 @@
 """test_phase1.py -- our manager is behaviour-identical, and every knob is HOT.
 
-    python3.12 packages/vllm-kvmgr/tests/test_phase1.py
+    python3.12 tests/test_phase1.py
 
 Two jobs, and the second is the one that catches the failure this work is most
 likely to ship:

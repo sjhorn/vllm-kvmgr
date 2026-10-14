@@ -19,7 +19,7 @@ committed a red suite.
 | mode | loads | proves |
 |---|---|---|
 | `pristine` (default) | `upstream/` only: the vLLM sources of the build kvmgr is proven on (`upstream/MANIFEST.txt`) | kvmgr works on a vLLM with **no patch of ours**. The harness asserts that no patch6 symbol is reachable |
-| `--with-dspark-patches` | the DSpark recipe's `patch6/7/8` over the same sources, from `KVMGR_DSPARK_REPO` (default: the repo this package sits in) | what the box runs, including the fork bridge (`kvmgr.compat.dspark`) |
+| `--with-dspark-patches` | the DSpark recipe's `patch6/7/8` over the same sources, from `KVMGR_DSPARK_REPO` (default: a DSpark checkout beside this repo) | what the box runs, including the fork bridge (`kvmgr.compat.dspark`) |
 
 Sections that assert facts *about patch6* run only in the second mode. In the
 first mode they print `SKIP [pristine mode] …`, and `run-all.sh` counts those

@@ -1,6 +1,6 @@
 """test_phase1d_disk.py -- the on-disk FINGERPRINT, and the fork that killed restore.
 
-    python3.12 packages/vllm-kvmgr/tests/test_phase1d_disk.py
+    python3.12 tests/test_phase1d_disk.py
 
 *** THE BUG THIS FILE EXISTS FOR. *** Measured live 2026-10-07: the worker wrote
 943 files per rank under `..._06be92914bd2_r0` while the engine core's manifest

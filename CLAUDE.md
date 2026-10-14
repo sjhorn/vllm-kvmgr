@@ -6,15 +6,17 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
 
 ## Where it lives
 
-- **This repo is the source of truth.** Releases are tags (`v0.2.0` …), each
+- Releases are tags (`v0.2.0` …), each
   naming the vLLM build it is proven on (`pyproject.toml` states the window).
-- The DSpark recipe repo (`~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark`)
-  carries a **squashed subtree copy** at `packages/vllm-kvmgr/`, which is what
-  the cluster runs. **Never edit that copy.**
-- Release: tests green → tag here → in DSpark
-  `git subtree pull --prefix=packages/vllm-kvmgr ~/dev/python/vllm-kvmgr <tag> --squash`
-  → deploy from DSpark. Deploying and restarting follow **DSpark's `CLAUDE.md`**,
-  including asking before every restart.
+- **It is the only copy.** The DSpark recipe repo
+  (`~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark`) no
+  longer holds one: its compose mounts `../vllm-kvmgr` on each node.
+- Deploy: tests green → tag → `git push head main && git push worker main`
+  (both nodes, `/home/shorn/vllm-kvmgr`). DSpark's start script refuses to
+  start unless both nodes are at the same commit. A push does not reach a
+  running engine, so it takes effect at the next restart. Deploying and
+  restarting otherwise follow **DSpark's `CLAUDE.md`**, including asking before
+  every restart.
 
 ## Layout
 

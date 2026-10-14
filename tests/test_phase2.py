@@ -1,6 +1,6 @@
 """test_phase2.py -- the counters say what happened, and WHY the victim went.
 
-    python3.12 packages/vllm-kvmgr/tests/test_phase2.py
+    python3.12 tests/test_phase2.py
 
 Today eviction is only INFERRED, after the fact, from engine_cached_tokens on
 the proxy side. These are the assertions that it is now observed:

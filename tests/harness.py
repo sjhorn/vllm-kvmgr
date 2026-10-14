@@ -33,7 +33,7 @@ if os.environ.get("KVMGR_TEST_INSTALLED") != "1" and _SRC_FOR_IMPORT not in sys.
 # their own from `REPO`, five different spellings of it, and one of them read
 # sources through a helper that SKIPPED a missing file -- so the move into
 # packages/ would have left a knob audit auditing an empty string, green.
-PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # packages/vllm-kvmgr
+PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the repo root
 SRC = os.path.join(PKG, "src")
 KVMGR_DIR = os.path.join(SRC, "kvmgr")
 # The vLLM sources the tests load, vendored from the image kvmgr is proven on.
@@ -41,9 +41,10 @@ UPSTREAM = os.path.join(PKG, "tests", "upstream")
 PRISTINE = UPSTREAM  # the old name, kept because the suites use it
 
 # The DSpark fork's patch overlays, needed only for --with-dspark-patches.
-# Located by env, else by this package's place inside the DSpark repo.
-DSPARK_REPO = os.environ.get("KVMGR_DSPARK_REPO") or os.path.dirname(
-    os.path.dirname(PKG))
+# Located by KVMGR_DSPARK_REPO, else a DSpark checkout beside this repo (the
+# layout on the nodes).
+DSPARK_REPO = os.environ.get("KVMGR_DSPARK_REPO") or os.path.join(
+    os.path.dirname(PKG), "DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark")
 PATCHES = os.path.join(DSPARK_REPO, "patches")
 REPO = DSPARK_REPO  # the old name, for the few checks that read the compose
 

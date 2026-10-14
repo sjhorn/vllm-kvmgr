@@ -1,6 +1,6 @@
 """test_phase1b_disk.py -- the pure core of the disk write path.
 
-    python3.12 packages/vllm-kvmgr/tests/test_phase1b_disk.py
+    python3.12 tests/test_phase1b_disk.py
 
 Everything here runs with no torch and no GPU, because everything here is where
 a SILENT KV corruption would live: which bytes go in which file, which staging

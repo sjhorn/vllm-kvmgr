@@ -1,6 +1,6 @@
 """test_phase1_disk.py -- the scheduler-side half of our disk spec.
 
-    python3.12 packages/vllm-kvmgr/tests/test_phase1_disk.py
+    python3.12 tests/test_phase1_disk.py
 
 Phase 1a is the SPEC, the MANAGER and the path arithmetic -- everything that
 decides *what* gets written and *where*. The transfer itself (Phase 1b) is the

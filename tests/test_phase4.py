@@ -1,7 +1,7 @@
 """test_phase4.py -- the hybrid-offload shim, exercised against a stub that
 asserts exactly what the real TieringOffloadingSpec asserts.
 
-    python3.12 packages/vllm-kvmgr/tests/test_phase4.py
+    python3.12 tests/test_phase4.py
 
 The real offload machinery needs CUDA, so the stub reproduces the ONE line that
 blocks us (`assert len(self.gpu_block_size) == 1`) plus the two fields the shim
