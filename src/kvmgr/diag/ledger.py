@@ -53,6 +53,7 @@ what both ranks share is the destination blocks and the lockstep forward pass.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -508,6 +509,80 @@ def dest_context(job, group: int, bids) -> dict:
     return out
 
 
+def bids_sha(bset) -> str:
+    """The set's identity as the vllm-proxy session writes it: sha1 of the
+    ledger's `bids` ranges, JSON with default separators, 12 hex. Pure."""
+    return hashlib.sha1(json.dumps(ranges(bset)).encode()).hexdigest()[:12]
+
+
+_TENSOR_HASH: dict = {}
+
+
+def tensor_context(h, group: int) -> dict:
+    """Which tensors this group's refs touch. Cached per (handler, group).
+
+    `ref_dup_tensors` counts refs that share a tensor with another ref of the
+    group: 0.21's copy writes each ref's page from the START of the row, so
+    two refs on one tensor write the same destination range in one copy."""
+    key = (id(h), int(group))
+    got = _TENSOR_HASH.get(key)
+    if got is not None:
+        return got
+    try:
+        tidx = [int(r.tensor_idx) for r in h._refs[group]]
+        uniq = sorted(set(tidx))
+        got = {"tensor_idx_set_hash": hashlib.sha1(
+                   json.dumps(uniq).encode()).hexdigest()[:12],
+               "ref_tensors": len(uniq),
+               "ref_dup_tensors": len(tidx) - len(uniq)}
+    except Exception as e:
+        got = {"tensor_idx_set_hash": None,
+               "tensor_idx_set_why": ("refs unreadable: %r" % (e,))[:160]}
+    _TENSOR_HASH[key] = got
+    return got
+
+
+def stream_context(h) -> dict:
+    """The compute stream at submit, and the copy stream upstream will pop.
+
+    Read just BEFORE the submit, after `_arm_compute_wait`, so with
+    load_wait_compute on the top of `_stream_pool` IS the copy's stream. Raw
+    CUDA handles as ints; null with a reason when unreadable."""
+    out: dict = {}
+    try:
+        import torch
+        out["compute_stream"] = int(torch.cuda.current_stream().cuda_stream)
+    except Exception as e:
+        out["compute_stream"] = None
+        out["compute_stream_why"] = ("unreadable: %r" % (e,))[:160]
+    try:
+        pool = h._inner._stream_pool
+        if pool:
+            out["copy_stream"] = int(pool[-1].cuda_stream)
+        else:
+            out["copy_stream"] = None
+            out["copy_stream_why"] = "pool empty: upstream creates a new stream"
+    except Exception as e:
+        out["copy_stream"] = None
+        out["copy_stream_why"] = ("unreadable: %r" % (e,))[:160]
+    return out
+
+
+def dest_shape(h, group: int, bset) -> dict:
+    """ask3 D: cheap context on every load submit. Plain ints and strings."""
+    out: dict = {}
+    if bset:
+        out["dst_span"] = int(max(bset) - min(bset))
+        out["dst_contig_runs"] = len(ranges(bset))
+        out["bids_sha"] = bids_sha(bset)
+    else:
+        out["dst_span"] = out["dst_contig_runs"] = None
+        out["dst_span_why"] = "no blocks"
+    out.update(tensor_context(h, group))
+    out.update(stream_context(h))
+    return out
+
+
 def _wal_write(h, line: str) -> None:
     """Append under _LOCK. Never raises; a failure is counted and said once."""
     try:
@@ -574,6 +649,8 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
         bound = _load_bound() if kind == "load" else None
         # Outside the lock: it walks the stack and reads the block table.
         ctx = dest_context(job, group, bset) if kind == "load" else {}
+        if kind == "load":
+            ctx.update(dest_shape(h, group, bset))
         canary = False
         with _LOCK:
             gpu_loads = sum(1 for k, _ in _INFLIGHT if k == "load")

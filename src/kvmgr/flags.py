@@ -673,6 +673,15 @@ DEFAULTS: dict[str, Any] = {
     # (read per transfer); needs diag_transfer_ledger, which installs the hook.
     # On because the 2026-10-14 Xid could not be attributed without it.
     "diag_ledger_file": True,
+    # Asks whether an in-flight copy has finished ON THE GPU (event query from
+    # the watchdog thread, which keeps running when the main loop blocks), and
+    # dumps a stuck or failed copy's real addresses. Read-only; never touches a
+    # transfer. On for the same reason as the ledger: every 2026-10-14 incident
+    # was a load nobody could see inside.
+    "diag_copy_probe": True,
+    # Boot-time replay of known-bad load destinations on an idle GPU, before
+    # the engine serves. Writes into FREE KV blocks; bounded; off by default.
+    "diag_copy_selftest": False,
     "diag_serializer_walk": False,   # name a numpy scalar's producer (coercion is core)
     "diag_geometry_snapshot": False, # KV geometry JSON written at handler build
     "diag_tiering_shims": False,     # O_DIRECT / hybrid / verify shims for upstream's tiering

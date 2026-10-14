@@ -146,6 +146,8 @@ def register() -> None:
 _DIAGNOSTICS = (
     ("hangdump", "diag_hang_dump"),
     ("ledger", "diag_transfer_ledger"),
+    ("copyprobe", "diag_copy_probe"),
+    ("selftest", "diag_copy_selftest"),
     ("serializer", "diag_serializer_walk"),
     ("geometry", "diag_geometry_snapshot"),
     ("tiering", "diag_tiering_shims"),

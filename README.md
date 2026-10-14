@@ -64,11 +64,11 @@ from disk.
 Into a vLLM image:
 
 ```sh
-pip install --no-deps vllm_kvmgr-0.4.1-py3-none-any.whl
+pip install --no-deps vllm_kvmgr-0.4.2-py3-none-any.whl
 ```
 
 The DSpark recipe does not pip install. It mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.4.1.dist-info` into site-packages instead. vLLM finds the
+`deploy/vllm_kvmgr-0.4.2.dist-info` into site-packages instead. vLLM finds the
 plugin through the entry point in that dist-info folder. The folder is made by
 a script:
 
@@ -291,6 +291,8 @@ Optional tools for finding problems. Each one has a knob:
 |---|---|---|
 | hang dump: a stack trace on a crash, or on `kill -USR1` | `diag_hang_dump` | **on** |
 | transfer ledger: which blocks each transfer used, logged on a fault | `diag_transfer_ledger` | **on** |
+| copy probe: is a stuck copy finished on the GPU, and its addresses | `diag_copy_probe` | **on** |
+| boot self-test: replay given load copies on an idle GPU | `diag_copy_selftest` | off |
 | the ledger file (below), and the `LEDGER OVERLAP` check. Can be changed while running | `diag_ledger_file` | **on** |
 | find where numpy numbers leak into vLLM's messages | `diag_serializer_walk` | off |
 | write a file with the KV cache layout | `diag_geometry_snapshot` | off |
@@ -331,11 +333,58 @@ Useful fields on a `submit` line:
 | `overlap` | another transfer was using some of the same GPU blocks |
 | `in_step` | (loads) how many of the target blocks the current batch is using. `null` means it could not be read, which is not the same as 0 |
 | `req`, `req_in_step` | (loads) the request this load is for, and whether it is in the current batch |
+| `wait_compute` | (loads) whether the copy waited for queued compute work (`load_wait_compute`). `null` means it could not be set up |
+| `dst_span`, `dst_contig_runs` | (loads) highest minus lowest target block id, and how many unbroken runs they form |
+| `bids_sha` | (loads) a short id for the exact block set (sha1 of the `bids` ranges, 12 hex), to match the same copy across ranks |
+| `tensor_idx_set_hash`, `ref_tensors`, `ref_dup_tensors` | (loads) which KV tensors the group's layers use, and how many layers share a tensor with another |
+| `compute_stream`, `copy_stream` | (loads) the CUDA stream handles at submit. `null` with a `_why` if unreadable |
 
 A `done` line is written when the plugin *notices* the transfer finished,
 which can be up to one scheduler step late. So `overlap` means "the plugin
 counted these blocks in two transfers at the same time". That is needed for
 the suspected bug, but it does not prove it.
+
+### When a copy gets stuck
+
+`diag_copy_probe` (on by default) watches every copy that is still open. It
+runs on the watchdog thread, which keeps going when the worker's main loop is
+blocked, and asks the GPU through the copy's own end event (a check that never
+blocks). If a copy is open for more than 30 s, or the watchdog says the store
+path has stalled, it:
+
+- logs `COPY PROBE ... copy_done_on_gpu=...` once. `False` means the GPU has
+  not finished the copy. `True` means the GPU finished it but the worker never
+  noticed. `null` means the GPU could not be asked, and gives the reason;
+- writes an `ev:"stuck"` line to the ledger;
+- writes `<tier parent>/diag/copydump-r<rank>-<kind>-<inner>.json`. This has
+  every copy step with its source and target address and size, and checks
+  that each target is inside its tensor and its memory allocation, the address
+  alignment, and whether two targets in the one copy overlap.
+
+A copy that fails to start is dumped the same way. `/kv/workers` shows the
+counts under `copy_probe`.
+
+### Boot self-test
+
+`diag_copy_selftest` (off by default, read when the plugin loads) replays
+load copies before the engine serves anything, while every GPU block is free.
+It fills staging with a known pattern, copies it into the given block ids with
+vLLM's own copy code, reads the blocks back and compares them. Each copy waits
+at most 10 s (by checking, never by blocking), and the whole test at most
+60 s. A control set (blocks 1..n) runs first, then each recorded set. A copy
+that times out or faults stops the test.
+
+The result goes to `<tier parent>/diag/selftest-r<rank>.json` after every
+step, so a test that hangs still shows which copy it was on. The 16-block set
+from the 2026-10-14 12:36 hang is built in. To add others, write
+`<tier parent>/diag/selftest-sets.json`:
+
+```json
+{"sets": [{"name": "job902", "bids": [1988, 1990, ...], "sha": "7513f576f389"}]}
+```
+
+If `sha` is given and the ids do not match it, the set is skipped. This test
+writes into GPU KV blocks, so turn it on only for a planned boot.
 
 ## What it changes inside vLLM
 

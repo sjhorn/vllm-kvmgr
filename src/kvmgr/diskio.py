@@ -466,6 +466,14 @@ def _load_read_ahead() -> int:
     return int(_f.DEFAULTS["load_read_ahead"])
 
 
+def _copy_probe_snapshot(h) -> dict:
+    """kvmgr.diag.copyprobe's counters, or why there are none (absent != 0)."""
+    snap = hooks.first("copy_probe_snapshot", h)
+    if snap is None:
+        return {"enabled": False, "why": "diag_copy_probe is off"}
+    return snap
+
+
 def _load_wait_compute() -> bool:
     """Whether a load copy waits on the compute stream first. Hot.
 
@@ -1001,6 +1009,11 @@ def _watchdog_loop():
             verdict, stalled_since = watchdog_verdict(
                 outstanding, fp, prev_fp, stalled_since, now)
             prev_fp = fp
+            # This thread keeps running when the worker's main loop is
+            # blocked, so it is where a diagnostic can still look at the GPU
+            # (kvmgr.diag.copyprobe). A no-op unless one is installed.
+            hooks.call("watchdog_tick", verdict,
+                       (now - stalled_since) if stalled_since else 0.0)
             if verdict == "idle":
                 dumped_for = None
                 continue
@@ -2005,6 +2018,7 @@ class DiskStoreHandler:
                     gpu_rows=self._bounds()[0],
                     staging_rows=self._bounds()[1],
                     ledger=self._ledger_snapshot(),
+                    copy_probe=_copy_probe_snapshot(self),
                     conn_worker=conn_worker_snapshot())
 
 
@@ -2150,6 +2164,10 @@ class DiskLoadHandler:
             "UNREADABLE" if _live is None else _live)
         _LIVE_HANDLERS.append(self)
         _start_watchdog()
+        # Both handlers exist and nothing has been served: the one moment a
+        # diagnostic can use the copy path on an idle GPU
+        # (kvmgr.diag.selftest, off by default). A no-op unless installed.
+        hooks.call("disk_load_handler_built", self, store)
 
     def _write_row(self, tensor_idx: int, slot: int, buf) -> None:
         # copy_into, never a bare `[:] = buf`: the staging tensor's view is
@@ -2625,4 +2643,5 @@ class DiskLoadHandler:
                     # one that most needs to be readable.
                     gpu_rows=self._bounds()[0],
                     staging_rows=self._bounds()[1],
-                    ledger=self._ledger_snapshot())
+                    ledger=self._ledger_snapshot(),
+                    copy_probe=_copy_probe_snapshot(self))

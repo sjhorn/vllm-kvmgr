@@ -124,6 +124,16 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     # flight across it open for ever: its `done` would carry the other boot.
     ("kvmgr.diag.ledger", "_ID", "this process's boot token"),
     ("kvmgr.diag.ledger", "_RUNNER", "the model runner, found on the stack"),
+    # Cheap to rebuild, but keyed by id(handler); kept so a reload does not
+    # re-read every group's refs mid-incident.
+    ("kvmgr.diag.ledger", "_TENSOR_HASH", "per-(handler, group) tensor hashes"),
+    # ask3 A/B (v0.4.2). The open-copy table is what the watchdog probes: a
+    # reload emptying it would hide exactly the stuck copy it exists for, and
+    # lose each entry's once-only stuck/dumped marks. _LOCK for serve._lock's
+    # reason.
+    ("kvmgr.diag.copyprobe", "_OPEN", "copies in flight, as the probe sees them"),
+    ("kvmgr.diag.copyprobe", "_STATS", "probe / stuck / dump counters"),
+    ("kvmgr.diag.copyprobe", "_LOCK", "the lock guarding _OPEN"),
 )
 
 
@@ -340,6 +350,7 @@ def reload_modules() -> dict:
     for name in ("kvmgr.hooks", "kvmgr.flags", "kvmgr.policy", "kvmgr.diskio",
                  "kvmgr.diskspec", "kvmgr.manager", "kvmgr.stats",
                  "kvmgr.diag.hangdump", "kvmgr.diag.ledger",
+                 "kvmgr.diag.copyprobe", "kvmgr.diag.selftest",
                  "kvmgr.diag.serializer", "kvmgr.diag.geometry",
                  "kvmgr.diag.tiering", "kvmgr.serve", "kvmgr.compat.dspark",
                  "kvmgr.register", "kvmgr.control", "kvmgr.diag.reload"):
