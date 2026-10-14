@@ -111,6 +111,117 @@ def group_file_sizes(group_data_refs: "Sequence[Sequence[Any]]") -> list[int]:
             for g in range(len(group_data_refs))]
 
 
+def verify_threads() -> int:
+    """`disk_verify_threads`, at least 1. Hot."""
+    try:
+        from kvmgr import flags as _f
+        v = _f.peek("disk_verify_threads")
+        return max(1, int(v if v is not None else _f.DEFAULTS["disk_verify_threads"]))
+    except Exception:
+        return 1
+
+
+def _pool_map(fn, items: list, threads: int) -> list:
+    """`[fn(x) for x in items]`, in input order, on at most `threads` threads.
+
+    `fn` must not raise (the callers' per-item functions catch everything).
+    The pool is joined before this returns, so no stat outlives the RPC.
+    """
+    n = min(max(1, int(threads)), len(items))
+    if n <= 1:
+        return [fn(x) for x in items]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=n,
+                            thread_name_prefix="kvmgr_verify") as ex:
+        return list(ex.map(fn, items))
+
+
+def check_presence(hexkeys, path_of, size_of, threads: int = 1,
+                   stat=None, unlink=None) -> dict:
+    """Does this rank hold each key's file at exactly the right size?
+
+    The per-rank half of the boot walk (`control.kvmgr_verify_presence`),
+    moved here so serial and parallel run the same per-key code. One file per
+    key per rank: the key carries its group. Each key gets exactly one
+    verdict, and the lists come back in INPUT order whatever `threads` is,
+    so the reply is byte-identical to the serial one (phase9 9ak).
+
+      * not hex                      -> missing (not counted in `checked`)
+      * stat raises OSError          -> missing
+      * the key's size unknowable    -> wrong_size (nothing unlinked)
+      * size differs                 -> wrong_size, and the file is UNLINKED:
+        it is provably unloadable and `_write_batch`'s exists() skip would
+        keep it for ever
+      * anything else raises (the path, the stat) -> `unvouched`: this rank
+        cannot vouch for it, so the key is bad. Never a crash of the whole
+        reply, never a pass.
+
+    `stat`/`unlink` default to os's; tests inject their own.
+    """
+    import os as _os
+    stat = stat or _os.stat
+    unlink = unlink or _os.unlink
+
+    def one(hexkey):
+        try:
+            k = bytes.fromhex(hexkey)
+        except Exception:
+            return ("missing", False, 0, None)
+        try:
+            path = path_of(k)
+            try:
+                st = stat(path)
+            except OSError:
+                return ("missing", True, 0, None)
+        except Exception as e:
+            return ("unvouched", True, 0, repr(e)[:160])
+        try:
+            want = int(size_of(k))
+        except Exception:
+            # a key naming a group this engine does not have
+            return ("wrong_size", True, 0, None)
+        if int(st.st_size) != want:
+            try:
+                unlink(path)
+                return ("wrong_size", True, 1, None)
+            except Exception:
+                return ("wrong_size", True, 0, None)
+        return ("ok", True, 0, None)
+
+    hexkeys = list(hexkeys or ())
+    out = {"missing": [], "wrong_size": [], "unvouched": [], "checked": 0,
+           "unlinked": 0, "threads": min(max(1, int(threads)),
+                                         max(1, len(hexkeys)))}
+    why = None
+    for hexkey, (v, counted, unl, err) in zip(
+            hexkeys, _pool_map(one, hexkeys, threads)):
+        out["checked"] += 1 if counted else 0
+        out["unlinked"] += unl
+        if v != "ok":
+            out[v].append(hexkey)
+        if err and why is None:
+            why = err
+    if why is not None:
+        out["unvouched_why"] = why
+    return out
+
+
+def exists_all(paths_of_keys, path_of, threads: int = 1) -> list:
+    """The keys whose file exists on THIS node, in input order. The head-only
+    walk's check (`_head_only_prune`), on the same pool. A key whose path or
+    stat raises is not kept, as before."""
+    import os as _os
+
+    def one(k):
+        try:
+            return _os.path.exists(path_of(k))
+        except Exception:
+            return False
+
+    keys = list(paths_of_keys)
+    return [k for k, ok in zip(keys, _pool_map(one, keys, threads)) if ok]
+
+
 def check_pairing(keys: "Sequence[bytes]", block_ids: "Sequence[int]",
                   group_sizes: "Sequence[int]",
                   group_of: Any) -> str | None:

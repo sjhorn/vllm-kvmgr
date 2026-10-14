@@ -295,6 +295,14 @@ DEFAULTS: dict[str, Any] = {
     # retracted "cheaper than the walk" claim, so the expectation here is
     # "materially less than 467s", not a number.
     "disk_boot_verify_chunk": 40000,
+    # Threads each rank uses to check one verify chunk's files (and the
+    # head-only walk's). *** THE WALK WAS ONE STAT AT A TIME. *** ~10K
+    # files/s per rank on a cold cache, so the boot walk grew to 515s (1.08M
+    # keys) and 649s (1.17M) on 2026-10-14. os.stat releases the GIL and NVMe
+    # serves many metadata lookups at once. The verdict does not depend on
+    # it (phase9 9ak compares serial against parallel). 1 = the serial walk.
+    # Hot; the pool lives only for one chunk. Unmeasured: ask5.
+    "disk_verify_threads": 16,
     # How long a lookup may DEFER one key before answering False.
     #
     # *** DEFERRING IS UPSTREAM'S OWN MECHANISM, not a trick. *** `lookup`

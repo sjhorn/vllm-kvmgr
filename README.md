@@ -64,11 +64,11 @@ from disk.
 Into a vLLM image:
 
 ```sh
-pip install --no-deps vllm_kvmgr-0.4.4-py3-none-any.whl
+pip install --no-deps vllm_kvmgr-0.4.5-py3-none-any.whl
 ```
 
 The DSpark recipe does not pip install. It mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.4.4.dist-info` into site-packages instead. vLLM finds the
+`deploy/vllm_kvmgr-0.4.5.dist-info` into site-packages instead. vLLM finds the
 plugin through the entry point in that dist-info folder. The folder is made by
 a script:
 
@@ -251,6 +251,15 @@ the start, the same as vLLM does on the GPU.
   the slowest part of startup, and it grows with the cache. It cannot be
   skipped: in vLLM, a failed restore stops the engine, so a missing file
   would crash it.
+  - The engine sends the index to every node in chunks
+    (`disk_boot_verify_chunk`, default 40,000 keys). Each node checks a
+    chunk's files on `disk_verify_threads` threads (default 16, hot; 1 is the
+    old one-at-a-time walk). The answer is the same either way: a key is
+    dropped if any node is missing its file, has it at the wrong size, or
+    could not check it.
+  - The walk ends with one log line, `BOOT WALK done`: keys, wall time, RPCs
+    and chunk size, the slowest chunk, and keys/s and threads per node. A
+    chunk taking over a quarter of the 300 s RPC timeout logs a WARNING.
 
 ### Running out of space
 

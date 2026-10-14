@@ -358,6 +358,8 @@ PROBE = {
     "disk_verify_enabled": (0, 1),
     "disk_verify_chunk": (100, 20000),
     "disk_boot_verify_chunk": (1000, 200000),
+    # ask5: the per-rank pool for the boot walk
+    "disk_verify_threads": (1, 4),
     "disk_verify_defer_s": (0.5, 30.0),
     "disk_verify_rpc_timeout_s": (5.0, 600.0),
     "disk_verify_bg_per_s": (0.0, 5000.0),

@@ -604,8 +604,10 @@ check("kvmgr_verify_presence is installed on Worker",
 # it ran in the core. The branch is explicit and commented for that reason.
 check("*** and _apply_locally names it explicitly rather than ignoring it ***",
       'elif method == "kvmgr_verify_presence":' in _csrc)
+_dsrc9 = open(os.path.join(REPO, "src", "kvmgr", "diskio.py")).read()
 check("the RPC compares SIZE, not just existence",
-      "group_file_sizes" in _csrc and "st_size" in _csrc)
+      "group_file_sizes" in _csrc and "diskio.check_presence(" in _csrc
+      and "int(st.st_size) != want" in _dsrc9)
 check("*** and unlinks a wrong-sized file, which exists() would preserve ***",
       "unlinked" in _csrc)
 check("a rank with no handler reports an ERROR rather than an empty pass",
@@ -1085,6 +1087,187 @@ _pres9 = {(m, a) for m, a, _ in _il9.import_module("kvmgr.diag.reload")._PRESERV
 for g in ("_VERIFY_REQUEST", "_VERIFY_LAST", "_VERIFY_SEQ"):
     check(f"`{g}` is in _PRESERVE -- a reload between the hand-off and the "
           f"take would lose a 202'd request", ("kvmgr.diskspec", g) in _pres9)
+
+print()
+print("== (9ak) ask5: the per-rank check on a pool gives the SERIAL verdict ==")
+import shutil as _sh9
+import threading as _th9
+import time as _tm9
+from kvmgr import diskio as DI  # noqa: E402
+
+_YK = [bytes([i, 7]) * 16 for i in range(60)]
+_YSIZE = [10, 20, 30]
+
+
+def _ysize(k):
+    if k == _YK[55]:
+        raise KeyError("group 9 is not on this engine")
+    return _YSIZE[k[0] % 3]
+
+
+_YRANK = {   # per rank: missing, wrong-size, path raises
+    0: ({5, 17}, {8, 30}, {50}),
+    1: ({5, 40}, {12}, set()),
+}
+
+
+def _ybuild(root, rank):
+    d = os.path.join(root, "r%d" % rank)
+    _sh9.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    miss, wrong, _ = _YRANK[rank]
+    for i, k in enumerate(_YK):
+        if i in miss:
+            continue
+        with open(os.path.join(d, k.hex()), "wb") as fh:
+            fh.write(b"x" * (_ysize(k) + (3 if i in wrong else 0))
+                     if i != 55 else b"x")
+    return d
+
+
+def _ypath(d, rank):
+    boom = {_YK[i] for i in _YRANK[rank][2]}
+
+    def path_of(k):
+        if k in boom:
+            raise RuntimeError("mapper fault (test)")
+        return os.path.join(d, k.hex())
+    return path_of
+
+
+_YHEX = [k.hex() for k in _YK] + ["zz-not-hex"]
+_yroot = tempfile.mkdtemp(prefix="kv9-par-")
+_yout = {}
+for rank in (0, 1):
+    for thr in (1, 8):
+        d = _ybuild(_yroot, rank)
+        r = DI.check_presence(_YHEX, _ypath(d, rank), _ysize, threads=thr)
+        r["left"] = sorted(os.listdir(d))
+        _yout[(rank, thr)] = r
+for rank in (0, 1):
+    a, b = dict(_yout[(rank, 1)]), dict(_yout[(rank, 8)])
+    eq("rank %d: serial ran on 1 thread, parallel on 8" % rank,
+       (a.pop("threads"), b.pop("threads")), (1, 8))
+    check("*** rank %d: the parallel reply is BYTE-IDENTICAL to the serial "
+          "one (verdicts, order, counts, files left) ***" % rank,
+          json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True),
+          "" if a == b else "%r\n%r" % (a, b))
+r0 = _yout[(0, 8)]
+eq("rank 0: missing, in input order (and the non-hex string)",
+   r0["missing"], [_YK[5].hex(), _YK[17].hex(), "zz-not-hex"])
+eq("rank 0: wrong size, including the key whose group is unknown",
+   r0["wrong_size"], [_YK[8].hex(), _YK[30].hex(), _YK[55].hex()])
+eq("*** rank 0: a key whose path raises is UNVOUCHED, not a pass ***",
+   r0["unvouched"], [_YK[50].hex()])
+check("...with the reason", "mapper fault" in r0.get("unvouched_why", ""),
+      r0.get("unvouched_why"))
+eq("...checked counts every hex key, not the non-hex one", r0["checked"], 60)
+eq("...the two wrong-sized files were unlinked", r0["unlinked"], 2)
+check("...and are gone", _YK[8].hex() not in r0["left"]
+      and _YK[30].hex() not in r0["left"])
+check("...the unknown-group file is NOT unlinked (nothing provable)",
+      _YK[55].hex() in r0["left"])
+# (the engine only ever sends hex, so the non-hex probe stays out of the fold)
+_v = D.verify_verdict(
+    [dict(_yout[(rk, 8)], rank=rk,
+          missing=[x for x in _yout[(rk, 8)]["missing"] if x != "zz-not-hex"])
+     for rk in (0, 1)], 2)
+eq("*** the verdict over both ranks: a key is bad if ANY rank says so ***",
+   sorted(_v["bad"]),
+   sorted({_YK[i] for i in (5, 17, 8, 30, 55, 50, 40, 12)}))
+eq("...no fault", _v["fault"], None)
+
+# bounded, and nothing left running when it returns
+_ids, _mu9 = set(), _th9.Lock()
+
+
+def _slow_stat(p):
+    with _mu9:
+        _ids.add(_th9.get_ident())
+    _tm9.sleep(0.002)
+    return os.stat(p)
+
+
+d = _ybuild(_yroot, 1)
+DI.check_presence(_YHEX, _ypath(d, 1), _ysize, threads=4, stat=_slow_stat)
+check("*** at most `threads` threads stat files ***", 1 < len(_ids) <= 4,
+      "%d threads" % len(_ids))
+check("...and none is left running when the RPC returns",
+      not [t for t in _th9.enumerate() if t.name.startswith("kvmgr_verify")])
+eq("threads is clamped to the work (3 keys, 16 threads)",
+   DI.check_presence(_YHEX[:3], _ypath(d, 1), _ysize, threads=16)["threads"], 3)
+eq("an empty chunk is an empty reply, not an error",
+   {k: v for k, v in DI.check_presence([], _ypath(d, 1), _ysize, threads=16).items()
+    if k != "threads"},
+   {"missing": [], "wrong_size": [], "unvouched": [], "checked": 0,
+    "unlinked": 0})
+
+# the head-only walk: same pool, same answer
+d = _ybuild(_yroot, 0)
+_pf = _ypath(d, 0)
+eq("*** exists_all: parallel == serial, in input order ***",
+   DI.exists_all(_YK, _pf, 8), DI.exists_all(_YK, _pf, 1))
+eq("...missing and raising keys are not kept",
+   len(DI.exists_all(_YK, _pf, 8)), 60 - 2 - 1)
+
+# the knob
+F.write(disk_verify_threads=3)
+KF.reset_for_tests()
+eq("disk_verify_threads is read hot", DI.verify_threads(), 3)
+F.write(disk_verify_threads=0)
+KF.reset_for_tests()
+eq("...and 0 means the serial walk (1), never no walk", DI.verify_threads(), 1)
+F.write()
+KF.reset_for_tests()
+eq("...default 16", DI.verify_threads(), 16)
+
+print()
+print("== (9al) ask5: one log line per boot walk, and the chunk-time guard ==")
+
+
+class _MsCore(FakeCore):
+    def __init__(self, ms, **kw):
+        super().__init__(**kw)
+        self._ms = ms
+
+    def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+        out = FakeCore.collective_rpc(self, method, timeout, args, kwargs)
+        for r in out:
+            r.update(ms=self._ms * (r["rank"] + 1), threads=16)
+        return out
+
+
+tmp = tempfile.mkdtemp(prefix="kv9-walklog-")
+YB = [K(bytes([i]) * 32, 0) for i in range(1, 9)]
+for k in YB:
+    touch(tmp, k)
+harness.clear_log()
+m = boot_with(tmp, YB, _MsCore(500), disk_boot_verify_chunk=4)
+_lt = harness.log_text()
+check("*** the walk ends with ONE summary line ***",
+      _lt.count("BOOT WALK done") == 1, _lt[-600:])
+check("...naming keys, RPCs, chunk and the slowest chunk",
+      "8 keys" in _lt and "2 RPC(s) of up to 4 keys" in _lt
+      and "slowest chunk 1.0s" in _lt, _lt[-600:])
+check("...and keys/s and threads PER RANK, from each rank's own time",
+      "r0 8 keys in 1.0s = 8 keys/s, threads 16" in _lt
+      and "r1 8 keys in 2.0s = 4 keys/s, threads 16" in _lt, _lt[-600:])
+eq("...also in the stats", m._stats["boot_verify_per_rank"]["1"]["ms"], 2000)
+check("a fast walk does not warn about the timeout", "RPC timeout" not in _lt)
+harness.clear_log()
+boot_with(tmp, YB, _MsCore(int(D.BOOT_VERIFY_TIMEOUT_S * 1000 / 4) + 1000),
+          disk_boot_verify_chunk=4)
+check("*** a chunk over a quarter of the RPC timeout WARNS ***",
+      "over a quarter of the" in harness.log_text(), harness.log_text()[-600:])
+harness.clear_log()
+with open(os.path.join(tmp, "presence.json"), "w") as fh:
+    json.dump({"keys": [[bytes(k).hex(), i] for i, k in enumerate(YB)]}, fh)
+F.write(disk_restore=1, disk_verify_enabled=0)
+KF.reset_for_tests()
+m = FakeCore().build(tmp)
+check("the head-only walk logs its own line, with threads",
+      "BOOT WALK (head-only)" in harness.log_text()
+      and "threads 16" in harness.log_text(), harness.log_text()[-400:])
 
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")

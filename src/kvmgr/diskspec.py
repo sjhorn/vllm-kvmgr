@@ -822,6 +822,10 @@ def verify_verdict(results: "Sequence[dict]", expect_ranks: int) -> dict:
             bad[bytes.fromhex(hexkey)] = None
         for hexkey in (r.get("wrong_size") or ()):
             bad[bytes.fromhex(hexkey)] = None
+        # a key the rank could not check at all (diskio.check_presence) is
+        # one it cannot vouch for: bad, never a pass
+        for hexkey in (r.get("unvouched") or ()):
+            bad[bytes.fromhex(hexkey)] = None
     out["bad"] = list(bad)
     return out
 
@@ -1437,15 +1441,19 @@ class DiskPresenceManager(OffloadingManager):
     # -- the boot check ----------------------------------------------------
 
     def _head_only_prune(self, keys) -> list:
-        """Today's walk: does the file exist ON THIS NODE? Rank-local."""
-        import os as _os
-        kept = []
-        for k in keys:
-            try:
-                if _os.path.exists(self._mapper.get_file_name(k)):
-                    kept.append(k)
-            except Exception:
-                pass
+        """Today's walk: does the file exist ON THIS NODE? Rank-local. On the
+        `disk_verify_threads` pool, same verdict as serial (diskio.exists_all).
+        """
+        from . import diskio
+        t0 = _now()
+        thr = diskio.verify_threads()
+        kept = diskio.exists_all(keys, self._mapper.get_file_name, thr)
+        sec = _now() - t0
+        logger.info(
+            "kvmgr: BOOT WALK (head-only) -- %d keys, %d files on this node, "
+            "%.1fs, %.0f keys/s, threads %d; %d kept",
+            len(keys), len(keys), sec, len(keys) / sec if sec > 0 else 0.0,
+            thr, len(kept))
         return kept
 
     def _boot_verify(self, keys) -> tuple:
@@ -1518,6 +1526,10 @@ class DiskPresenceManager(OffloadingManager):
             cap = int(flags.DEFAULTS["disk_boot_verify_chunk"])
         kept: list = []
         bad_total = 0
+        unvouched = 0
+        # per rank: summed in-RPC ms, keys checked, threads used
+        per_rank: dict = {}
+        chunk_max_s = 0.0
         t0 = _now()
         for i in range(0, len(keys), cap):
             chunk = [bytes(k) for k in keys[i:i + cap]]
@@ -1554,6 +1566,25 @@ class DiskPresenceManager(OffloadingManager):
                 return (kept, "all-ranks for %d key(s), then head-only for the "
                               "remaining %d after a failure"
                               % (n_allranks, len(keys) - i))
+            for r in results:
+                pr = per_rank.setdefault(r.get("rank"),
+                                         {"ms": 0, "checked": 0, "threads": None})
+                pr["ms"] += int(r.get("ms") or 0)
+                pr["checked"] += int(r.get("checked") or 0)
+                pr["threads"] = r.get("threads", pr["threads"])
+                unvouched += len(r.get("unvouched") or ())
+            # *** A CHUNK MUST STAY WELL INSIDE THE RPC TIMEOUT. *** A timeout
+            # is unrecoverable (see BOOT_VERIFY_TIMEOUT_S), so say so at a
+            # quarter of it, while there is still room to lower the chunk.
+            _cs = max((int(r.get("ms") or 0) for r in results), default=0) / 1000.0
+            if _cs > chunk_max_s:
+                chunk_max_s = _cs
+                if _cs > BOOT_VERIFY_TIMEOUT_S / 4:
+                    logger.warning(
+                        "kvmgr: a boot verify chunk of %d keys took %.0fs on its "
+                        "slowest rank, over a quarter of the %.0fs RPC timeout. "
+                        "Lower disk_boot_verify_chunk before it reaches it.",
+                        len(chunk), _cs, BOOT_VERIFY_TIMEOUT_S)
             bad = {bytes(b) for b in v["bad"]}
             bad_total += len(bad)
             kept.extend(k for k in chunk if k not in bad)
@@ -1565,6 +1596,26 @@ class DiskPresenceManager(OffloadingManager):
         self._stats["boot_verify_ms"] = ms
         self._stats["boot_verify_dropped"] = bad_total
         self._stats["boot_verify_rpcs"] = (len(keys) + cap - 1) // cap
+        self._stats["boot_verify_unvouched"] = unvouched
+        self._stats["boot_verify_chunk_max_s"] = round(chunk_max_s, 3)
+        self._stats["boot_verify_per_rank"] = {
+            str(rk): dict(pr) for rk, pr in sorted(per_rank.items(),
+                                                   key=lambda x: str(x[0]))}
+        # ONE LINE THAT COMPARES BOOTS (ask5): no reconstruction from the log.
+        # keys/s per rank is from that rank's own in-RPC time; the wall time
+        # also pays each chunk's max(rank0, rank1) and the round trip.
+        logger.info(
+            "kvmgr: BOOT WALK done -- %d keys (one file each per rank), %.1fs "
+            "wall, %d RPC(s) of up to %d keys, slowest chunk %.1fs; per rank: "
+            "%s; %d dropped (%d unvouched)",
+            len(keys), ms / 1000.0, (len(keys) + cap - 1) // cap, cap,
+            chunk_max_s,
+            ", ".join("r%s %d keys in %.1fs = %.0f keys/s, threads %s" % (
+                rk, pr["checked"], pr["ms"] / 1000.0,
+                pr["checked"] / (pr["ms"] / 1000.0) if pr["ms"] else 0.0,
+                pr["threads"])
+                for rk, pr in sorted(per_rank.items(), key=lambda x: str(x[0])))
+            or "no replies", bad_total, unvouched)
         return (kept, "all-ranks (%d key(s) in %d RPC(s), %.1fs, %d dropped "
                       "as missing or wrong-sized on some rank)"
                       % (len(keys), (len(keys) + cap - 1) // cap, ms / 1000.0,

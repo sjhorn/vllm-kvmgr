@@ -283,34 +283,16 @@ def install_worker_methods() -> None:
                 out["free_bytes"] = int(vfs.f_bavail) * int(vfs.f_frsize)
             except Exception:
                 out["free_bytes"] = None
-            for hexkey in (keys or ()):
-                try:
-                    k = bytes.fromhex(hexkey)
-                except Exception:
-                    out["missing"].append(hexkey)
-                    continue
-                out["checked"] += 1
-                path = h._mapper.get_file_name(k)
-                try:
-                    stt = _os.stat(path)
-                except OSError:
-                    out["missing"].append(hexkey)
-                    continue
-                try:
-                    g = int(get_offload_group_idx(k))
-                    want = int(sizes[g])
-                except Exception:
-                    # A key naming a group this engine does not have is not
-                    # something to guess about.
-                    out["wrong_size"].append(hexkey)
-                    continue
-                if int(stt.st_size) != want:
-                    out["wrong_size"].append(hexkey)
-                    try:
-                        _os.unlink(path)
-                        out["unlinked"] += 1
-                    except Exception:
-                        pass
+            # *** ONE FILE AT A TIME WAS THE BOOT'S BIGGEST COST. *** ~10K
+            # stats/s per rank on a cold cache (the start script drops it every
+            # 2s), so 1.17M keys walked for 649s on 2026-10-14. NVMe serves
+            # many metadata lookups at once and os.stat releases the GIL, so
+            # the chunk now runs on `disk_verify_threads` threads. The verdict
+            # is the serial one, key for key (diskio.check_presence).
+            out.update(diskio.check_presence(
+                keys, h._mapper.get_file_name,
+                lambda k: sizes[int(get_offload_group_idx(k))],
+                threads=diskio.verify_threads()))
         except Exception as e:
             out["error"] = repr(e)
         out["ms"] = int((_time.monotonic() - t0) * 1000)

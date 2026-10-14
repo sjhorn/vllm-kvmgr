@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-kvmgr"
-version = "0.4.4"
+version = "0.4.5"
 description = "A hot-configurable KV cache manager and a disk-backed, cross-node prefix cache for vLLM"
 readme = "README.md"
 requires-python = ">=3.10"
