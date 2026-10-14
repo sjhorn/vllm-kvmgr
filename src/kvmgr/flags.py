@@ -503,6 +503,13 @@ DEFAULTS: dict[str, Any] = {
     # at most (inflight + read_ahead) x the per-round cap. 0 = strictly serial
     # (read, copy, read). Unmeasured: 0/1/2 against a 700K restore is the test.
     "load_read_ahead": 1,
+    # 1 = a staging->GPU load copy waits for work already queued on the
+    # compute stream before it writes, as vLLM 0.31 does for loads
+    # (cpu/gpu_worker.py:690-696). Our 0.21 handler waits only for STORES,
+    # and with --async-scheduling, zeroing of a destination block shipped in
+    # an earlier step is ordered against nothing else. Candidate cause of the
+    # 2026-10-14 Xid 32s, unproven. 0 = 0.21's behaviour. Hot.
+    "load_wait_compute": 1,
     # Max COPY-OP DESCRIPTORS in one staging->GPU submit. This is the quantity
     # upstream's single `cuMemcpyBatchAsync` actually contains --
     # `num_copy_ops += group_size * len(group_data_refs)` -- so a cap in BLOCKS

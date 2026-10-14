@@ -466,6 +466,22 @@ def _load_read_ahead() -> int:
     return int(_f.DEFAULTS["load_read_ahead"])
 
 
+def _load_wait_compute() -> bool:
+    """Whether a load copy waits on the compute stream first. Hot.
+
+    vLLM 0.31's copy handler does this for loads; 0.21's does it for stores
+    only. See `DiskLoadHandler._arm_compute_wait`."""
+    try:
+        from kvmgr import flags as _f
+    except Exception:
+        return True
+    try:
+        return bool(int(_f.peek("load_wait_compute")))
+    except Exception:
+        # the DECLARED default, never a second copy (see _load_inflight_max)
+        return bool(_f.DEFAULTS["load_wait_compute"])
+
+
 def _load_batch_max() -> int:
     """Max blocks in ONE staging->GPU `transfer_async`. Hot.
 
@@ -2114,7 +2130,8 @@ class DiskLoadHandler:
                       "bytes": 0, "errors": 0,
                       "wait_calls": 0, "wait_ours": 0, "wait_blocked_ms": 0,
                       "wait_max_pending": 0, "wait_rounds": 0,
-                      "saturations": 0, "rounds_done": 0}
+                      "saturations": 0, "rounds_done": 0,
+                      "compute_waits": 0, "compute_wait_unarmed": 0}
         # REPORT THE FACT, NOT THE ASK. This said "(restore is live)"
         # unconditionally, from __init__, with no gate on the flag -- so a boot
         # whose flags file had disk_restore=False still announced a live
@@ -2195,6 +2212,48 @@ class DiskLoadHandler:
 
     def _ledger_done(self, kind: str, inner: int, ok: bool) -> None:
         hooks.call("ledger_done", self, kind, inner, ok)
+
+    def _arm_compute_wait(self) -> "bool | None":
+        """Make the NEXT inner load copy wait for queued compute work.
+
+        vLLM 0.31's `transfer_async` does `stream.wait_stream(current_stream)`
+        for loads as well as stores: "Loads must wait for pending writes
+        (including zeroing) to their destination blocks ... with async
+        scheduling nothing else orders that zeroing against this copy."
+        0.21's waits for stores only, and --async-scheduling is on here.
+
+        The copy stream is chosen INSIDE upstream's handler, by
+        `self._stream_pool.pop()`. So the wait goes on the stream that pop
+        will return: take it (or a new one), make it wait on the current
+        stream, and put it back on top. Same call site and thread as 0.31's
+        (the connector's get_finished/wait on the worker thread), so the same
+        "current stream". No upstream code is copied.
+
+        True = armed, False = knob off, None = could not arm (logged once;
+        the load proceeds unordered, exactly as before this existed)."""
+        if not _load_wait_compute():
+            return False
+        pool = getattr(self._inner, "_stream_pool", None)
+        try:
+            if not isinstance(pool, list):
+                raise TypeError("inner handler has no _stream_pool list")
+            import torch
+            stream = pool.pop() if pool else torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            pool.append(stream)
+        except Exception as exc:
+            self.stats["compute_wait_unarmed"] = (
+                self.stats.get("compute_wait_unarmed", 0) + 1)
+            if not getattr(self, "_compute_wait_warned", False):
+                self._compute_wait_warned = True
+                logger.warning(
+                    "kvmgr: could not make the load copy wait on compute "
+                    "(%r). Loads proceed UNORDERED against queued compute, "
+                    "as on stock 0.21. Said once; counted as "
+                    "compute_wait_unarmed.", exc)
+            return None
+        self.stats["compute_waits"] = self.stats.get("compute_waits", 0) + 1
+        return True
 
     def transfer_async(self, job_id: int, spec) -> bool:
         from vllm.v1.kv_offload.base import get_offload_group_idx
@@ -2414,6 +2473,8 @@ class DiskLoadHandler:
             self.stats["bytes"] += nbytes
             inner = self._next_inner
             self._next_inner += 1
+            # Before the ledger line, so the line says whether it held.
+            self._wait_compute_last = self._arm_compute_wait()
             self._ledger_note("load", g, bids, slots)
             self._ledger_submit("load", inner, job_id, g, bids, slots)
             ok = self._inner.transfer_async(

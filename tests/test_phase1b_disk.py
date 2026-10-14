@@ -2865,7 +2865,8 @@ def mkloadhandler(pool_size, nrefs=REFS):
                "refused_bounds": 0, "bytes": 0, "errors": 0,
                "wait_calls": 0, "wait_ours": 0, "wait_blocked_ms": 0,
                "wait_max_pending": 0, "wait_rounds": 0,
-               "saturations": 0, "rounds_done": 0}
+               "saturations": 0, "rounds_done": 0,
+               "compute_waits": 0, "compute_wait_unarmed": 0}
     h._read_batch = lambda bkeys, slots, g: 100 * len(bkeys)
     h._bounds_cache = (22756, pool_size)
     return h
@@ -3080,6 +3081,121 @@ for _i, _body in enumerate(_w6):
           "get_finished(" not in _code)
 F.write(load_inflight_max=1)
 flags.reset_for_tests()
+
+# ---- C7: a load copy waits on the compute stream ----------------------------
+# vLLM 0.31 makes LOAD copies wait for queued compute (destination zeroing
+# under async scheduling); 0.21 waits only for stores. We arm the stream
+# upstream's handler will pop. Faked CUDA: a stream records what it waited on,
+# and the fake inner pops its stream exactly as upstream does.
+print("\n== (C7) a load copy waits on the compute stream ==")
+import torch as _torch7  # the stub
+
+_COMPUTE = object()
+
+
+class _Stream7:
+    made = 0
+
+    def __init__(self):
+        _Stream7.made += 1
+        self.waited = []
+
+    def wait_stream(self, other):
+        self.waited.append(other)
+
+
+class _Inner7(FakeLoadInner):
+    """Pops its copy stream the way upstream's transfer_async does."""
+
+    def __init__(self):
+        super().__init__()
+        self._stream_pool = []
+        self.used = []
+
+    def transfer_async(self, job_id, spec):
+        st = self._stream_pool.pop() if self._stream_pool else _Stream7()
+        self.used.append(list(st.waited))
+        self._stream_pool.append(st)          # returned on completion
+        return FakeLoadInner.transfer_async(self, job_id, spec)
+
+
+_had_cuda = hasattr(_torch7, "cuda")
+_torch7.cuda = type("C", (), {"Stream": _Stream7,
+                              "current_stream": staticmethod(lambda: _COMPUTE)})
+try:
+    F.write(load_inflight_max=1, load_read_ahead=0, load_batch_max=4,
+            load_ops_max=0, load_wait_compute=1)
+    flags.reset_for_tests()
+    h7 = mkloadhandler(16)
+    h7._inner = _Inner7()
+    load_job(h7, 71, 8, 900, 71)
+    for _ in range(6):
+        for f in h7._readers.futs:
+            if not getattr(f, "_done", False):
+                f.finish()
+        if 71 in step(h7):
+            break
+    eq("two rounds reached the GPU", len(h7._inner.used), 2)
+    check("*** every load copy ran on a stream that waited on compute ***",
+          all(_COMPUTE in w for w in h7._inner.used), repr(h7._inner.used))
+    eq("...counted", h7.stats["compute_waits"], 2)
+    eq("...and the ledger line can say so", h7._wait_compute_last, True)
+
+    F.write(load_wait_compute=0)
+    flags.reset_for_tests()
+    h7b = mkloadhandler(16)
+    h7b._inner = _Inner7()
+    load_job(h7b, 72, 4, 920, 72)
+    for _ in range(4):
+        for f in h7b._readers.futs:
+            if not getattr(f, "_done", False):
+                f.finish()
+        if 72 in step(h7b):
+            break
+    check("with the knob at 0 the copy does NOT wait (0.21 behaviour)",
+          h7b._inner.used == [[]], repr(h7b._inner.used))
+    eq("...and says so", h7b._wait_compute_last, False)
+
+    F.write(load_wait_compute=1)
+    flags.reset_for_tests()
+    h7c = mkloadhandler(16)             # FakeLoadInner: no _stream_pool
+    harness.clear_log()
+    load_job(h7c, 73, 4, 940, 73)
+    for _ in range(4):
+        for f in h7c._readers.futs:
+            if not getattr(f, "_done", False):
+                f.finish()
+        if 73 in step(h7c):
+            break
+    eq("an inner with no stream pool: the load still completes",
+       h7c._jobs.get(73), None)
+    eq("...unarmed, counted", h7c.stats["compute_wait_unarmed"], 1)
+    eq("...and the ledger line says None, not False", h7c._wait_compute_last, None)
+    check("...and it is logged",
+          "could not make the load copy wait on compute" in harness.log_text())
+finally:
+    if not _had_cuda:
+        del _torch7.cuda
+    F.write(load_inflight_max=1, load_wait_compute=1)
+    flags.reset_for_tests()
+
+# THE CONTRACT THE ARMING RELIES ON: upstream picks its copy stream by popping
+# the END of _stream_pool, then (loads) adds no compute wait of its own.
+_gw7 = open(os.path.join(REPO, "tests", "upstream", "vllm", "v1", "kv_offload",
+                         "cpu", "gpu_worker.py")).read()
+check("upstream's handler takes its stream with _stream_pool.pop()",
+      "stream = self._stream_pool.pop() if self._stream_pool else" in _gw7)
+check("...and on this vLLM waits on compute for STORES only",
+      "if self.gpu_to_cpu:\n            # wait for model computation to finish "
+      "before offloading\n            stream.wait_stream(" in _gw7)
+_lg7 = open(os.path.join(REPO, "src", "kvmgr", "diag", "ledger.py")).read()
+check("the ledger's load submit line carries wait_compute",
+      '"wait_compute": getattr(h, "_wait_compute_last", None)' in _lg7)
+_c7 = _lsrc[_lsrc.index("def _collect", _lsrc.index("class DiskLoadHandler")):]
+check("the wait is armed BEFORE the ledger line and the submit",
+      _c7.index("self._arm_compute_wait()")
+      < _c7.index('self._ledger_submit("load"')
+      < _c7.index("self._inner.transfer_async("))
 
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:

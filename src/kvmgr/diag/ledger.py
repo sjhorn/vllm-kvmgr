@@ -605,7 +605,12 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
                 bid_max=max(bset) if bset else None, bids=ranges(bset),
                 slots=ranges(slots or ()),
                 gpu_loads=gpu_loads, gpu_stores=gpu_stores, ops=ops,
-                overlap=[[k2, i2] for k2, i2, *_ in hits] or None, **ctx))
+                overlap=[[k2, i2] for k2, i2, *_ in hits] or None,
+                # loads: did the copy wait on compute? True/False/None
+                # (None = could not arm). Absent on stores.
+                **({"wait_compute": getattr(h, "_wait_compute_last", None)}
+                   if kind == "load" else {}),
+                **ctx))
             for k2, i2, j2, g2, common in hits:
                 _STATS["overlaps"] += 1
                 if g2 == group:

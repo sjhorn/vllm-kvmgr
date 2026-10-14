@@ -122,6 +122,12 @@ the engine:
     above were measured without the limit. Since v0.4.0 the limit is real.
   - `load_read_ahead` (default 1) lets the next block group read from disk
     while the current one copies to the GPU.
+- **`load_wait_compute=1`.** A copy from disk back to the GPU first waits for
+  work already queued on the compute stream, as vLLM 0.31 does. vLLM 0.21
+  waits only when saving. With async scheduling, a block being reloaded may
+  still have a zeroing write queued from an earlier step. This is a candidate
+  cause of the Xid 32 faults, not a proven one. Each load's ledger line says
+  whether the wait was in force (`wait_compute`). Can be changed while running.
 - **`stall_fail_after_s=240`.** If a save to disk gets stuck, it fails after
   240 s with a log line that says which job it was. Without this, NCCL kills
   the worker after 600 s and leaves no Python trace.
@@ -211,6 +217,8 @@ A block counts as saved only when **both** ranks have written their part.
   load_inflight_max   = how many GPU copies may run at once  (default 1)
   load_read_ahead     = how many more rounds may read from disk while
                         they wait                            (default 1)
+  load_wait_compute   = the GPU copy waits for queued compute work first
+                                                             (default 1)
 ```
 
 `lookup` checks the index. A prompt reuses blocks in one unbroken run from
