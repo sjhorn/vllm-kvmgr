@@ -1,259 +1,402 @@
-# vllm-kvmgr — a hot-configurable KV cache manager and a cross-node disk prefix cache for vLLM
+# vllm-kvmgr
 
-One `vllm.general_plugins` entry point, two halves:
+A vLLM plugin that does two jobs:
 
-1. **A KV cache manager for the full-attention MLA group**, registered through
-   vLLM's public `spec_manager_map`. It decides which prompt blocks stay
-   protected in GPU memory and which go first, and every policy knob moves on
-   a running engine: the protection budget, how it is split across KV groups,
-   and the eviction order.
-2. **A disk-backed prefix cache**, `DSparkDiskOffloadingSpec` (generic alias
-   `KvmgrDiskOffloadingSpec`), registered through vLLM's public
-   `OffloadingSpecFactory`. Each tensor-parallel rank writes its **own** KV
-   slice GPU → a small pinned staging pool → its own node's disk, and reads it
-   back the same way. A prefix survives an engine restart.
+1. **It decides which prompt blocks stay in GPU memory.** You can change how
+   it decides while the engine is running.
+2. **It saves prompt blocks to disk.** The saved blocks survive a restart, so
+   a long prompt you sent before does not have to be computed again.
 
-**What it is for.** On the cluster it was built for, a 2,000-token delta on a
-warm 770K-token prefix costs 0.9s, and the same prefix arrived at cold costs
-430–795s. Measured with this package: a 700,445-token prompt costs **598s cold
-and 11s after a full restart of both nodes (54x)**, with every lookup a hit.
-A conversational prefix comes back at 98.7% after the GPU cache is dropped.
+```
+                         +------------------------------+
+   your prompt  ------>  |            vLLM              |
+                         |                              |
+                         |  +------------------------+  |
+                         |  | 1. KV cache manager    |  |  which blocks stay
+                         |  |    (in GPU memory)     |  |  on the GPU
+                         |  +------------------------+  |
+                         |  +------------------------+  |
+                         |  | 2. disk prefix cache   |--+--> /kvoffload on
+                         |  |    (on each node)      |  |     each node's disk
+                         |  +------------------------+  |
+                         +------------------------------+
+```
 
-> **Where this lives.** This repository is the only copy of kvmgr, with its
-> full history carried over from the DSpark recipe repo where it was
-> developed. Releases are git tags (`v0.2.0` and on), each naming the vLLM
-> build it is proven on.
+## Why use it
 
-## Requirements
+Some words first:
 
-- **vLLM `0.21.1rc1.dev339+g1967a5627bc3`.** That is the build it is proven on.
-  `pyproject.toml` declares `vllm>=0.21.1rc1.dev0,<0.22`, but kvmgr wraps
-  private internals (listed below), so a version inside that window is not a
-  promise. To port it, re-vendor `tests/upstream/` from the target build and
-  run the tests: an upstream change surfaces as a named failure, not as "the
-  plugin did not load".
-- **No patch to vLLM.** The DSpark recipe's overlays are optional; see "On a
-  vLLM without the DSpark fork" for what differs.
-- **`PYTHONHASHSEED` set to a fixed value, and never changed.** vLLM's block
-  hash is a Merkle chain rooted at `NONE_HASH`, which is `os.urandom(32)` when
-  the seed is unset. Every boot then computes different hashes, and the files
-  a previous boot wrote become a permanent **miss**, not an error. Changing the
-  value later orphans everything already written, just as silently.
-- `--enable-prefix-caching`, and a writable directory on every node.
+- A **prompt** is turned into **KV cache** blocks on the GPU. Making them is
+  the slow part of reading a long prompt.
+- A **prefix** is the start of a prompt. If two prompts start the same way,
+  the second one can reuse the first one's blocks.
+
+Without this plugin, those blocks are lost when the GPU runs out of room or
+the engine restarts. Then a long prompt has to be read again from the start.
+
+On the cluster this was built for:
+
+| case | time |
+|---|---|
+| a 700,445-token prompt, nothing cached | 598 s |
+| the same prompt after restarting both nodes | **11 s** (54x faster) |
+
+After the GPU cache is dropped, 98.7% of a chat's earlier prompt comes back
+from disk.
+
+## What you need
+
+- **vLLM `0.21.1rc1.dev339+g1967a5627bc3`.** This is the version it is tested
+  on. `pyproject.toml` allows `>=0.21.1rc1.dev0,<0.22`, but the plugin uses
+  some private parts of vLLM, so other versions in that range may break. To
+  move to a new vLLM, copy that version's files into `tests/upstream/` and run
+  the tests. A change in vLLM shows up as a test failure with a name.
+- **No changes to vLLM itself.** The DSpark recipe adds some patches, but you
+  do not need them. See [Without the DSpark patches](#without-the-dspark-patches).
+- **`PYTHONHASHSEED` set to a fixed number, and never changed.** vLLM names
+  each block with a hash. If the seed is not set, every start makes different
+  names, and the files on disk are never found again. There is no error; you
+  just get misses. Changing the number later has the same effect.
+- `--enable-prefix-caching`, and a folder you can write to on every node.
 
 ## Install
 
 Into a vLLM image:
 
-    pip install --no-deps vllm_kvmgr-0.4.1-py3-none-any.whl
+```sh
+pip install --no-deps vllm_kvmgr-0.4.1-py3-none-any.whl
+```
 
-The DSpark recipe instead bind-mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.4.1.dist-info` into site-packages. The dist-info is
-**generated** (`python3 deploy/gen-dist-info.py`; `--check` fails when it is
-stale) because the entry point vLLM looks for lives in it.
+The DSpark recipe does not pip install. It mounts `src/kvmgr` and
+`deploy/vllm_kvmgr-0.4.1.dist-info` into site-packages instead. vLLM finds the
+plugin through the entry point in that dist-info folder. The folder is made by
+a script:
 
-Registering is inert. The manager's policy is off until `kvmgr_enabled` is
-set, and the disk tier is off until `KV_TRANSFER_CONFIG` names the spec:
+```sh
+python3 deploy/gen-dist-info.py          # write it
+python3 deploy/gen-dist-info.py --check  # fail if it is out of date
+```
 
-    KV_TRANSFER_CONFIG='{"kv_connector":"OffloadingConnector","kv_role":"kv_both",
-      "kv_connector_extra_config":{"spec_name":"KvmgrDiskOffloadingSpec",
-        "staging_blocks":256,"staging_load_blocks":256,"write_threads":4,
-        "root_dir":"/kvoffload"}}'
+Installing the plugin changes nothing on its own:
 
-## Configuration
+- The GPU manager does nothing until you set `kvmgr_enabled`.
+- The disk cache does nothing until `KV_TRANSFER_CONFIG` names it:
 
-Knobs are read from a JSON flags file, `VLLM_KV_FLAGS_FILE` (default
-`/etc/vllm-kv-flags/flags.json`), which is re-read at most once a second. The
-precedence is: **in-memory override** (set over HTTP), then `VLLM_<NAME>` env,
-then the file, then the default.
+```sh
+KV_TRANSFER_CONFIG='{"kv_connector":"OffloadingConnector","kv_role":"kv_both",
+  "kv_connector_extra_config":{"spec_name":"KvmgrDiskOffloadingSpec",
+    "staging_blocks":256,"staging_load_blocks":256,"write_threads":4,
+    "root_dir":"/kvoffload"}}'
+```
 
-**The authoritative list is `DEFAULTS` in `src/kvmgr/flags.py`** (52 knobs),
-and `GET /kv` publishes every one with its effective value and **the source
-that won**. A hand-written table here once listed 6 of 24, so there is none.
-The defaults are inert by design: an empty file behaves exactly as upstream.
-The safety bounds are the exception, because inert-by-default is right for
-them:
+## Settings (knobs)
 
-- **`load_ops_max=2048`, `load_inflight_max=1`.** Four restores in flight
-  killed the engine with a GPU fault (Xid 32) while the batch size was pinned
-  at 2048, and 1 and 2 restored 700K in the same 12s. **Both were measured
-  before v0.4.0, when the knob did not bound the GPU stage**: finished reads
-  went to the GPU unchecked, up to 7 at once. Since v0.4.0 it bounds
-  staging->GPU copies, and `load_read_ahead` (default 1, hot) bounds how many
-  rounds may read from disk beyond it, so the disk overlaps the copy.
-- **`stall_fail_after_s=240`.** A store job that cannot complete fails with
-  our line naming it, before NCCL's 600s watchdog aborts the worker in C++
-  with no Python traceback.
+Settings live in a JSON file. Set the path with `VLLM_KV_FLAGS_FILE`. The
+default is `/etc/vllm-kv-flags/flags.json`. The file is read again at most
+once a second, so most changes take effect without a restart.
 
-The configuration the recipe actually runs is in the DSpark repo's
+When the same knob is set in more than one place, the first one in this list
+wins:
+
+```
+  1. an override set over HTTP      (POST /kv/knob)
+  2. an env var                     (VLLM_<NAME>, for example VLLM_KVMGR_ENABLED)
+  3. the flags file
+  4. the default in the code
+```
+
+The full list is `DEFAULTS` in `src/kvmgr/flags.py` (52 knobs). `GET /kv`
+shows every knob, its value, and which of the four places it came from. There
+is no copy of the list here, because a copy goes out of date.
+
+An empty flags file behaves the same as plain vLLM. A few safety limits are
+the exception. They are on by default because turning them off has crashed
+the engine:
+
+- **`load_ops_max=2048` and `load_inflight_max=1`.** These limit how much
+  data is copied from disk back to the GPU at once.
+  - With 4 copies at once, the engine crashed with a GPU fault (Xid 32).
+  - With 1 or 2, a 700K-token prompt came back in the same 12 s.
+  - **Before v0.4.0, `load_inflight_max` did not really work.** Finished disk
+    reads went to the GPU with no check, up to 7 at once. So all the numbers
+    above were measured without the limit. Since v0.4.0 the limit is real.
+  - `load_read_ahead` (default 1) lets the next block group read from disk
+    while the current one copies to the GPU.
+- **`stall_fail_after_s=240`.** If a save to disk gets stuck, it fails after
+  240 s with a log line that says which job it was. Without this, NCCL kills
+  the worker after 600 s and leaves no Python trace.
+
+The settings the DSpark recipe runs with are in the DSpark repo, in
 `local-ops/flags.reference.json`.
 
-## Endpoints
+## HTTP endpoints
 
-| where | route | |
+vLLM runs in more than one process. Each endpoint lives in one of them:
+
+```
+  +------------------------------+        +-------------------------------+
+  | API server (vLLM's own port) |        | engine core                   |
+  |                              |  ----> |   stats listener              |
+  | only with                    |        |   127.0.0.1:<kvmgr_stats_port>|
+  |   kvmgr_control_plane=1      |        |                               |
+  |                              |        |   holds the disk index        |
+  +------------------------------+        +-------------------------------+
+                 |
+                 v
+  +-------------+   +-------------+
+  | worker r0   |   | worker r1   |   one per GPU; they move the bytes
+  +-------------+   +-------------+
+```
+
+**Stats listener** (in the engine core; `kvmgr_stats_port=0` turns it off):
+
+| route | what it does |
+|---|---|
+| `GET /kv` | the disk index, counters, settings, and every knob with where it came from |
+| `GET /metrics` | Prometheus metrics |
+| `GET /flags` | the current knob values |
+| `POST /kv/verify` | check saved blocks on every node again. Returns **202** and runs at the next scheduler step |
+
+**API server** (only with `kvmgr_control_plane=1`):
+
+| route | what it does |
+|---|---|
+| `GET /kv`, `GET /kv/workers` | the state of each worker, and the transfer ledger |
+| `POST /kv/knob`, `POST /kv/knob/clear` | set or clear an override in every process, and show each one's answer |
+| `POST /kv/drop_gpu_cache` | empty the GPU prefix cache but keep the disk. Refused unless `gpu_cache_drop_allowed` is on |
+| `POST /kv/reload` | only exists when the hot-reload diagnostic is on |
+
+Two things to watch for:
+
+- **The disk index is in the engine core.** `GET /kv` on the API server shows
+  `disk: null`, because that process does not have it. Ask the stats listener.
+- **The control plane uses vLLM's own port.** If you put that port behind a
+  proxy, your users can reach these routes too.
+
+## How the disk cache works
+
+Each GPU (each "rank") holds part of every block. Each rank saves its own part
+to its own node's disk. The data goes through a small pinned buffer in CPU
+memory, called **staging**.
+
+```
+  node A (rank 0)                           node B (rank 1)
+
+  GPU memory                                GPU memory
+     |   ^                                     |   ^
+save |   | restore                        save |   | restore
+     v   |                                     v   |
+  staging (pinned CPU memory)               staging (pinned CPU memory)
+     |   ^                                     |   ^
+     v   |                                     v   |
+  /kvoffload/dspark-kv-v1/<fp>_r0/          /kvoffload/dspark-kv-v1/<fp>_r1/
+```
+
+A block counts as saved only when **both** ranks have written their part.
+
+### Saving
+
+1. vLLM's scheduler picks which blocks to save.
+2. The plugin matches each block with its name (key), and checks the match on
+   every transfer. If the match is wrong, it refuses to write.
+3. Big jobs are split into rounds, so they fit in the staging buffer.
+4. Each file is written as `.part` and then renamed. A file that exists is
+   always a whole file.
+
+### Restoring
+
+```
+  disk file --(read thread)--> staging --(GPU copy)--> GPU memory
+
+  load_inflight_max   = how many GPU copies may run at once  (default 1)
+  load_read_ahead     = how many more rounds may read from disk while
+                        they wait                            (default 1)
+```
+
+`lookup` checks the index. A prompt reuses blocks in one unbroken run from
+the start, the same as vLLM does on the GPU.
+
+### Keeping track of what is saved
+
+- The index of saved blocks is kept in a journal (an append-only log) plus a
+  snapshot. A crash, even in the middle of writing the snapshot, loses
+  nothing.
+- **At startup**, every saved block is checked on every node (does the file
+  exist, is it the right size) before vLLM starts taking requests. This is
+  the slowest part of startup, and it grows with the cache. It cannot be
+  skipped: in vLLM, a failed restore stops the engine, so a missing file
+  would crash it.
+
+### Running out of space
+
+- Each node has a size budget. When it is full, the least recently used
+  prompts are removed, **last blocks first**. A prompt is only useful from its
+  start, so removing the first block would waste all the blocks after it.
+- A block that is being restored right now cannot be removed.
+- If the disk gets too full, saving stops before the disk fills up.
+- If a file is missing on any node, that block is dropped from the index
+  before anything tries to restore it.
+
+### The folder name (fingerprint)
+
+Files go in `<root>/dspark-kv-v1/<fingerprint>_r<rank>/`. The fingerprint is
+a hash of:
+
+- the model files (`config.json` and the safetensors files),
+- the parallel sizes and the cache data type,
+- each group's block size and layers,
+- the plugin's file format version.
+
+If any of these change, the new setup uses a new folder and simply misses.
+Old files are never read by the wrong setup. A test also fails if someone
+changes the file layout by accident.
+
+### Why not vLLM's own tiering spec
+
+vLLM's `TieringOffloadingSpec` sends every tier through one shared-memory area
+per machine. With one rank per node, rank 1's half goes to the wrong machine's
+`/dev/shm`. Every file it wrote had a second half full of zeros, and nothing
+caught it. The DSpark repo's `docs/UPSTREAM-FINDINGS.md` has the details and
+four other findings.
+
+## How the GPU manager decides
+
+- **`kvmgr_enabled` is checked on every call.** When it is off, the plugin
+  runs vLLM's own code, not its own code with default settings.
+- **`protect_alloc=by_need`** splits the protected space by what each group
+  can use. A sliding-window group never needs more than its window, so it
+  gets that, and full attention gets the rest. On the reference model, full
+  attention gets 8,192 blocks (2,097,152 tokens) instead of 3,643 with
+  `equal`, which is 2.25x more.
+- **`evict_order`** can be `fifo` (vLLM's default), `lru`, or
+  `lru_tail_first`. In a test with four 12K-token prompts, `lru` kept 87% of
+  the kept blocks usable and `lru_tail_first` kept 100%.
+- **Every removal is counted by reason** (`cap`, `pool`, `reset`). A `cap`
+  removal when the pool is not full is a bug. A `pool` removal just means the
+  GPU is full.
+
+## Diagnostics (`kvmgr.diag`)
+
+Optional tools for finding problems. Each one has a knob:
+
+| tool | knob | default |
 |---|---|---|
-| stats listener, `127.0.0.1:<kvmgr_stats_port>` (0 binds nothing), engine-core process | `GET /kv` | the disk index, counters, policy, every knob with its source |
-| | `GET /metrics` | Prometheus text, labelled by group, cause and victim rule |
-| | `GET /flags` | effective knob values |
-| | `POST /kv/verify` | re-verify keys on all ranks; answers **202** and applies at the next scheduler step |
-| API server, only with `kvmgr_control_plane=1` | `GET /kv`, `GET /kv/workers` | per-rank handler state and the transfer ledger |
-| | `POST /kv/knob`, `POST /kv/knob/clear` | set or clear an override in the API server, the engine core **and every worker**, with each rank's answer |
-| | `POST /kv/drop_gpu_cache` | drop the GPU prefix cache, keeping the disk index; refused unless `gpu_cache_drop_allowed` |
-| | `POST /kv/reload` | **absent** unless the hot-reload diagnostic is installed |
+| hang dump: a stack trace on a crash, or on `kill -USR1` | `diag_hang_dump` | **on** |
+| transfer ledger: which blocks each transfer used, logged on a fault | `diag_transfer_ledger` | **on** |
+| the ledger file (below), and the `LEDGER OVERLAP` check. Can be changed while running | `diag_ledger_file` | **on** |
+| find where numpy numbers leak into vLLM's messages | `diag_serializer_walk` | off |
+| write a file with the KV cache layout | `diag_geometry_snapshot` | off |
+| fixes for vLLM's tiering spec | `diag_tiering_shims` | off |
+| reload the plugin's code in a running engine | `diag_hot_reload` | off |
 
-**The disk index lives in the engine core.** `GET /kv` on the API server
-therefore answers `disk: null`, because it is the wrong process. Read the stats
-listener. **The control plane shares the engine's own port**, so anything that
-proxies that port exposes these routes to its clients.
+These are set up when the plugin loads, so changing them needs a restart.
+`diag_ledger_file` is the one exception.
 
-## How the disk tier works
+The main code never imports `kvmgr.diag`. A test checks this. Another test
+checks that with every diag knob off, no diag code is loaded at all.
 
-- **Store.** The scheduler decides what to offload. Our handler pairs blocks
-  with keys **positionally** and checks the pairing on every transfer,
-  refusing rather than writing another block's KV under a key. A job of any
-  size is pumped over rounds through the staging pool. Each file is written to
-  `.part` and renamed, because a file's existence **is** the presence check.
-- **Presence.** A key becomes present only when every rank reports its slice
-  written, which is the framework's own all-ranks aggregation. The index is
-  persisted as an append-only **journal** with a snapshot as its compaction,
-  and a SIGKILL, including one mid-compaction, loses nothing.
-- **Boot.** The index is replayed, then every key is checked on **every rank**
-  (file present, right size) before the API listens. This walk dominates boot
-  time and grows with the index. It cannot be skipped: upstream's
-  `offloading/worker.py` asserts on a failed load, so a vanished file would
-  otherwise kill the engine.
-- **Restore.** `lookup` answers from the index, and reuse is a contiguous run
-  from token 0, exactly as on the GPU.
-- **Growth.** A byte budget per node with LRU eviction **tail-first**.
-  Evicting a prefix's head writes off everything behind it, so the tail goes
-  first. A key with a load in flight holds a counted eviction hold. A
-  free-space floor freezes stores before a disk fills. Files missing on any
-  rank are condemned before a load can reach them (self-heal).
-- **Fingerprint.** Files live under
-  `<root>/dspark-kv-v1/<fingerprint>_r<rank>/`. The fingerprint hashes the
-  model's content identity (`config.json` plus the safetensors
-  `filename → blob` map, deliberately not the HF revision), the parallel
-  sizes, cache dtype, every group's block size and layers, and our format
-  version. A changed configuration misses by construction. An accidental
-  layout change is caught **offline** by a pinned hash of the layout functions.
+### Reading the ledger after a GPU fault
 
-**Why not upstream's tiering spec.** `TieringOffloadingSpec` routes every tier
-through one shared-memory CPU region per host. With one tensor-parallel rank
-per node, rank 1's half reaches a different host's `/dev/shm` and goes nowhere:
-every file it wrote had its second half zero, and nothing refused. The details
-and four other findings are in the DSpark repo's `docs/UPSTREAM-FINDINGS.md`.
+Each worker writes `<tier parent>/diag/ledger-r<rank>.jsonl`. It gets a
+`submit` line **before** each GPU transfer starts, and a `done` line when the
+plugin sees it finish.
 
-### This README was once confidently wrong about the disk tier
+```
+  {"ev":"submit","kind":"load","inner":1000051,"boot":"1791974370-2e92673a",...}
+  {"ev":"done",  "kind":"load","inner":1000051,"boot":"1791974370-2e92673a",...}
+```
 
-It used to carry a section headed **"The disk tier is not buildable here"**.
-The section argued, correctly, that a KV cache manager holds no KV bytes, and
-then concluded that a disk tier was impossible. The bytes are reachable from
-the worker side, and the tier has since written and restored hundreds of
-gigabytes. The section is named here rather than quietly deleted, because a
-document that was wrong about its own central question is worth knowing about
-when deciding how far to trust the rest.
+After a crash:
 
-## The manager's policies
+1. Find the `boot` value of the process that died. (Use `boot`, not `pid`.
+   Inside a container, the worker gets the same pid every time.)
+2. The `submit` lines from that boot with no `done` are what the GPU was
+   working on. `kvmgr.diag.ledger.open_entries()` finds them for you.
+3. Compare their `ts` times with the Xid time in `journalctl -k`.
 
-- **`kvmgr_enabled` is read per call.** The manager class is chosen once at
-  boot, so we are always constructed, and "off" means calling `super()`:
-  literally upstream's code path, not our policy with default settings.
-- **`protect_alloc=by_need`** splits the protection budget by need, not
-  equally. A sliding-window group can only ever use its window, so it gets
-  that and full attention gets the rest. On the reference geometry that is
-  8,192 blocks (2,097,152 tokens) for group 0 against 3,643 under `equal`,
-  2.25x. Read naively as "the same token extent per group" it would be a 21x
-  regression, which is why the windows are load-bearing.
-- **`evict_order`** is `fifo` (upstream), `lru`, or `lru_tail_first`. Measured
-  live with four 12K-token prefixes: `lru` kept 87% of the surviving blocks
-  reusable and `lru_tail_first` kept 100%.
-- **Eviction is counted by cause** (`cap`, `pool`, `reset`) and by victim rule.
-  A `cap` eviction on an idle pool is a policy bug; a `pool` eviction is
-  capacity.
+Useful fields on a `submit` line:
 
-## Diagnostics (`kvmgr.diag`, opt-in)
+| field | meaning |
+|---|---|
+| `gpu_loads`, `gpu_stores` | how many transfers were already on the GPU |
+| `ops` | how many copy steps this one transfer has |
+| `overlap` | another transfer was using some of the same GPU blocks |
+| `in_step` | (loads) how many of the target blocks the current batch is using. `null` means it could not be read, which is not the same as 0 |
+| `req`, `req_in_step` | (loads) the request this load is for, and whether it is in the current batch |
 
-| module | knob | default |
-|---|---|---|
-| hang dump: `faulthandler` on fatal signals plus `kill -USR1` for a live process | `diag_hang_dump` | **on** |
-| transfer ledger: index ranges per transfer, logged on a fault | `diag_transfer_ledger` | **on** |
-| ...its write-ahead file `<tier parent>/diag/ledger-r<rank>.jsonl` (one line per GPU transfer before submit, one on completion) and the live `LEDGER OVERLAP` check; **hot** | `diag_ledger_file` | **on** |
-| numpy-scalar producer walk (the `.item()` **coercion** itself is core) | `diag_serializer_walk` | off |
-| KV geometry snapshot file | `diag_geometry_snapshot` | off |
-| shims for upstream's tiering spec (O_DIRECT, hybrid block sizes, verify) | `diag_tiering_shims` | off |
-| hot reload of kvmgr in a running engine, and `/kv/reload` | `diag_hot_reload` | off |
+A `done` line is written when the plugin *notices* the transfer finished,
+which can be up to one scheduler step late. So `overlap` means "the plugin
+counted these blocks in two transfers at the same time". That is needed for
+the suspected bug, but it does not prove it.
 
-These are installed at plugin load, so they are boot-time knobs (except
-`diag_ledger_file`, read per transfer once the ledger is installed).
+## What it changes inside vLLM
 
-**Reading the write-ahead ledger after a fault.** The entries with a `submit`
-and no `done` for the dead process's `pid` are what the GPU had been handed and
-had not been seen to finish; line their `ts` up against `journalctl -k`'s Xid.
-`kvmgr.diag.ledger.open_entries()` does the matching. An entry's span is submit
-to OBSERVED completion (polled once per scheduler step), a superset of the GPU's
-own, so an `overlap` field means the bookkeeping held a block in two transfers
-at once -- necessary for the suspected race, not proof of it. No functional
-module imports `kvmgr.diag`; a test lint enforces that, and another proves that
-with every knob off no diag module is imported at all.
+Public hooks: `spec_manager_map`, `OffloadingSpecFactory.register_spec`, and
+the `vllm.general_plugins` entry point.
 
-## What it touches in vLLM
+Private parts (this is why the vLLM version matters):
 
-Public: `spec_manager_map`, `OffloadingSpecFactory.register_spec`, the
-`vllm.general_plugins` entry point. Private, and the reason for the version
-window:
-
-- wraps `KVCacheCoordinator.__init__` (to read the real group geometry),
-  `OffloadingConnectorScheduler.__init__`, `EngineCore.collective_rpc`,
-  `EngineCore.step` (a one-shot boot step) and the API server's router hook;
-- replaces `MsgpackEncoder.enc_hook` to coerce numpy scalars. Without it, one
-  numpy scalar kills the engine core's **output thread**, and every request
-  hangs with nothing logged;
-- adds `kvmgr_*` methods to `vllm.v1.worker.gpu_worker.Worker` for
+- wraps `KVCacheCoordinator.__init__`, `OffloadingConnectorScheduler.__init__`,
+  `EngineCore.collective_rpc`, `EngineCore.step` (once, at startup) and the
+  API server's router hook;
+- replaces `MsgpackEncoder.enc_hook` to turn numpy numbers into plain Python
+  numbers. Without this, one numpy number stops the engine's output thread,
+  and every request hangs with nothing in the log;
+- adds `kvmgr_*` methods to `vllm.v1.worker.gpu_worker.Worker`, for
   `collective_rpc`;
-- reads offload-scheduler and connector-worker privates, and finds a few of
-  them by walking caller frames.
+- reads private fields of the offload scheduler and connector worker, and
+  finds some of them by looking up the call stack.
 
-## On a vLLM without the DSpark fork
+## Without the DSpark patches
 
-The DSpark recipe's `patch6` carries three mechanisms that are not kvmgr: SWA
-recycle, free-queue prepend and static-head pin. When patch6 is present,
-`kvmgr.compat.dspark` bridges to it. Its flag reader shares kvmgr's cache, an
-override reaches its knobs, its knobs are declared, and its pending-blocks
-hook gets kvmgr's provider. Without patch6:
+The DSpark recipe's `patch6` adds three features that are not part of this
+plugin: SWA recycle, free-queue prepend and static-head pin. When `patch6` is
+there, `kvmgr.compat.dspark` connects the two: they share settings, and
+overrides reach `patch6`'s knobs too.
+
+Without `patch6`:
 
 - those knobs do not exist, and `/kv` does not list them;
-- **releasing a protected block does not consult in-flight KV transfers**,
-  because that hook is patch6's;
-- with our policy off, the cap is upstream's own legacy cap, which knows no
-  fraction;
-- if the group geometry cannot be read, the manager uses upstream's cap rather
-  than guessing a group count;
-- registration relies on the entry point alone (patch6 also offers a lazy
-  in-module hook).
+- **freeing a protected block does not check for KV transfers in progress**,
+  because that check lives in `patch6`;
+- with the plugin's GPU policy off, the limit is vLLM's own;
+- if the group layout cannot be read, the manager uses vLLM's own limit
+  instead of guessing;
+- the plugin loads only through the entry point.
 
-## What this does not guarantee
+## Known limits
 
-- **A failed transfer is fatal upstream**, not a miss: `offloading/worker.py`
-  is a bare `assert transfer_result.success`. We make the reachable cases
-  impossible (boot verification, eviction holds, self-heal), but an `EIO` or
-  `ENOSPC` mid-transfer will still take the engine down.
-- **If the model directory cannot be read, the fingerprint degrades to the
-  model name.** It is published as `model_identity: unknown`.
-- **The space budget is per node and bounds the index, not the disk.** Files
-  the index cannot name are invisible to it; the DSpark repo's
-  `local-ops/kvsweep.sh` removes them.
-- **GPU faults on the first large restore after a boot** (Xid 32) have been
-  seen twice, with every index in range. They are not proven to be ours.
+- **In vLLM, a failed restore stops the engine.** It is a plain
+  `assert transfer_result.success` in `offloading/worker.py`. The plugin
+  avoids the cases it can predict (startup checks, removal holds, dropping
+  missing files). A disk error (`EIO`) or a full disk (`ENOSPC`) in the
+  middle of a transfer will still stop the engine.
+- **If the model folder cannot be read, the fingerprint falls back to the
+  model name.** `/kv` then shows `model_identity: unknown`.
+- **The size budget counts only files in the index.** Files the index does not
+  know about are not counted. The DSpark repo's `local-ops/kvsweep.sh` removes
+  them.
+- **GPU faults (Xid 32) have happened while blocks were moving to or from
+  disk.** We have not proven what causes them. The ledger above is how we are
+  looking.
 
 ## Tests
 
-    bash tests/run-all.sh
+```sh
+bash tests/run-all.sh; echo $?
+```
 
-Sixteen suites, no GPU, no cluster, a few seconds, run against vLLM's own
-sources with numpy and torch stubbed. They run twice: on pristine vLLM, and
-with the DSpark patches. See `tests/README.md`.
+- 17 test files. No GPU and no cluster needed. Takes a few seconds.
+- They run against vLLM's own source files, with numpy and torch faked.
+- Everything runs twice: once on plain vLLM, and once with the DSpark patches.
+  The DSpark run needs `KVMGR_DSPARK_REPO` set to a DSpark recipe checkout.
+  Without it, every DSpark test fails. To run only the plain-vLLM tests, use
+  `MODES=pristine bash tests/run-all.sh`.
+- Check the exit code, not the last line.
+
+See `tests/README.md` for more.
 
 ## License
 
-Apache License 2.0, see `LICENSE` and `NOTICE`. `tests/upstream/` holds
-unmodified vLLM sources under the same license.
+Apache License 2.0. See `LICENSE` and `NOTICE`. `tests/upstream/` holds
+unchanged vLLM source files under the same license.
