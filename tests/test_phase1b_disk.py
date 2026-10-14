@@ -3051,6 +3051,36 @@ check("the watchdog fingerprint carries rounds_done",
       _lsrc[_lsrc.index("def _handler_progress"):
             _lsrc.index("def _watchdog_loop")])
 
+# ---- C6: a load wait() must not lose OTHER loads' completions ---------------
+# The load wait() used to loop on get_finished(), which empties _ready: a load
+# that completed while wait() spun for a DIFFERENT id was dropped, its job
+# already popped, so its request never resumed. Load ids reach wait() through
+# reset_cache (scheduler.py:850-855). The store side was fixed the same way.
+print("\n== (C6) load wait() keeps other loads' completions ==")
+F.write(load_inflight_max=4, load_read_ahead=0, load_batch_max=4,
+        load_ops_max=0)
+flags.reset_for_tests()
+hw6 = mkloadhandler(16)
+check("two loads accepted", load_job(hw6, 61, 4, 700, 61)
+      and load_job(hw6, 62, 4, 710, 62))
+for f in hw6._readers.futs:
+    f.finish()
+hw6.wait({61})
+eq("wait() returns once ITS load is done, with job 61 popped",
+   61 in hw6._jobs, False)
+eq("*** the OTHER load's completion is still reported on the next step ***",
+   step(hw6), {61: True, 62: True})
+_w6 = _re.findall(r"def wait\(self, job_ids: set\) -> None:(.*?)(?=\n    def )",
+                  _lsrc, _re.S)
+eq("both handlers define wait()", len(_w6), 2)
+for _i, _body in enumerate(_w6):
+    _body = _body.split('"""')[-1]          # drop the docstring
+    _code = "\n".join(_l.split("#")[0] for _l in _body.splitlines())
+    check(f"wait() #{_i + 1} never calls get_finished()",
+          "get_finished(" not in _code)
+F.write(load_inflight_max=1)
+flags.reset_for_tests()
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
     for f in FAIL:

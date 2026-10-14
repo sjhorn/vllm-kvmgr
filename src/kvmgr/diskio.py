@@ -2474,7 +2474,11 @@ class DiskLoadHandler:
         deadline = time.monotonic() + 120.0
         while rem and time.monotonic() < deadline:
             self.stats["wait_rounds"] += 1
-            for r in self.get_finished():
+            # _collect, NEVER get_finished: get_finished empties _ready, so
+            # every OTHER load completed in this loop was lost for good and
+            # its request never resumed. See DiskStoreHandler.wait.
+            self._collect()
+            for r in self._ready_buf():
                 rem.discard(r.job_id)
             if rem:
                 time.sleep(0.0005)
