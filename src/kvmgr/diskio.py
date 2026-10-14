@@ -1503,21 +1503,24 @@ class DiskStoreHandler:
         for t in kv_caches.tensors:
             gpu_tensors.append(t.tensor.view(torch.int8).view((-1, t.page_size_bytes)))
             self._staging.append(torch.empty(
-                (staging_blocks, t.page_size_bytes * spec.block_size_factor),
+                (staging_blocks, t.page_size_bytes * spec.blocks_per_chunk),
                 dtype=torch.int8, device="cpu", pin_memory=pin))
 
         self._gpu_tensors = gpu_tensors   # the load handler reuses these
+        # vLLM 0.31: blocks_per_chunk / layer_refs_per_group, and the inner
+        # handler now waits on the compute stream in BOTH directions.
         self._inner = SingleDirectionOffloadingHandler(
             gpu_tensors=gpu_tensors, cpu_tensors=self._staging,
-            block_size_factor=spec.block_size_factor,
-            kv_cache_groups_data_refs=self._refs, gpu_to_cpu=True,
+            blocks_per_chunk=spec.blocks_per_chunk,
+            layer_refs_per_group=self._refs, gpu_to_cpu=True,
+            host_memory_is_pinned=pin,
         )
         # Batching per group is only trivial at factor 1 (block_indices enters
         # the inner arithmetic as `block_idx % factor`). Asserted rather than
         # assumed, because a silently wrong offset is the F8_E8M0 class.
-        assert spec.block_size_factor == 1, (
+        assert spec.blocks_per_chunk == 1, (
             "kvmgr: the disk handler batches per group, which assumes "
-            f"block_size_factor == 1 (got {spec.block_size_factor}). Do not set "
+            f"blocks_per_chunk == 1 (got {spec.blocks_per_chunk}). Do not set "
             "'block_size' in kv_connector_extra_config.")
         # *** NOT the flags directory: it is mounted READ-ONLY into the
         # container, which the first attempt discovered the honest way --
@@ -1539,7 +1542,7 @@ class DiskStoreHandler:
         # Measured geometry: 63 tensors summing to 1,039,680 B a block, so 32
         # blocks is 33 MB and 256 is 266 MB per rank. One log line beats
         # anybody doing that arithmetic from a shape dump again.
-        _per_block = sum(t.page_size_bytes * spec.block_size_factor
+        _per_block = sum(t.page_size_bytes * spec.blocks_per_chunk
                          for t in kv_caches.tensors)
         logger.info(
             "kvmgr: staging allocation -- %d blocks x %d tensors = %.1f MB "
@@ -1970,9 +1973,9 @@ class DiskStoreHandler:
                 try:
                     ok = self._inner.transfer_async(
                         inner,
-                        (GPULoadStoreSpec(_sb, group_sizes=gs,
-                                          block_indices=[0] * ngroups),
-                         CPULoadStoreSpec(_ss)))
+                        GPULoadStoreSpec(_sb, group_sizes=gs,
+                                         block_indices=[0] * ngroups),
+                        CPULoadStoreSpec(_ss))
                 except Exception:
                     logger.exception("kvmgr: inner GPU->staging submit raised")
                     ok = False
@@ -2063,7 +2066,7 @@ class DiskStoreHandler:
 
     def _collect(self) -> None:
         self.reconcile_pool()
-        from vllm.v1.kv_offload.worker.worker import TransferResult
+        from vllm.v1.kv_offload.base import TransferResult
 
         # *** THE FENCE FIX, and it is a LEGIBILITY fix rather than a recovery.
         # A job whose copy will never complete (a dead GPU after an Xid is the
@@ -2163,8 +2166,7 @@ class DiskStoreHandler:
                     # output socket thread and the clients hang for ever.
                     job_id=int(job_id), success=True,
                     transfer_size=int(st["bytes"]),
-                    transfer_time=_elapsed(st.get("t0")),
-                    transfer_type=("GPU", self._spec.disk_medium)))
+                    transfer_time=_elapsed(st.get("t0"))))
         return None
 
     def wait(self, job_ids: set) -> None:
@@ -2398,10 +2400,10 @@ class DiskLoadHandler:
         self._staging = []
         for t in kv_caches.tensors:
             self._staging.append(torch.empty(
-                (staging_blocks, t.page_size_bytes * spec.block_size_factor),
+                (staging_blocks, t.page_size_bytes * spec.blocks_per_chunk),
                 dtype=torch.int8, device="cpu", pin_memory=pin))
         self._pool = SlotPool(staging_blocks)
-        _per_block = sum(t.page_size_bytes * spec.block_size_factor
+        _per_block = sum(t.page_size_bytes * spec.blocks_per_chunk
                          for t in kv_caches.tensors)
         logger.info(
             "kvmgr: LOAD staging allocation -- %d blocks x %d tensors = %.1f MB "
@@ -2416,13 +2418,13 @@ class DiskLoadHandler:
         # the inner handler, whose attribute name is upstream's to change.
         self._gpu_tensors = getattr(store, "_gpu_tensors", None) or []
         self._inner = SingleDirectionOffloadingHandler(
-            gpu_tensors=store._inner.gpu_tensors
-            if hasattr(store._inner, "gpu_tensors") else store._gpu_tensors,
+            gpu_tensors=store._gpu_tensors,
             # Our own rows, so no GPU stream ever writes this buffer.
             cpu_tensors=self._staging,
-            block_size_factor=spec.block_size_factor,
-            kv_cache_groups_data_refs=self._refs,
+            blocks_per_chunk=spec.blocks_per_chunk,
+            layer_refs_per_group=self._refs,
             gpu_to_cpu=False,
+            host_memory_is_pinned=pin,
         )
         # ask9: this handler's copy goes through load_copy_api. The proxy sits
         # in the handler module's `ops` global, but it is inert unless OUR
@@ -2835,7 +2837,7 @@ class DiskLoadHandler:
     def _collect_locked(self) -> None:
         from vllm.v1.kv_offload.base import GPULoadStoreSpec
         from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-        from vllm.v1.kv_offload.worker.worker import TransferResult
+        from vllm.v1.kv_offload.base import TransferResult
 
         self.reconcile_pool()
 
@@ -2955,9 +2957,9 @@ class DiskLoadHandler:
             self._ledger_submit("load", inner, job_id, g, bids, slots)
             with copyapi.active(_mode, _chunk) as _rec:
                 ok = self._inner.transfer_async(
-                    inner, (CPULoadStoreSpec(slots),
-                            GPULoadStoreSpec(bids, group_sizes=gs,
-                                             block_indices=[0] * ngroups)))
+                    inner, CPULoadStoreSpec(slots),
+                    GPULoadStoreSpec(bids, group_sizes=gs,
+                                     block_indices=[0] * ngroups))
             self.stats["copy_calls_" + _mode] = (
                 self.stats.get("copy_calls_" + _mode, 0) + _rec["calls"])
             if not ok:
@@ -3011,8 +3013,7 @@ class DiskLoadHandler:
                 job_id=int(job_id), success=ok is not False,
                 # int() for the same reason as the store side.
                 transfer_size=(int(st["bytes"]) if ok else None),
-                transfer_time=_elapsed(st.get("t0")),
-                transfer_type=(self._spec.disk_medium, "GPU")))
+                transfer_time=_elapsed(st.get("t0"))))
         return None
 
     def wait(self, job_ids: set) -> None:

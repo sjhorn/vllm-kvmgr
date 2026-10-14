@@ -154,7 +154,10 @@ def load_kv_offload() -> types.ModuleType:
     `vllm.v1.core.kv_cache_utils`, which is PATCH 8 -- so the block-size
     resolution these tests see is our patched one, which is the point.
     """
-    load()  # patch8 must be in sys.modules under its canonical name first
+    # vLLM 0.31: base.py no longer imports kv_cache_utils, so the disk tier
+    # loads WITHOUT the GPU-manager core (which has no hook on 0.31 and does
+    # not load here). Stubs only.
+    vllm_stubs.install()
     # *** IDEMPOTENT. *** A second load re-executes base.py and mints NEW class
     # objects, so a spec built against the first copy is no longer an instance
     # of the second's LoadStoreSpec -- every isinstance check then fails for a
@@ -164,17 +167,15 @@ def load_kv_offload() -> types.ModuleType:
         return sys.modules["vllm.v1.kv_offload.base"]
 
     kvo = os.path.join(PRISTINE, "vllm", "v1", "kv_offload")
-    for name in ("vllm.v1.kv_offload", "vllm.v1.kv_offload.worker",
-                 "vllm.v1.kv_offload.tiering"):
+    for name in ("vllm.v1.kv_offload", "vllm.v1.kv_offload.tiering"):
         if name not in sys.modules:
             mod = types.ModuleType(name)
             sys.modules[name] = mod
             parent, _, leaf = name.rpartition(".")
             setattr(sys.modules[parent], leaf, mod)
 
+    _load_file(os.path.join(kvo, "config.py"), "vllm.v1.kv_offload.config")
     _load_file(os.path.join(kvo, "base.py"), "vllm.v1.kv_offload.base")
-    _load_file(os.path.join(kvo, "worker", "worker.py"),
-               "vllm.v1.kv_offload.worker.worker")
     _load_file(os.path.join(kvo, "factory.py"), "vllm.v1.kv_offload.factory")
     # cpu/common.py holds CPULoadStoreSpec, which the disk handler uses as the
     # inner (staging) destination -- so the chunking tests need it.
@@ -349,12 +350,13 @@ class Flags:
 
     def __init__(self, path: str):
         self.path = path
-        H = load()
-        self.mod = H.mgr_mod
+        # vLLM 0.31: the GPU-manager core may not load; flags do not need it.
+        vllm_stubs.install()
+        self.mod = sys.modules.get("vllm.v1.core.single_type_kv_cache_manager")
         from kvmgr import flags as _kf
 
         _kf.FLAGS_PATH = path
-        if hasattr(self.mod, "_FLAGS_PATH"):
+        if self.mod is not None and hasattr(self.mod, "_FLAGS_PATH"):
             self.mod._FLAGS_PATH = path
 
     def write(self, **kw) -> None:

@@ -214,7 +214,7 @@ def run(h, store, ops=None, clock=time.monotonic, sleep=time.sleep,
             res["result"] = "running"
             write()
             iid += 1
-            if not h._inner.transfer_async(iid, (cpu, gpu)):
+            if not h._inner.transfer_async(iid, cpu, gpu):    # 0.31 signature
                 res.update(result="faulted", why="transfer_async returned False")
                 stop = "a copy failed to submit"
                 write()
@@ -236,7 +236,7 @@ def run(h, store, ops=None, clock=time.monotonic, sleep=time.sleep,
                     ops.poison(store._staging[t], len(chunk))
                 gpu2, cpu2 = make_specs(chunk, ngroups, range(len(chunk)))
                 iid += 1
-                if not store._inner.transfer_async(iid, (gpu2, cpu2)):
+                if not store._inner.transfer_async(iid, gpu2, cpu2):
                     raise RuntimeError("readback submit returned False")
                 st2, ms2, why2 = wait_event(store._inner, iid, COPY_TIMEOUT_S,
                                             clock, sleep)

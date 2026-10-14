@@ -14,7 +14,8 @@ The source is upstream's own per-request state in the engine core:
 `OffloadingConnectorScheduler._req_status[req].group_states[g].offload_keys`,
 the full ordered key list per KV group, in prompt order. While the request is
 alive it is read live; when it finishes, `request_finished` (wrapped here; it
-runs before upstream drops the state) copies the lists into a bounded ring.
+runs before 0.21 drops the state, and again after it so 0.31's final-block
+key is included) copies the lists into a bounded ring.
 
 `GET /kv/keys` on the engine-core stats port (kvmgr_stats_port):
 
@@ -67,11 +68,19 @@ def entry_of(osched, req_status) -> dict:
     groups = []
     for gi, gs in enumerate(req_status.group_states):
         cfg = cfgs[gi] if gi < len(cfgs) else None
+        # 0.21 names a key's span `offloaded_block_size` and the hits
+        # `num_hit_blocks`; 0.31 offloads per CHUNK (`tokens_per_chunk`,
+        # `num_hit_chunks`). Neither present -> None, never a made-up 0.
         bt = getattr(cfg, "offloaded_block_size", None)
+        if bt is None:
+            bt = getattr(cfg, "tokens_per_chunk", None)
+        hits = getattr(gs, "num_hit_blocks", None)
+        if hits is None:
+            hits = getattr(gs, "num_hit_chunks", None)
         groups.append({
             "group": int(getattr(cfg, "group_idx", gi)),
             "block_tokens": int(bt) if bt is not None else None,
-            "num_hit_blocks": int(getattr(gs, "num_hit_blocks", 0) or 0),
+            "num_hit_blocks": int(hits) if hits is not None else None,
             "keys": list(gs.offload_keys),
         })
     return {"req": str(req.request_id), "num_tokens": int(req.num_tokens),
@@ -235,8 +244,14 @@ def _install_capture() -> None:
         return
 
     def request_finished(self, request, *a, **kw):
-        capture(self, request.request_id)     # before upstream drops it
-        return orig(self, request, *a, **kw)
+        # BEFORE: vLLM 0.21 drops _req_status inside request_finished.
+        capture(self, request.request_id)
+        out = orig(self, request, *a, **kw)
+        # AFTER, replacing it when the state survives: 0.31 keeps it alive and
+        # first appends the final block's key (update_offload_keys), which the
+        # before-copy would miss.
+        capture(self, request.request_id)
+        return out
 
     request_finished._kvmgr_wrapped = True
     cls.request_finished = request_finished

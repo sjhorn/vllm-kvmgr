@@ -274,8 +274,7 @@ class Inner:
         self.gpu, self.host, self.refs, self.to_gpu, self.mode = gpu, host, refs, to_gpu, mode
         self._transfer_events, self.calls = {}, []
 
-    def transfer_async(self, iid, spec):
-        src, dst = spec
+    def transfer_async(self, iid, src, dst):      # vLLM 0.31's signature
         gspec, cspec = (dst, src) if self.to_gpu else (src, dst)
         self.calls.append((iid, list(gspec.block_ids)))
         for r in self.refs[0]:

@@ -16,7 +16,7 @@ license = { text = "Apache-2.0" }
 # The image's own build (0.21.1rc1.dev339) satisfies this, so pip has nothing
 # to replace there; install with --no-deps anyway to be certain it never
 # re-resolves vLLM inside a tuned image.
-dependencies = ["vllm>=0.21.1rc1.dev0,<0.22"]
+dependencies = ["vllm>=0.31.0,<0.32"]  # spike/vllm-0.31 only; main is 0.21
 
 [project.urls]
 Homepage = "https://github.com/sjhorn/vllm-kvmgr"

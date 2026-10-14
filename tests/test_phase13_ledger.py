@@ -51,7 +51,7 @@ def eq(name: str, got, want) -> None:
     check(name, got == want, f"got {got!r} want {want!r}")
 
 
-H = harness.load()
+H = harness.load_kv_offload()  # 0.31: the ledger needs the disk tier only
 import importlib  # noqa: E402
 
 from kvmgr import flags  # noqa: E402

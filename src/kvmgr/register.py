@@ -63,35 +63,11 @@ def register() -> None:
     _install_control_plane()
     _install_fork_bridges()
 
-    from vllm.v1.core import single_type_kv_cache_manager as stm
-    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    if _register_gpu_manager():
+        # Only with our manager registered: the hook stamps its class.
+        from .manager import DSparkMLAAttentionManager
 
-    from .manager import DSparkMLAAttentionManager
-
-    previous = stm.spec_manager_map.get(MLAAttentionSpec)
-    if previous is DSparkMLAAttentionManager:
-        _REGISTERED = True
-        return
-
-    # Phase 1 owns GROUP 0 ONLY -- MLAAttentionSpec, the full-MLA group whose
-    # cap is the one that binds.  The other four spec types stay on upstream's
-    # classes, which is both the narrow rollout and the fallback if this is
-    # wrong.
-    #
-    # NOTE for Phase 5: this is NOT sufficient for disk restore.  The hybrid
-    # coordinator converges the hit length to the MINIMUM across all five
-    # groups, so restoring only group 0 buys nothing -- every spec type has to
-    # be registered before a restore can lengthen a hit.  See
-    # docs/history/KVMGR-PHASE0-20261007.md finding 1.
-    stm.spec_manager_map[MLAAttentionSpec] = DSparkMLAAttentionManager
-    logger.info(
-        "kvmgr: registered %s for MLAAttentionSpec (was %s); group 0 only, "
-        "policy still gated on kvmgr_enabled",
-        DSparkMLAAttentionManager.__name__,
-        getattr(previous, "__name__", previous),
-    )
-
-    _install_group_geometry_hook(DSparkMLAAttentionManager)
+        _install_group_geometry_hook(DSparkMLAAttentionManager)
     _install_offload_scheduler_hook()
     # A failed restore -> invalid blocks -> recompute (kvmgr.loadfail). Both
     # patches act only once a load has failed; the worker reports failures that
@@ -142,6 +118,49 @@ def register() -> None:
     _REGISTERED = True
 
 
+
+
+def _register_gpu_manager() -> bool:
+    """Register DSparkMLAAttentionManager for MLAAttentionSpec. False when
+    this vLLM has no hook for it."""
+    from vllm.v1.core import single_type_kv_cache_manager as stm
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    # vLLM 0.31 removed spec_manager_map, MLAAttentionManager and all prompt
+    # block protection; spec->manager now goes through KVCacheSpecRegistry.
+    # The GPU-manager half is not ported, so skip it and let the disk half
+    # load alone.
+    if not hasattr(stm, "spec_manager_map") or not hasattr(
+            stm, "MLAAttentionManager"):
+        logger.warning(
+            "kvmgr: this vLLM has no spec_manager_map/MLAAttentionManager "
+            "(0.31+ uses KVCacheSpecRegistry); the GPU KV manager is NOT "
+            "registered. The disk tier still loads.")
+        return False
+    from .manager import DSparkMLAAttentionManager
+
+    previous = stm.spec_manager_map.get(MLAAttentionSpec)
+    if previous is DSparkMLAAttentionManager:
+        return True
+
+    # Phase 1 owns GROUP 0 ONLY -- MLAAttentionSpec, the full-MLA group whose
+    # cap is the one that binds.  The other four spec types stay on upstream's
+    # classes, which is both the narrow rollout and the fallback if this is
+    # wrong.
+    #
+    # NOTE for Phase 5: this is NOT sufficient for disk restore.  The hybrid
+    # coordinator converges the hit length to the MINIMUM across all five
+    # groups, so restoring only group 0 buys nothing -- every spec type has to
+    # be registered before a restore can lengthen a hit.  See
+    # docs/history/KVMGR-PHASE0-20261007.md finding 1.
+    stm.spec_manager_map[MLAAttentionSpec] = DSparkMLAAttentionManager
+    logger.info(
+        "kvmgr: registered %s for MLAAttentionSpec (was %s); group 0 only, "
+        "policy still gated on kvmgr_enabled",
+        DSparkMLAAttentionManager.__name__,
+        getattr(previous, "__name__", previous),
+    )
+    return True
 
 
 # Diagnostic module -> its knob. THE ONLY PLACE IN kvmgr's CORE THAT IMPORTS

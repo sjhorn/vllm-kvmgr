@@ -39,10 +39,14 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
+    LookupResult,
+    Medium,
     OffloadingEvent,
     OffloadingManager,
     OffloadingSpec,
+    OffloadingWorker,
     PrepareStoreOutput,
+    RequestOffloadingContext,
 )
 from vllm.v1.kv_offload.file_mapper import FileMapper
 
@@ -52,7 +56,7 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Iterable, Iterator, Sequence
 
     from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadKey, ReqContext
-    from vllm.v1.kv_offload.worker.worker import OffloadingHandler
+    from vllm.v1.kv_offload.base import GPULoadStoreSpec, TransferResult
 
 # A logger named __name__ is SILENTLY DROPPED: vLLM gives a handler to the
 # `vllm` logger only, so `kvmgr.*` sits at effective level 30 and every info()
@@ -1166,10 +1170,6 @@ class DiskLoadStoreSpec(LoadStoreSpec):
         # structure killed the engine's output thread earlier tonight.
         self.to_delete = [bytes(k) for k in (to_delete or [])]
 
-    @staticmethod
-    def medium() -> str:
-        return DISK_MEDIUM
-
     def __repr__(self) -> str:
         return (f"DiskLoadStoreSpec({len(self.keys)} keys"
                 f"{', %d to delete' % len(self.to_delete) if self.to_delete else ''})")
@@ -2131,7 +2131,18 @@ class DiskPresenceManager(OffloadingManager):
                              "in memory; a restart will simply forget it)")
 
     # -- reads ------------------------------------------------------------
-    def lookup(self, key: "OffloadKey", req_context: "ReqContext") -> bool | None:
+    def lookup(self, key: "OffloadKey", req_context: "ReqContext") -> LookupResult:
+        # vLLM 0.31: an enum, not a bool. A bool here is not an error upstream,
+        # it silently scores 0 hits, so the mapping is explicit.
+        ans = self._lookup_bool(key, req_context)
+        if ans is None:
+            return LookupResult.RETRY
+        return LookupResult.HIT if ans else LookupResult.MISS
+
+    def on_new_request(self, req_context: "ReqContext") -> RequestOffloadingContext:
+        return RequestOffloadingContext()
+
+    def _lookup_bool(self, key: "OffloadKey", req_context: "ReqContext") -> bool | None:
         self._ensure_index()
         self._stats["lookup"] += 1
         # One-shot, and `lookup` is the right place: it is called by the
@@ -2935,7 +2946,7 @@ class DiskPresenceManager(OffloadingManager):
             self._stats["evicted_bytes"] = (
                 self._stats.get("evicted_bytes", 0) + freed)
             self._events.append(OffloadingEvent(
-                keys=list(victims), medium=DISK_MEDIUM, removed=True))
+                keys=list(victims), medium=Medium.STORAGE, removed=True))
             self._unflushed += len(victims)
             # *** THROTTLED, BECAUSE AT STEADY STATE THIS IS NOT NEWS. ***
             # Measured: once the index is at budget every store evicts ~90 keys
@@ -3009,7 +3020,7 @@ class DiskPresenceManager(OffloadingManager):
         self._count_groups("completed", keys)
         if new:
             self._events.append(
-                OffloadingEvent(keys=list(new), medium=DISK_MEDIUM, removed=False)
+                OffloadingEvent(keys=list(new), medium=Medium.STORAGE, removed=False)
             )
             # complete_store is the ALL-RANKS edge, so this is the only place a
             # key may be claimed present -- see _load_manifest.
@@ -3323,26 +3334,26 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
     setting it requires a uniform block size we do not have.
     """
 
-    def __init__(self, vllm_config, kv_cache_config):
-        super().__init__(vllm_config, kv_cache_config)
+    def __init__(self, config):
+        # vLLM 0.31: one normalized OffloadingConfig replaces
+        # (vllm_config, kv_cache_config). The base sets tokens_per_block,
+        # tokens_per_hash and blocks_per_chunk from it.
+        super().__init__(config)
 
-        parallel = vllm_config.parallel_config
+        parallel = config.parallel
         self.world_size: int = parallel.world_size
         self.rank: int = parallel.rank
+        # *** offload_prompt_only DEFAULTS TO True in 0.31 *** (base.py), so
+        # decode blocks are no longer stored unless extra_config says otherwise.
 
         # THE PER-WORKER SLICE, derived exactly as cpu/spec.py derives it rather
         # than hardcoded -- because getting this wrong is how the tiering tier
         # came to write a page it only half filled. The fs tier takes
         # primary_kv_view.strides[0], which is the WHOLE page across all ranks;
         # the honest number is that divided by world_size.
-        if kv_cache_config is not None and kv_cache_config.num_blocks > 0:
-            total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
-            kv_bytes_per_block = (
-                total_gpu_kv_bytes // kv_cache_config.num_blocks
-            ) * self.world_size
-        else:
-            kv_bytes_per_block = 0
-        kv_bytes_per_offloaded_block = kv_bytes_per_block * self.block_size_factor
+        # 0.31 hands us the per-worker slice directly.
+        kv_bytes_per_block = config.worker_kv_bytes_per_block * self.world_size
+        kv_bytes_per_offloaded_block = kv_bytes_per_block * self.blocks_per_chunk
         self.whole_page_bytes: int = kv_bytes_per_offloaded_block
         self.page_size_per_worker: int = (
             kv_bytes_per_offloaded_block // self.world_size if self.world_size else 0
@@ -3405,6 +3416,11 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
         """
         import os as _os
         if DISK_FORMAT_VERSION != 1:
+            return
+        # vLLM 0.31: FileMapper's fields changed (tokens_per_hash,
+        # blocks_per_file) and the KV layout changed, so nothing under the
+        # 0.21 fingerprint is adoptable. Spike: no migration.
+        if not hasattr(self, "vllm_config"):
             return
         try:
             legacy = FileMapper(
@@ -3488,8 +3504,8 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
             # ours rather than inherited: a fingerprint is the one thing here
             # that must not change shape without us noticing, and
             # `test_mapper_fields_cover_upstreams` fails if upstream adds a key.
-            parallel_config = self.vllm_config.parallel_config
-            mc = self.vllm_config.model_config
+            cfg = self.config
+            parallel = cfg.parallel
             # *** PHASE 4: OUR FORMAT VERSION AND THE MODEL'S CONTENT IDENTITY
             # *** GO INSIDE THE HASH. ***
             # `inference_engine` is the one free-form string FileMapper takes,
@@ -3499,8 +3515,8 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
             # also names the directory, so an operator reading the filesystem
             # can see WHICH checkpoint a cache belongs to instead of only a
             # sha prefix.
-            self._content_id = model_content_id(
-                model_dir(mc.model, getattr(mc, "revision", None)))
+            # 0.31's config carries the model NAME only, no revision.
+            self._content_id = model_content_id(model_dir(cfg.model.name, None))
             if self._content_id == "unknown":
                 logger.warning(
                     "kvmgr: could not identify the model's CONTENT (dir not "
@@ -3508,27 +3524,25 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
                     "back to the model NAME, exactly as before Phase 4. Not a "
                     "regression, but this cache is no better protected against "
                     "a re-quantised checkpoint at the same id than it was.",
-                    mc.model)
+                    cfg.model.name)
             self._mapper = FileMapper(
                 root_dir=self.root_dir,
                 inference_engine="vllm+dspark-kv/v%d" % DISK_FORMAT_VERSION,
-                model_name="%s@%s" % (mc.model, self._content_id),
-                hash_block_size=self.hash_block_size,
-                gpu_blocks_per_file=self.block_size_factor,
-                tp_size=parallel_config.tensor_parallel_size,
-                pp_size=parallel_config.pipeline_parallel_size,
-                pcp_size=parallel_config.prefill_context_parallel_size,
-                dcp_size=parallel_config.decode_context_parallel_size,
-                rank=parallel_config.rank,
-                dtype=str(self.vllm_config.cache_config.cache_dtype).replace(
-                    "torch.", ""
-                ),
+                model_name="%s@%s" % (cfg.model.name, self._content_id),
+                tokens_per_hash=self.tokens_per_hash,
+                blocks_per_file=self.blocks_per_chunk,
+                tp_size=parallel.tp_size,
+                pp_size=parallel.pp_size,
+                pcp_size=parallel.pcp_size,
+                dcp_size=parallel.dcp_size,
+                rank=parallel.rank,
+                dtype=cfg.model.dtype,
                 kv_cache_groups=[
                     {
-                        "block_size": group.kv_cache_spec.block_size,
+                        "tokens_per_block": group.tokens_per_block,
                         "layer_names": list(group.layer_names),
                     }
-                    for group in self.kv_cache_config.kv_cache_groups
+                    for group in cfg.groups
                 ],
             )
             # *** `file_mapper` IS DELIBERATELY CALLABLE WITH A DUCK-TYPED
@@ -3542,7 +3556,7 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
             # test that guards the hardest bug this module has had.
             _mig = getattr(self, "_migrate_legacy_base", None)
             if _mig is not None:
-                _mig(parallel_config)
+                _mig(parallel)
 
             # *** LOG THE WHOLE FINGERPRINT, because the two processes DISAGREED
             # about it and nothing said so. *** Measured 2026-10-07: the worker
@@ -3605,88 +3619,56 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
                 logger.exception("kvmgr: could not start the stats port")
         return self._manager
 
-    def get_handlers(
-        self, kv_caches: "CanonicalKVCaches"
-    ) -> "Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]":
-        """Register the STORE direction only.
-
-        No (DISK -> GPU) handler exists yet, and that is the same safety property
-        `lookup()` enforces one layer up, done twice on purpose: with no load
-        handler registered, OffloadingWorker has nothing to route a load to, so a
-        restore cannot happen even if a future edit made lookup() optimistic.
-        Phase 3 adds the pair, and only once it can prove a restored block equals
-        what was stored.
-        """
-        from vllm.v1.kv_offload.base import GPULoadStoreSpec
-
+    def get_worker(self, kv_caches: "CanonicalKVCaches") -> OffloadingWorker:
+        """vLLM 0.31: one OffloadingWorker per spec, replacing the handler
+        pairs. Both handlers are built unconditionally, as before (see the
+        0.21 note in git history: withholding the load handler killed the
+        engine on a bare assert)."""
         from .diskio import DiskLoadHandler, DiskStoreHandler
 
-        handler = DiskStoreHandler(
-            spec=self,
-            kv_caches=kv_caches,
+        store = DiskStoreHandler(
+            spec=self, kv_caches=kv_caches,
             staging_blocks=self.staging_blocks,
             write_threads=self.write_threads,
         )
-        self._store_handler = handler
-        yield (GPULoadStoreSpec, DiskLoadStoreSpec, handler)
-
-        # *** THE LOAD DIRECTION IS REGISTERED ONLY IF disk_restore IS SET, and
-        # that is a SECOND lock on the same door. *** lookup() already refuses
-        # while the flag is off, so the scheduler never asks for a load; this
-        # means that even if a later edit made lookup() optimistic,
-        # OffloadingWorker would have no handler to route the transfer to.
-        #
-        # It is read ONCE here rather than per transfer, unlike every other knob
-        # in this plugin, and that is deliberate: handlers are registered at boot
-        # and cannot appear later, so a hot read would promise something the
-        # framework cannot deliver. This is the one knob that needs a restart,
-        # and saying so is better than a flag that silently does nothing.
-        # *** REGISTERED UNCONDITIONALLY, AND THE OLD GATE KILLED THE ENGINE
-        # TWICE OVER. *** This used to register the load handler only when
-        # `disk_restore` was set, on the stated reasoning that withholding it
-        # was a second gate -- "done twice so a later optimistic lookup() still
-        # cannot restore". That reasoning was wrong about the FAILURE MODE, and
-        # the box said so on 2026-10-08:
-        #
-        #   worker.py:133 in transfer_async
-        #       assert handler is not None
-        #   AssertionError
-        #   RuntimeError: Worker failed with error ''
-        #
-        # The SCHEDULER reads `disk_restore` hot, so flipping it on a running
-        # engine makes `lookup()` claim keys and `prepare_load` issue load jobs
-        # -- while the WORKER still has no DISK->GPU handler, because handlers
-        # register at construction. `OffloadingWorker.transfer_async` looks the
-        # handler up by medium pair, finds None, and dies on a BARE assert,
-        # taking the worker and then the engine core with it.
-        #
-        # So the second gate does not fail safe; it fails fatal. A gate whose
-        # failure mode is a bare assert in a worker is not a safety feature,
-        # and `lookup()` returning False is already structural: the scheduler
-        # only ever calls `prepare_load` for keys lookup claimed, so with
-        # restore off no file can reach a GPU tensor whether the handler exists
-        # or not.
-        #
-        # *** AND IT FIXES A SECOND BUG FOR FREE: THE RANKS NO LONGER DISAGREE
-        # ABOUT THEIR HANDLER SETS. *** Measured the same day, rank 1 built a
-        # DiskLoadHandler and rank 0 did not, because each node read its own
-        # (differently stale) flags file at boot. Registering unconditionally
-        # makes the handler sets identical by construction, which no amount of
-        # knob-syncing could guarantee -- the boot sync lands after
-        # construction.
-        #
-        # The cost is one object per worker that may never be used. That is the
-        # right price for a knob that is now genuinely hot on both sides.
-        self._load_handler = DiskLoadHandler(
+        load = DiskLoadHandler(
             spec=self, kv_caches=kv_caches,
-            # ITS OWN row count: the load no longer shares the store's buffer.
             staging_blocks=self.staging_load_blocks,
-            read_threads=self.write_threads, store=handler,
+            read_threads=self.write_threads, store=store,
         )
-        yield (DiskLoadStoreSpec, GPULoadStoreSpec, self._load_handler)
-        logger.info(
-            "kvmgr: DISK -> GPU handler registered unconditionally; "
-            "`disk_restore` is now genuinely HOT because lookup() is the only "
-            "gate. Currently %s. Withholding the handler used to be a second "
-            "gate and it killed the engine instead -- see the note here.",
-            "ON" if flags.peek("disk_restore") else "OFF")
+        self._store_handler, self._load_handler = store, load
+        return DiskOffloadingWorker(store, load)
+
+
+class DiskOffloadingWorker(OffloadingWorker):
+    """Adapts the two direction handlers to 0.31's OffloadingWorker.
+
+    The handlers keep their 0.21 `transfer_async(job_id, (src, dst))` shape;
+    this is the only place that knows the API moved."""
+
+    def __init__(self, store, load):
+        self._store = store
+        self._load = load
+
+    def submit_store(self, job_id: int, src_spec: "GPULoadStoreSpec",
+                     dst_spec: LoadStoreSpec) -> bool:
+        return self._store.transfer_async(job_id, (src_spec, dst_spec))
+
+    def submit_load(self, job_id: int, src_spec: LoadStoreSpec,
+                    dst_spec: "GPULoadStoreSpec") -> bool:
+        return self._load.transfer_async(job_id, (src_spec, dst_spec))
+
+    def get_finished(self) -> "list[TransferResult]":
+        return self._store.get_finished() + self._load.get_finished()
+
+    def wait(self, job_ids: set[int]) -> None:
+        # Each handler filters to the ids it holds.
+        self._store.wait(job_ids)
+        self._load.wait(job_ids)
+
+    def shutdown(self) -> None:
+        for h in (self._store, self._load):
+            try:
+                h.shutdown()
+            except Exception:
+                logger.exception("kvmgr: handler shutdown raised")
