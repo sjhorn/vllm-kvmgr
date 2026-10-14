@@ -48,8 +48,8 @@ KVMGR_DSPARK_REPO=<DSpark checkout> bash tests/run-all.sh; echo $?
   `dspark-kv-v1` root. They are part of the on-disk path, so renaming them
   orphans the existing tier. `KvmgrDiskOffloadingSpec` is the generic alias.
 - **The on-disk layout.** A pinned hash of the layout functions fails offline
-  when it changes. Bump `DISK_FORMAT_VERSION` deliberately; never re-pin to
-  silence it.
+  when it changes. Never re-pin to silence it. `DISK_FORMAT_VERSION` names
+  the root (`dspark-kv-v1`), so bumping it also orphans the existing tier.
 - **`PYTHONHASHSEED=20261007`** in the deployment, the root of the block-hash
   chain. Changing it turns every file on disk into a silent miss.
 - **`load_ops_max=2048`, `load_inflight_max=1`** as code defaults. Inflight 4
