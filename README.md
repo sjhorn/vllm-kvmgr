@@ -110,7 +110,7 @@ wins:
   4. the default in the code
 ```
 
-The full list is `DEFAULTS` in `src/kvmgr/flags.py` (52 knobs). `GET /kv`
+The full list is `DEFAULTS` in `src/kvmgr/flags.py` (62 knobs). `GET /kv`
 shows every knob, its value, and which of the four places it came from. There
 is no copy of the list here, because a copy goes out of date.
 
@@ -121,6 +121,9 @@ the engine:
 - **`load_ops_max=2048` and `load_inflight_max=1`.** These limit how much
   data is copied from disk back to the GPU at once.
   - With 4 copies at once, the engine crashed with a GPU fault (Xid 32).
+    That was measured before `load_wait_compute` existed, so it may have been
+    the same race (below) rather than a limit of its own. Re-measuring 2 and
+    4 is planned (`docs/plan-2026-10-14.md`, item 5).
   - With 1 or 2, a 700K-token prompt came back in the same 12 s.
   - **Before v0.4.0, `load_inflight_max` did not really work.** Finished disk
     reads went to the GPU with no check, up to 7 at once. So all the numbers
@@ -273,13 +276,15 @@ the start, the same as vLLM does on the GPU.
   exist, is it the right size) before vLLM starts taking requests. This is
   the slowest part of startup, and it grows with the cache. It cannot be
   skipped: in vLLM, a failed restore stops the engine, so a missing file
-  would crash it.
+  would crash it. (`disk_load_failure_recompute` turns a failed restore into
+  a recompute. Once that is proven on the cluster, this check no longer has
+  to block startup. Until then it does.)
   - The engine sends the index to every node in chunks
     (`disk_boot_verify_chunk`, default 40,000 keys). Each node checks a
     chunk's files on `disk_verify_threads` threads (default 16, hot; 1 is the
     old one-at-a-time walk). The answer is the same either way: a key is
     dropped if any node is missing its file, has it at the wrong size, or
-    could not check it.
+    could not check it (`unvouched`).
   - The walk ends with one log line, `BOOT WALK done`: keys, wall time, RPCs
     and chunk size, the slowest chunk, and keys/s and threads per node. A
     chunk taking over a quarter of the 300 s RPC timeout logs a WARNING.
@@ -385,7 +390,8 @@ Useful fields on a `submit` line:
 | `in_step` | (loads) how many of the target blocks the current batch is using. `null` means it could not be read, which is not the same as 0 |
 | `req`, `req_in_step` | (loads) the request this load is for, and whether it is in the current batch |
 | `wait_compute` | (loads) whether the copy waited for queued compute work (`load_wait_compute`). `null` means it could not be set up |
-| `via` | (loads) `step`, or `poll` when the poll thread submitted it (`load_poll_ms`). A `poll` line has `in_step: null`: the block table cannot be read from that thread |
+| `via` | (loads) `step`, or `poll` when the poll thread submitted it (`load_poll_ms`). A `poll` line has `in_step: null`: the block table cannot be read from that thread, and `/kv/workers` counts it as `loads_via_poll` rather than as unreadable |
+| `keys` | the round's keys, as hex, when `diag_ledger_keys` is on. `null` with `keys_why` if the handler named none |
 | `dst_span`, `dst_contig_runs` | (loads) highest minus lowest target block id, and how many unbroken runs they form |
 | `bids_sha` | (loads) a short id for the exact block set (sha1 of the `bids` ranges, 12 hex), to match the same copy across ranks |
 | `tensor_idx_set_hash`, `ref_tensors`, `ref_dup_tensors` | (loads) which KV tensors the group's layers use, and how many layers share a tensor with another |
@@ -393,8 +399,9 @@ Useful fields on a `submit` line:
 
 A `done` line is written when the plugin *notices* the transfer finished,
 which can be up to one scheduler step late. So `overlap` means "the plugin
-counted these blocks in two transfers at the same time". That is needed for
-the suspected bug, but it does not prove it.
+counted these blocks in two transfers at the same time". It was the first
+suspect for the Xid 32 faults. The actual cause turned out to be different
+(see Known limits), and the 2026-10-14 faults all had 0 overlaps.
 
 ### When a copy gets stuck
 
@@ -509,15 +516,20 @@ Without `patch6`:
   `assert transfer_result.success` in `offloading/worker.py`. The plugin
   avoids the cases it can predict (startup checks, removal holds, dropping
   missing files). A disk error (`EIO`) or a full disk (`ENOSPC`) in the
-  middle of a transfer will still stop the engine.
+  middle of a transfer will still stop the engine, unless
+  `disk_load_failure_recompute` is on (off until it has been tested on the
+  cluster).
 - **If the model folder cannot be read, the fingerprint falls back to the
   model name.** `/kv` then shows `model_identity: unknown`.
 - **The size budget counts only files in the index.** Files the index does not
   know about are not counted. The DSpark repo's `local-ops/kvsweep.sh` removes
   them.
-- **GPU faults (Xid 32) have happened while blocks were moving to or from
-  disk.** We have not proven what causes them. The ledger above is how we are
-  looking.
+- **The GPU faults (Xid 32) were a restore racing the forward pass.**
+  vLLM 0.21 makes only saves wait for queued compute work, and with async
+  scheduling a restore could write blocks the running step was still using.
+  This was shown on 2026-10-14: no faults in 3,270+ restores with
+  `load_wait_compute=1`, and a fault within 36 with it at 0. Keep it at 1.
+  The ledger and copy probe stay, to read any future fault.
 
 ## Tests
 
@@ -525,7 +537,7 @@ Without `patch6`:
 bash tests/run-all.sh; echo $?
 ```
 
-- 17 test files. No GPU and no cluster needed. Takes a few seconds.
+- 20 test files. No GPU and no cluster needed. Takes a few seconds.
 - They run against vLLM's own source files, with numpy and torch faked.
 - Everything runs twice: once on plain vLLM, and once with the DSpark patches.
   The DSpark run needs `KVMGR_DSPARK_REPO` set to a DSpark recipe checkout.

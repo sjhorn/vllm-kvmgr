@@ -49,6 +49,14 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   through `hooks.py`; **core must never import from `diag`** (a test enforces
   this). `compat/dspark.py` bridges the DSpark fork's patch6 and does nothing
   without it.
+- **Patches on vLLM classes, which a port must re-check:** `loadfail.py`
+  (Scheduler `_update_requests_with_invalid_blocks`, OffloadingConnector
+  `get_block_ids_with_load_errors`), `diskio._arm_compute_wait` (upstream's
+  `_stream_pool`), `register.py` (OffloadingConnectorScheduler `__init__`,
+  KVCacheCoordinator `__init__`), `diag/reqkeys.py` (OffloadingConnectorScheduler
+  `request_finished`). Tests pin the upstream code each of the first, second
+  and last relies on (phase15, phase1b C7, phase16); the `__init__` wraps
+  only need the classes to exist.
 - `tests/upstream/` holds pristine vLLM sources the tests load (see its
   MANIFEST). Re-vendor it from the target build when porting.
 - `deploy/` holds the generated dist-info the cluster bind-mounts. Regenerate it

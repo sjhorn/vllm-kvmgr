@@ -199,6 +199,16 @@ eq("upstream's return value is passed through",
 check("*** the finished request's keys are in the ring ***", "fin" in RK._RING)
 eq("...and upstream still dropped its state", s._req_status, {})
 
+_up = open(os.path.join(REPO, "tests", "upstream", "vllm",
+                        "kv_connector_offloading", "scheduler.py")).read()
+_rf = _up[_up.index("    def request_finished("):]
+_rf = _rf[:_rf.index("\n    def ", 10)]
+check("UPSTREAM'S SHAPE: request_finished drops _req_status itself, which is "
+      "why the capture must run first",
+      "del self._req_status[request.request_id]" in _rf)
+check("...and the per-group key list is RequestGroupState.offload_keys",
+      "offload_keys: list[OffloadKey]" in _up)
+
 print("\n== (16g) the route, and the ledger's keys ==")
 hooks.register("http_get", RK.http_get)
 from kvmgr import serve  # noqa: E402
