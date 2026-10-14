@@ -120,6 +120,10 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     ("kvmgr.diag.ledger", "_STATS", "overlap and write-ahead counters"),
     ("kvmgr.diag.ledger", "_WAL", "the write-ahead file's descriptor and size"),
     ("kvmgr.diag.ledger", "_LOCK", "the lock guarding the three above"),
+    # v0.4.1. A reload minting a new boot token would leave every transfer in
+    # flight across it open for ever: its `done` would carry the other boot.
+    ("kvmgr.diag.ledger", "_ID", "this process's boot token"),
+    ("kvmgr.diag.ledger", "_RUNNER", "the model runner, found on the stack"),
 )
 
 

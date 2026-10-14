@@ -45,10 +45,10 @@ A conversational prefix comes back at 98.7% after the GPU cache is dropped.
 
 Into a vLLM image:
 
-    pip install --no-deps vllm_kvmgr-0.4.0-py3-none-any.whl
+    pip install --no-deps vllm_kvmgr-0.4.1-py3-none-any.whl
 
 The DSpark recipe instead bind-mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.4.0.dist-info` into site-packages. The dist-info is
+`deploy/vllm_kvmgr-0.4.1.dist-info` into site-packages. The dist-info is
 **generated** (`python3 deploy/gen-dist-info.py`; `--check` fails when it is
 stale) because the entry point vLLM looks for lives in it.
 

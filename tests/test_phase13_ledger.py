@@ -111,7 +111,8 @@ eq("expand inverts ranges", L.expand(L.ranges([1, 2, 3, 10])), {1, 2, 3, 10})
 r = json.loads(L.record("submit", "load", 4, ts=1.5, pid=77, job=9, group=2,
                         bids=[[1, 3]]))
 eq("one JSON object with the fields asked for",
-   sorted(r), ["bids", "ev", "group", "inner", "job", "kind", "pid", "ts"])
+   sorted(r), ["bids", "boot", "ev", "group", "inner", "job", "kind", "pid",
+               "ts"])
 eq("...values intact", (r["ev"], r["kind"], r["inner"], r["job"], r["pid"]),
    ("submit", "load", 4, 9, 77))
 check("a record is exactly ONE line",
@@ -179,10 +180,16 @@ eq("*** submits with no done are exactly what is open ***",
    sorted((k[1], k[2]) for k in op), [("load", 0), ("store", 1)])
 eq("...and equal the live registry", sorted(op and [(k[1], k[2]) for k in op]),
    sorted(L._INFLIGHT))
-# a restarted process numbers its inner ids from 0 again
-other = L.record("done", "load", 0, pid=os.getpid() + 1)
-eq("a `done` from ANOTHER pid does not close this pid's entry",
-   len(L.open_entries(lines(p) + [other.strip()])), 2)
+# a restarted process numbers its inner ids from 0 again -- and in a container
+# it has the SAME pid, so only the boot token tells the two apart
+other = L.record("done", "load", 0, boot="1-deadbeef")
+eq("*** a `done` from ANOTHER boot with the SAME pid does not close this "
+   "boot's entry ***", len(L.open_entries(lines(p) + [other.strip()])), 2)
+same = L.record("done", "load", 0)
+eq("...while a `done` from this boot does",
+   len(L.open_entries(lines(p) + [same.strip()])), 1)
+eq("open entries are keyed (boot, kind, inner)",
+   sorted(k[0] for k in L.open_entries(lines(p))), [L.boot_id()] * 2)
 eq("a torn final line (a death mid-write) is skipped, not fatal",
    len(L.open_entries(lines(p) + ['{"ts":1,"ev":"sub'])), 2)
 
@@ -415,6 +422,152 @@ eq("...and the marks start from it",
    (L._STATS.get("max_gpu_loads"), L.wal_snapshot().get("burst_canary")), (2, 1))
 F.write(diag_ledger_file=1)
 flags.reset_for_tests()
+
+# ---------------------------------------------------------------------------
+print("\n== (8) v0.4.1: boot identity, and the DESTINATION blocks ==")
+# The 12:43 Xid 32 hit both ranks 3 ms apart on the same load, identical GPU
+# block ids, alone on the head's GPU. What both ranks share is the destination
+# blocks and the lockstep forward pass, so each load submit now records what
+# the current batch is doing with them.
+
+# (A) two boots, one pid, one file: the 10:12 contamination, reproduced
+tmp = fresh()
+h = handler()
+L._ID.update(boot="100-aaaaaaaa", pid=os.getpid())
+L.submit(h, "load", 0, 1, 0, [10], [0])
+L.submit(h, "load", 1, 2, 0, [11], [1])      # boot 1 dies with both open
+L._ID.update(boot="200-bbbbbbbb", pid=os.getpid())
+L._INFLIGHT.clear()
+L.submit(h, "load", 0, 1, 0, [10], [0])      # boot 2 reuses pid AND inner ids
+L.done(h, "load", 0, True)
+recs = [json.loads(x) for x in lines(os.path.join(tmp, "ledger-r0.jsonl"))]
+eq("every record carries the boot that wrote it",
+   [r.get("boot") for r in recs],
+   ["100-aaaaaaaa", "100-aaaaaaaa", "200-bbbbbbbb", "200-bbbbbbbb"])
+eq("...and the same pid throughout -- the container case",
+   len({r.get("pid") for r in recs}), 1)
+op = L.open_entries(lines(os.path.join(tmp, "ledger-r0.jsonl")))
+eq("*** boot 2's done does NOT close boot 1's inner 0: the dead boot keeps "
+   "both its open entries ***", sorted(op), [("100-aaaaaaaa", "load", 0),
+                                           ("100-aaaaaaaa", "load", 1)])
+eq("a pre-v0.4.1 line (no boot) still keys by pid",
+   list(L.open_entries(['{"ev":"submit","kind":"load","inner":3,"pid":9}'])),
+   [(("pid", 9), "load", 3)])
+L._ID.update(boot=None, pid=None)
+b1 = L.boot_id()
+check("a fresh token is <epoch>-<8 hex>",
+      len(b1.split("-")) == 2 and len(b1.split("-")[1]) == 8, b1)
+eq("...stable within the process", L.boot_id(), b1)
+L._ID["pid"] = -1                             # as if forked from a parent
+check("*** a forked child mints its OWN token, not the parent's ***",
+      L.boot_id() != b1)
+
+
+# (B) the destination blocks against a fake block table
+class Buf:
+    def __init__(self, rows):
+        self.np = rows
+
+
+class BT:
+    def __init__(self, rows, div=None):
+        self.block_table = Buf([list(r) + [0] * 4 for r in rows])
+        # the stale tail of row 0 is ids 900.. -- must NOT count
+        self.block_table.np[0] = list(rows[0]) + [900, 901, 902, 903]
+        self.num_blocks_per_row = [len(r) for r in rows]
+        if div:
+            self.blocks_per_kv_block = div
+
+
+class IB:
+    def __init__(self, tables, req_ids):
+        self.block_table = tables
+        self.req_ids = req_ids
+        self.num_reqs = len(req_ids)
+        self.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
+
+
+ib = IB([BT([[1988, 1989, 5], [40, 41]]), BT([[7], [8]])], ["reqA", "reqB"])
+eq("*** a load whose ids intersect the step's table: in_step > 0 ***",
+   L.step_hits(ib, 0, range(1988, 2111)),
+   {"in_step": 2, "in_step_ids": [1988, 1989], "in_step_reqs": ["reqA"],
+    "in_step_div": 1})
+eq("*** a disjoint one: in_step == 0, a MEASURED zero ***",
+   L.step_hits(ib, 0, [3000, 3001])["in_step"], 0)
+eq("ids past num_blocks_per_row (a previous occupant's) are not counted",
+   L.step_hits(ib, 0, [900, 901])["in_step"], 0)
+eq("only THIS group's table is read", L.step_hits(ib, 1, [1988])["in_step"], 0)
+eq("kernel-block ids are divided back to KV-manager ids",
+   L.step_hits(IB([BT([[40, 41, 42, 43]], div=4)], ["r"]), 0, [10])["in_step"],
+   1)
+for label, bad in (("absent table", IB(None, ["r"])),
+                   ("short table", IB([], ["r"])),
+                   ("hostile num_reqs", types.SimpleNamespace(num_reqs="x")),
+                   ("None", None)):
+    got = L.step_hits(bad, 0, [1988])
+    check(f"*** {label}: in_step is None with a reason -- ABSENT IS NOT ZERO ***",
+          got.get("in_step") is None and "unreadable" in got.get("in_step_why", ""),
+          got)
+
+
+# end to end: submit() finds the runner on the stack and the request per job
+class Runner:
+    def __init__(self, ib):
+        self.input_batch = ib
+
+    def execute_model(self, fn):
+        return fn()
+
+
+class CW:
+    pass
+
+
+from kvmgr import diskio as _dio  # noqa: E402
+_saved_cw = list(_dio._LIVE_CONN_WORKER)
+cw = CW()
+cw._load_jobs = {902: "req-902", 903: "reqB"}
+_dio._LIVE_CONN_WORKER[:] = [cw]
+try:
+    tmp = fresh()
+    L._RUNNER.clear()
+    hr = rhandler([[0] * 62])
+    eq("with no runner on the stack, a load records in_step=None, not 0",
+       (L.submit(hr, "load", 50, 902, 0, [1988], [0]),
+        first(os.path.join(tmp, "ledger-r0.jsonl")).get("in_step", "MISSING"))[1],
+       None)
+    eq("...counted as UNREADABLE, apart from the zeroes",
+       (L.wal_snapshot()["loads_in_step_unreadable"],
+        L.wal_snapshot()["loads_not_in_step"]), (1, 0))
+    run = Runner(ib)
+    run.execute_model(lambda: L.submit(hr, "load", 51, 902, 0,
+                                       list(range(1988, 2021)), [1]))
+    run.execute_model(lambda: L.submit(hr, "load", 52, 903, 0, [3000], [2]))
+    L.submit(hr, "store", 9, 1, 0, [1988], [3])
+    recs = [json.loads(x) for x in lines(os.path.join(tmp, "ledger-r0.jsonl"))]
+    eq("*** the submit line carries in_step, examples, req, req_in_step ***",
+       [(r.get("in_step"), r.get("in_step_ids"), r.get("req"),
+         r.get("req_in_step")) for r in recs[1:3]],
+       [(2, [1988, 1989], "req-902", False), (0, [], "reqB", True)])
+    check("a STORE line carries none of it",
+          "in_step" not in recs[3] and "req" not in recs[3], recs[3])
+    snap = L.wal_snapshot()
+    eq("*** /kv/workers counts loads by in_step, absence kept apart ***",
+       tuple(snap.get(k) for k in ("loads_in_step", "loads_not_in_step",
+                                   "loads_in_step_unreadable",
+                                   "loads_req_in_step")), (1, 1, 1, 1))
+    eq("...and names this process's boot", snap.get("boot"), L.boot_id())
+    check("the runner is cached once found", L._RUNNER == [run])
+    # a request the connector worker does not know: absent, not guessed
+    L.submit(hr, "load", 53, 777, 0, [3000], [4])
+    rec = first(os.path.join(tmp, "ledger-r0.jsonl"), -1)
+    eq("an unknown job's req is None", (rec.get("req"), rec.get("req_in_step")),
+       (None, None))
+    json.dumps(L.wal_snapshot())
+    check("every new field is JSON-plain (the msgpack rule)", True)
+finally:
+    _dio._LIVE_CONN_WORKER[:] = _saved_cw
+    L._RUNNER.clear()
 
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:

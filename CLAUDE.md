@@ -11,7 +11,7 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   restarts, deploys and measurements in its `CLAUDE.md`), and the recipe is the
   DSpark repo. This file is meant to stand alone, but **DSpark's `CLAUDE.md`
   governs the engine** and wins any disagreement about restarting it.
-- Releases are tags (`v0.1.0` … `v0.4.0`), each
+- Releases are tags (`v0.1.0` … `v0.4.1`), each
   naming the vLLM build it is proven on (`pyproject.toml` states the window).
 - **It is the only copy.** The DSpark recipe repo
   (`~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark`) no
@@ -117,6 +117,21 @@ using. v0.3.0's write-ahead ledger exists to settle it:
   `/kv/workers` carries `max_gpu_loads`/`max_gpu_stores` (the deploy check is
   `max_gpu_loads == 1`), and a load submitted at or over the bound logs
   `LOAD BURST` once.
+- **The 12:43 Xid 32 hit BOTH nodes 3 ms apart** on the same load (inner
+  1000051, job 902, group 0, 33 blocks, identical GPU block ids on both ranks),
+  alone on the head's GPU, with 0 overlaps. Neither burst nor size explains it.
+  The hypothesis has moved to the destination blocks and what the lockstep
+  forward pass is doing with them. Note that upstream's load copy stream (cpu
+  `gpu_worker.py`, `gpu_to_cpu=False`) does **not** `wait_stream` on compute,
+  and `_collect` submits right after the forward is enqueued, with
+  `--async-scheduling` on. So since v0.4.1 every record carries `boot` (pid
+  repeats across container boots), and every load submit records `in_step`
+  (destination blocks in this rank's input-batch block table; `null` +
+  `in_step_why` when unreadable, never 0), `in_step_ids`, `in_step_reqs`,
+  `req` and `req_in_step`. `/kv/workers` counts `loads_in_step`,
+  `loads_not_in_step`, `loads_in_step_unreadable` and `loads_req_in_step`.
+  Last-freed time is not recorded: it lives in the scheduler's BlockPool, in
+  another process.
 - The supervisor copies both nodes' ledger tails, logs and kernel logs to
   `~/kvdiag/supervisor/<ts>/` on the head before it restarts anything.
 

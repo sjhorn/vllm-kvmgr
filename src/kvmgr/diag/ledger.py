@@ -34,6 +34,21 @@ the bound had never applied to the GPU stage. Each submit line now carries
 `gpu_loads`/`gpu_stores` (already on the GPU) and `ops` (copy descriptors), the
 high-water marks `max_gpu_loads`/`max_gpu_stores` reach /kv/workers, and a load
 submitted at or over the bound logs `LOAD BURST` once.
+
+*** v0.4.1: WHICH BOOT, AND WHAT THE ENGINE WAS DOING WITH THE DESTINATION. ***
+The 12:43 Xid 32 hit both ranks 3 ms apart on the same load (identical GPU
+block ids), alone on the head's GPU: neither a burst nor size explains it, and
+what both ranks share is the destination blocks and the lockstep forward pass.
+  - every record carries `boot`, a per-process token: a container gives the
+    worker the SAME pid every boot, so keying on pid merged two boots' records.
+  - every LOAD submit records `in_step` (destination blocks referenced by the
+    model runner's input-batch block table on this rank, the batch the forward
+    just enqueued) with up to 8 example ids, `req` (the request the load is for,
+    from upstream's connector worker) and `req_in_step`. An unreadable table is
+    `in_step: null` with `in_step_why`, never 0. Read only, no GPU sync.
+  - NOT recorded: when each block was last freed or allocated. That lives in
+    the scheduler's BlockPool, in the engine-core process; the worker never
+    sees it.
 """
 
 from __future__ import annotations
@@ -254,8 +269,16 @@ _INFLIGHT: dict = {}
 # burst_canary: loads submitted while `load_inflight_max` were already on it.
 _STATS = {"overlaps": 0, "overlap_same_group": 0, "overlap_last": None,
           "wal_lines": 0, "wal_errors": 0, "wal_rotations": 0,
-          "max_gpu_loads": 0, "max_gpu_stores": 0, "burst_canary": 0}
+          "max_gpu_loads": 0, "max_gpu_stores": 0, "burst_canary": 0,
+          "loads_in_step": 0, "loads_not_in_step": 0,
+          "loads_in_step_unreadable": 0, "loads_req_in_step": 0}
 _WAL = {"fd": None, "path": None, "bytes": 0, "why": "nothing submitted yet"}
+# The per-process identity. Lazy and checked against the pid, so a worker
+# FORKED from a parent that imported this module gets its own token rather than
+# inheriting the parent's.
+_ID = {"boot": None, "pid": None}
+# The model runner, found once on the call stack (see _runner()).
+_RUNNER: list = []
 
 
 def ledger_dir(h) -> str:
@@ -291,10 +314,25 @@ def expand(rs) -> set:
     return {b for lo, hi in rs for b in range(int(lo), int(hi) + 1)}
 
 
+def boot_id() -> str:
+    """This process's token: `<epoch seconds>-<8 hex>`, made once per pid.
+
+    *** pid IS NOT AN IDENTITY INSIDE A CONTAINER. *** The worker is pid 126 on
+    the head boot after boot, so two boots' records in one file merged, and
+    kvledger.py reported max_on_gpu=11 from the mixture. The time prefix sorts
+    boots; the random suffix separates two started in the same second."""
+    pid = os.getpid()
+    if _ID.get("boot") is None or _ID.get("pid") != pid:
+        _ID["boot"] = "%d-%s" % (int(time.time()), os.urandom(4).hex())
+        _ID["pid"] = pid
+    return _ID["boot"]
+
+
 def record(ev: str, kind: str, inner: int, **kw) -> str:
     """One ledger line. Pure, so the format is testable without a file."""
     d = {"ts": round(kw.pop("ts", None) or time.time(), 6), "ev": ev,
-         "kind": kind, "inner": int(inner), "pid": kw.pop("pid", os.getpid())}
+         "kind": kind, "inner": int(inner), "pid": kw.pop("pid", os.getpid()),
+         "boot": kw.pop("boot", None) or boot_id()}
     d.update(kw)
     return json.dumps(d, separators=(",", ":"), sort_keys=True) + "\n"
 
@@ -302,17 +340,20 @@ def record(ev: str, kind: str, inner: int, **kw) -> str:
 def open_entries(lines) -> dict:
     """The submits with no matching `done`: the in-flight set. Pure.
 
-    Keyed (pid, kind, inner), because a restarted process numbers its inner
-    transfers from 0 again and appends to the same file. After a fault, the
-    entries left here for the DEAD pid are exactly what the GPU had been
-    handed and had not been seen to finish."""
+    Keyed (boot, kind, inner), because a restarted process numbers its inner
+    transfers from 0 again and appends to the same file -- and inside a
+    container it has the same PID too, so pid cannot tell two boots apart.
+    After a fault, the entries left here for the DEAD boot are exactly what the
+    GPU had been handed and had not been seen to finish. A pre-v0.4.1 line has
+    no boot and falls back to ("pid", pid)."""
     open_: dict = {}
     for ln in lines:
         try:
             r = json.loads(ln)
         except Exception:
             continue                    # a torn last line is expected after a death
-        k = (r.get("pid"), r.get("kind"), r.get("inner"))
+        k = (r.get("boot") or ("pid", r.get("pid")), r.get("kind"),
+             r.get("inner"))
         if r.get("ev") == "submit":
             open_[k] = r
         elif r.get("ev") == "done":
@@ -363,6 +404,108 @@ def _load_bound():
         return diskio._load_inflight_max()
     except Exception:
         return None
+
+
+_RUNNER_DEPTH = 40
+
+
+def _runner():
+    """The model runner on this thread's call stack, cached once found.
+
+    A load's GPU copy is submitted from `_collect`, which runs inside upstream's
+    connector `get_finished`, which runs in the model runner's step -- so the
+    runner (anything with `input_batch.block_table`) is a `self` a bounded number
+    of frames up. Looked for only until found; a miss costs one bounded walk."""
+    if _RUNNER:
+        return _RUNNER[-1]
+    import sys
+    f = sys._getframe(1)
+    try:
+        for _ in range(_RUNNER_DEPTH):
+            if f is None:
+                break
+            cand = f.f_locals.get("self")
+            ib = getattr(cand, "input_batch", None) if cand is not None else None
+            if ib is not None and getattr(ib, "block_table", None) is not None:
+                _RUNNER[:] = [cand]
+                return cand
+            f = f.f_back
+    except Exception:
+        return None
+    finally:
+        del f
+    return None
+
+
+def step_hits(input_batch, group: int, bids) -> dict:
+    """Destination blocks the current batch's block table references. Pure.
+
+    Reads rows 0..num_reqs-1 of group `group`'s table, each only up to its
+    `num_blocks_per_row` (the rest of a row is a previous occupant's stale ids).
+    Kernel-block ids are divided back to KV-manager ids by the table's
+    `blocks_per_kv_block` when it has one. Returns
+    {"in_step": n, "in_step_ids": [<=8], "in_step_reqs": [<=4]} or
+    {"in_step": None, "in_step_why": ...}: an unreadable table is an ABSENCE,
+    never a 0. Host memory only -- `.np` is the CPU side, so no GPU sync."""
+    try:
+        dest = {int(b) for b in (bids or ())}
+        nreq = int(input_batch.num_reqs)
+        bt = input_batch.block_table[int(group)]
+        arr = getattr(bt.block_table, "np", bt.block_table)
+        nb = bt.num_blocks_per_row
+        div = int(getattr(bt, "blocks_per_kv_block", 1) or 1)
+        req_ids = list(getattr(input_batch, "req_ids", None) or ())
+        hit: set = set()
+        reqs: list = []
+        for r in range(nreq):
+            row = arr[r][:int(nb[r])]
+            row = row.tolist() if hasattr(row, "tolist") else list(row)
+            got = (dest.intersection(int(x) // div for x in row) if div > 1
+                   else dest.intersection(int(x) for x in row))
+            if got:
+                hit |= got
+                if len(reqs) < 4 and r < len(req_ids):
+                    reqs.append(str(req_ids[r]))
+        return {"in_step": len(hit), "in_step_ids": sorted(hit)[:8],
+                "in_step_reqs": reqs, "in_step_div": div}
+    except Exception as e:
+        return {"in_step": None,
+                "in_step_why": "block table unreadable: %r" % (e,)}
+
+
+def dest_context(job, group: int, bids) -> dict:
+    """What the engine is doing with a LOAD's destination blocks. Never raises.
+
+    `req` is the request the load is for: upstream's OffloadingConnectorWorker
+    records `_load_jobs[job_id] = req_id` before it calls transfer_async."""
+    out: dict = {}
+    try:
+        runner = _runner()
+        ib = getattr(runner, "input_batch", None) if runner is not None else None
+        if ib is None:
+            out = {"in_step": None,
+                   "in_step_why": "model runner not found on the call stack"}
+        else:
+            out = step_hits(ib, group, bids)
+        req = None
+        try:
+            from kvmgr import diskio
+            cw = diskio._LIVE_CONN_WORKER[-1] if diskio._LIVE_CONN_WORKER else None
+            req = (getattr(cw, "_load_jobs", None) or {}).get(job)
+        except Exception:
+            req = None
+        out["req"] = None if req is None else str(req)
+        if req is not None and ib is not None:
+            try:
+                out["req_in_step"] = req in (ib.req_id_to_index or {})
+            except Exception:
+                out["req_in_step"] = None
+        else:
+            out["req_in_step"] = None
+    except Exception as e:
+        out = {"in_step": None, "in_step_why": "raised: %r" % (e,),
+               "req": None, "req_in_step": None}
+    return out
 
 
 def _wal_write(h, line: str) -> None:
@@ -429,6 +572,8 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
         # SUBMITTED block list, before any de-duplication.
         ops = submit_ops(h, group, len(bids or ()))
         bound = _load_bound() if kind == "load" else None
+        # Outside the lock: it walks the stack and reads the block table.
+        ctx = dest_context(job, group, bset) if kind == "load" else {}
         canary = False
         with _LOCK:
             gpu_loads = sum(1 for k, _ in _INFLIGHT if k == "load")
@@ -441,6 +586,13 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
                 if bound is not None and gpu_loads >= bound:
                     _STATS["burst_canary"] = (_STATS.get("burst_canary") or 0) + 1
                     canary = _STATS["burst_canary"] == 1
+                _n = ctx.get("in_step")
+                _k = ("loads_in_step_unreadable" if _n is None else
+                      "loads_in_step" if _n > 0 else "loads_not_in_step")
+                _STATS[_k] = (_STATS.get(_k) or 0) + 1
+                if ctx.get("req_in_step"):
+                    _STATS["loads_req_in_step"] = (
+                        _STATS.get("loads_req_in_step") or 0) + 1
             elif kind == "store":
                 _STATS["max_gpu_stores"] = max(_STATS.get("max_gpu_stores") or 0,
                                                gpu_stores + 1)
@@ -453,7 +605,7 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
                 bid_max=max(bset) if bset else None, bids=ranges(bset),
                 slots=ranges(slots or ()),
                 gpu_loads=gpu_loads, gpu_stores=gpu_stores, ops=ops,
-                overlap=[[k2, i2] for k2, i2, *_ in hits] or None))
+                overlap=[[k2, i2] for k2, i2, *_ in hits] or None, **ctx))
             for k2, i2, j2, g2, common in hits:
                 _STATS["overlaps"] += 1
                 if g2 == group:
@@ -504,7 +656,15 @@ def wal_snapshot() -> dict:
                 "wal_rotations": int(_STATS["wal_rotations"]),
                 "max_gpu_loads": int(_STATS.get("max_gpu_loads") or 0),
                 "max_gpu_stores": int(_STATS.get("max_gpu_stores") or 0),
-                "burst_canary": int(_STATS.get("burst_canary") or 0)}
+                "burst_canary": int(_STATS.get("burst_canary") or 0),
+                # loads whose destination blocks the current batch references,
+                # and the ABSENCE count kept apart from the zero
+                "loads_in_step": int(_STATS.get("loads_in_step") or 0),
+                "loads_not_in_step": int(_STATS.get("loads_not_in_step") or 0),
+                "loads_in_step_unreadable": int(
+                    _STATS.get("loads_in_step_unreadable") or 0),
+                "loads_req_in_step": int(_STATS.get("loads_req_in_step") or 0),
+                "boot": _ID.get("boot")}
 
 
 def install() -> None:
