@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pristine:
+    # Pristine mode only: the dspark mode needs the DSpark recipe's patch6/7/8,
+    # which are not public. Pristine is the package's claim (kvmgr on a vLLM with
+    # no patch of ours), and KVMGR_BUILD_PY adds the wheel build and install check.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build setuptools wheel
+      - name: run-all.sh (exits on the verdict)
+        env:
+          MODES: pristine
+          PY: python
+        run: KVMGR_BUILD_PY="$(command -v python)" bash tests/run-all.sh

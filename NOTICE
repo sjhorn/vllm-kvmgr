@@ -1,0 +1,10 @@
+vllm-kvmgr
+Copyright 2026 Scott Horn
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+tests/upstream/ contains unmodified source files from vLLM
+(https://github.com/vllm-project/vllm), Copyright the vLLM project
+contributors, licensed under the Apache License, Version 2.0. They are
+vendored only so the offline tests can load them; see
+tests/upstream/MANIFEST.txt for the build they were taken from.

@@ -248,3 +248,8 @@ hook gets kvmgr's provider. Without patch6:
 Sixteen suites, no GPU, no cluster, a few seconds, run against vLLM's own
 sources with numpy and torch stubbed. They run twice: on pristine vLLM, and
 with the DSpark patches. See `tests/README.md`.
+
+## License
+
+Apache License 2.0, see `LICENSE` and `NOTICE`. `tests/upstream/` holds
+unmodified vLLM sources under the same license.
