@@ -507,8 +507,12 @@ DEFAULTS: dict[str, Any] = {
     # compute stream before it writes, as vLLM 0.31 does for loads
     # (cpu/gpu_worker.py:690-696). Our 0.21 handler waits only for STORES,
     # and with --async-scheduling, zeroing of a destination block shipped in
-    # an earlier step is ordered against nothing else. Candidate cause of the
-    # 2026-10-14 Xid 32s, unproven. 0 = 0.21's behaviour. Hot.
+    # an earlier step is ordered against nothing else. 0 = 0.21's behaviour.
+    #
+    # *** 0 IS THE XID 32, DEMONSTRATED 2026-10-14. *** 3,270+ loads clean at
+    # 1; Xid 32 on the worker within 36 loads at 0 (DSpark local-ops/kvrace.py
+    # run --arm off). MUST STAY 1 ON A SERVING ENGINE. Hot only so that
+    # reproducer can run; diskio warns while it is 0.
     "load_wait_compute": 1,
     # Max COPY-OP DESCRIPTORS in one staging->GPU submit. This is the quantity
     # upstream's single `cuMemcpyBatchAsync` actually contains --

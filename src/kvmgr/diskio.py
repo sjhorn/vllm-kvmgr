@@ -39,6 +39,7 @@ from __future__ import annotations
 import itertools
 import os
 import threading
+import time
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from vllm.logger import init_logger
@@ -478,16 +479,59 @@ def _load_wait_compute() -> bool:
     """Whether a load copy waits on the compute stream first. Hot.
 
     vLLM 0.31's copy handler does this for loads; 0.21's does it for stores
-    only. See `DiskLoadHandler._arm_compute_wait`."""
+    only. See `DiskLoadHandler._arm_compute_wait`.
+
+    *** 0 IS THE XID 32. *** Demonstrated 2026-10-14: 3,270+ loads clean
+    with this at 1, Xid 32 on the worker within 36 loads at 0 (DSpark
+    `local-ops/kvrace.py run --arm off`). The knob stays only so that
+    reproducer can run; `_wait_compute_guard` shouts while it is 0."""
     try:
         from kvmgr import flags as _f
     except Exception:
         return True
     try:
-        return bool(int(_f.peek("load_wait_compute")))
+        v = bool(int(_f.peek("load_wait_compute")))
     except Exception:
         # the DECLARED default, never a second copy (see _load_inflight_max)
-        return bool(_f.DEFAULTS["load_wait_compute"])
+        v = bool(_f.DEFAULTS["load_wait_compute"])
+    _wait_compute_guard(v)
+    return v
+
+
+WAIT_COMPUTE_REWARN_S = 300.0
+# off_since: when the knob was first seen at 0 (None while it is 1);
+# warned_at: the last WARNING, so a long reproduction repeats it rather than
+# scrolling it away. Written from the worker thread and the watchdog thread;
+# the worst a race costs is one extra log line.
+_WAIT_COMPUTE_OFF = {"off_since": None, "warned_at": None}
+
+
+def _wait_compute_guard(on: bool, now=None) -> None:
+    """WARN when load_wait_compute is 0, again every WAIT_COMPUTE_REWARN_S
+    while it stays 0, and INFO when it comes back. Called on every load and
+    on every watchdog tick, so a flip is reported within seconds even when
+    no load runs."""
+    st = _WAIT_COMPUTE_OFF
+    now = time.monotonic() if now is None else now
+    if on:
+        if st["off_since"] is not None:
+            logger.info("kvmgr: load_wait_compute is 1 again after %.0fs at 0 "
+                        "-- load copies wait on compute.",
+                        now - st["off_since"])
+        st["off_since"] = st["warned_at"] = None
+        return
+    if st["off_since"] is None:
+        st["off_since"] = now
+    if st["warned_at"] is None or now - st["warned_at"] >= WAIT_COMPUTE_REWARN_S:
+        st["warned_at"] = now
+        logger.warning(
+            "kvmgr: *** load_wait_compute=0 (off for %.0fs) -- THIS IS THE "
+            "XID 32 SETTING. *** Disk->GPU load copies no longer wait for the "
+            "in-flight step, so with --async-scheduling a load can write blocks "
+            "the forward pass is still using: reproduced 2026-10-14 within 36 "
+            "loads. Only for DSpark local-ops/kvrace.py --arm off; never on a "
+            "serving engine. Set it back to 1. Repeated every %.0fs while 0.",
+            now - st["off_since"], WAIT_COMPUTE_REWARN_S)
 
 
 def _load_batch_max() -> int:
@@ -1014,6 +1058,7 @@ def _watchdog_loop():
             # (kvmgr.diag.copyprobe). A no-op unless one is installed.
             hooks.call("watchdog_tick", verdict,
                        (now - stalled_since) if stalled_since else 0.0)
+            _load_wait_compute()     # reports a 0 even with no load running
             if verdict == "idle":
                 dumped_for = None
                 continue
@@ -2145,7 +2190,8 @@ class DiskLoadHandler:
                       "wait_calls": 0, "wait_ours": 0, "wait_blocked_ms": 0,
                       "wait_max_pending": 0, "wait_rounds": 0,
                       "saturations": 0, "rounds_done": 0,
-                      "compute_waits": 0, "compute_wait_unarmed": 0}
+                      "compute_waits": 0, "compute_wait_unarmed": 0,
+                      "compute_wait_off": 0}
         # REPORT THE FACT, NOT THE ASK. This said "(restore is live)"
         # unconditionally, from __init__, with no gate on the flag -- so a boot
         # whose flags file had disk_restore=False still announced a live
@@ -2250,6 +2296,8 @@ class DiskLoadHandler:
         True = armed, False = knob off, None = could not arm (logged once;
         the load proceeds unordered, exactly as before this existed)."""
         if not _load_wait_compute():
+            self.stats["compute_wait_off"] = (
+                self.stats.get("compute_wait_off", 0) + 1)
             return False
         pool = getattr(self._inner, "_stream_pool", None)
         try:

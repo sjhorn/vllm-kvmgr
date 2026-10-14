@@ -2866,7 +2866,8 @@ def mkloadhandler(pool_size, nrefs=REFS):
                "wait_calls": 0, "wait_ours": 0, "wait_blocked_ms": 0,
                "wait_max_pending": 0, "wait_rounds": 0,
                "saturations": 0, "rounds_done": 0,
-               "compute_waits": 0, "compute_wait_unarmed": 0}
+               "compute_waits": 0, "compute_wait_unarmed": 0,
+               "compute_wait_off": 0}
     h._read_batch = lambda bkeys, slots, g: 100 * len(bkeys)
     h._bounds_cache = (22756, pool_size)
     return h
@@ -3155,6 +3156,42 @@ try:
     check("with the knob at 0 the copy does NOT wait (0.21 behaviour)",
           h7b._inner.used == [[]], repr(h7b._inner.used))
     eq("...and says so", h7b._wait_compute_last, False)
+    eq("...counted as compute_wait_off", h7b.stats["compute_wait_off"], 1)
+
+    # *** 0 IS THE XID 32 SETTING (2026-10-14), SO IT MUST BE LOUD. ***
+    _g = diskio._WAIT_COMPUTE_OFF
+    _g.update(off_since=None, warned_at=None)
+    harness.clear_log()
+    diskio._wait_compute_guard(False, now=1000.0)
+    check("knob at 0: a WARNING naming the Xid 32",
+          "THIS IS THE XID 32 SETTING" in harness.log_text(), harness.log_text())
+    harness.clear_log()
+    diskio._wait_compute_guard(False, now=1000.0 + diskio.WAIT_COMPUTE_REWARN_S - 1)
+    check("...said once, not on every load", "XID 32" not in harness.log_text())
+    diskio._wait_compute_guard(False, now=1000.0 + diskio.WAIT_COMPUTE_REWARN_S)
+    check("...and repeated while it stays 0",
+          "off for %.0fs" % diskio.WAIT_COMPUTE_REWARN_S in harness.log_text(),
+          harness.log_text())
+    harness.clear_log()
+    diskio._wait_compute_guard(True, now=1400.0)
+    check("back at 1: an INFO line and the state cleared",
+          "load_wait_compute is 1 again after 400s" in harness.log_text()
+          and _g["off_since"] is None, harness.log_text())
+    harness.clear_log()
+    diskio._wait_compute_guard(True, now=1500.0)
+    check("...and nothing at all while it stays 1", harness.log_text() == "",
+          harness.log_text())
+    F.write(load_wait_compute=0)
+    flags.reset_for_tests()
+    harness.clear_log()
+    diskio._load_wait_compute()
+    check("the knob reader itself raises the warning (so a hot flip is seen)",
+          "THIS IS THE XID 32 SETTING" in harness.log_text(), harness.log_text())
+    _wd = _lsrc[_lsrc.index("def _watchdog_loop"):]
+    _wd = _wd[:_wd.index("\ndef ")]
+    check("the watchdog reads the knob every tick, so a 0 is reported with no "
+          "load running", "_load_wait_compute()" in _wd)
+    _g.update(off_since=None, warned_at=None)
 
     F.write(load_wait_compute=1)
     flags.reset_for_tests()

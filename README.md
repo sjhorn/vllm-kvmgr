@@ -64,11 +64,11 @@ from disk.
 Into a vLLM image:
 
 ```sh
-pip install --no-deps vllm_kvmgr-0.4.2-py3-none-any.whl
+pip install --no-deps vllm_kvmgr-0.4.3-py3-none-any.whl
 ```
 
 The DSpark recipe does not pip install. It mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.4.2.dist-info` into site-packages instead. vLLM finds the
+`deploy/vllm_kvmgr-0.4.3.dist-info` into site-packages instead. vLLM finds the
 plugin through the entry point in that dist-info folder. The folder is made by
 a script:
 
@@ -122,12 +122,16 @@ the engine:
     above were measured without the limit. Since v0.4.0 the limit is real.
   - `load_read_ahead` (default 1) lets the next block group read from disk
     while the current one copies to the GPU.
-- **`load_wait_compute=1`.** A copy from disk back to the GPU first waits for
-  work already queued on the compute stream, as vLLM 0.31 does. vLLM 0.21
-  waits only when saving. With async scheduling, a block being reloaded may
-  still have a zeroing write queued from an earlier step. This is a candidate
-  cause of the Xid 32 faults, not a proven one. Each load's ledger line says
-  whether the wait was in force (`wait_compute`). Can be changed while running.
+- **`load_wait_compute=1`. Must stay 1 on a serving engine.** A copy from
+  disk back to the GPU first waits for work already queued on the compute
+  stream, as vLLM 0.31 does. vLLM 0.21 waits only when saving, and with async
+  scheduling a reload could then write blocks the running step was still
+  using. **That was the cause of the Xid 32 faults** (2026-10-14: 3,270+ loads
+  clean with it at 1; Xid 32 within 36 loads at 0). 0 exists only for the
+  reproducer (DSpark `local-ops/kvrace.py --arm off`). While it is 0 the log
+  repeats a WARNING every 5 minutes and `/kv/workers` counts
+  `compute_wait_off`. Each load's ledger line says whether the wait was in
+  force (`wait_compute`).
 - **`stall_fail_after_s=240`.** If a save to disk gets stuck, it fails after
   240 s with a log line that says which job it was. Without this, NCCL kills
   the worker after 600 s and leaves no Python trace.
@@ -218,7 +222,7 @@ A block counts as saved only when **both** ranks have written their part.
   load_read_ahead     = how many more rounds may read from disk while
                         they wait                            (default 1)
   load_wait_compute   = the GPU copy waits for queued compute work first
-                                                             (default 1)
+                        (default 1; 0 is the Xid 32, never on a serving engine)
 ```
 
 `lookup` checks the index. A prompt reuses blocks in one unbroken run from

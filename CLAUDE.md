@@ -11,7 +11,7 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   restarts, deploys and measurements in its `CLAUDE.md`), and the recipe is the
   DSpark repo. This file is meant to stand alone, but **DSpark's `CLAUDE.md`
   governs the engine** and wins any disagreement about restarting it.
-- Releases are tags (`v0.1.0` … `v0.4.1`), each
+- Releases are tags (`v0.1.0` … `v0.4.3`), each
   naming the vLLM build it is proven on (`pyproject.toml` states the window).
 - **It is the only copy.** The DSpark recipe repo
   (`~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark`) no
@@ -83,57 +83,55 @@ KVMGR_DSPARK_REPO=~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-S
   the root (`dspark-kv-v1`), so bumping it also orphans the existing tier.
 - **`PYTHONHASHSEED=20261007`** in the deployment, the root of the block-hash
   chain. Changing it turns every file on disk into a silent miss.
+- **`load_wait_compute=1`.** 0 is the Xid 32 (see below). Not a tunable.
 - **`load_ops_max=2048`, `load_inflight_max=1`** as code defaults. Inflight 4
-  caused GPU faults (Xid 32). **But until v0.4.0 the knob did not bound the
+  caused GPU faults (Xid 32), measured before `load_wait_compute` existed. **But until v0.4.0 the knob did not bound the
   GPU stage**: `_pump` checked it before a file read and `_collect` sent every
   finished read to the GPU unchecked. So "inflight 1 is safe" and "inflight 4
   faulted" were both measured without the bound, with up to 7 loads on the GPU
   at once. v0.4.0 bounds staging->GPU copies by it, and the read stage by it
   plus `load_read_ahead` (default 1, hot, not yet measured).
 
-## The open question this repo is carrying (2026-10-14)
+## Xid 32: the cause, and the rule it leaves (2026-10-14)
 
-**Xid 32 recurs and is not proven ours.** Every instance since 10-09 coincided
-with disk-tier transfers. The latest (2026-10-14 06:21:48) came 16.5h into a
-boot, with a load submitted in the fault's second and 50 stores outstanding.
-Leading hypothesis, unproven: a load writes a GPU block another transfer is
-using. v0.3.0's write-ahead ledger exists to settle it:
+**Cause, demonstrated:** a disk->GPU load copy raced the forward pass. vLLM
+0.21's `SingleDirectionOffloadingHandler` makes only STORES
+`wait_stream(compute)`. With `--async-scheduling`, a load could run while the
+in-flight step was still using its destination blocks. The result was Xid 32
+(several `intr` words) or, once, a hang with no Xid. Every instance since
+10-09 fell on a disk-tier load.
 
-- `/kvoffload/diag/ledger-r<rank>.jsonl` on each node (host:
-  `~/kvoffload/diag/`), one line per GPU transfer BEFORE submit plus a `done`.
-  After a fault, the open entries for the dead `pid` are what the GPU had.
-  `kvmgr.diag.ledger.open_entries()` does the matching. An idle engine always
-  leaves its last submit open until the next step, so read open entries
-  against the Xid's timestamp (`journalctl -k`), not as a bare count.
-- `LEDGER OVERLAP` warnings in the engine log, and `overlaps` on `GET
-  /kv/workers` (`:8888`). It was 0 after the first 700K restore. A non-zero
-  count is the first evidence for the hypothesis. It is not proof, because an
-  entry's span is submit-to-OBSERVED completion.
-- **The 2026-10-14 10:12:17 Xid 32 (head)** had 0 overlaps, which is evidence
-  AGAINST the hypothesis, and three load copies open, all submitted within
-  3 ms: two at the op cap (33 blocks × 62 refs = 2,046 descriptors) and one
-  small one, with `load_inflight_max=1`. That burst is what v0.4.0 fixes. Since
-  v0.4.0 each submit line carries `gpu_loads`, `gpu_stores` and `ops`,
-  `/kv/workers` carries `max_gpu_loads`/`max_gpu_stores` (the deploy check is
-  `max_gpu_loads == 1`), and a load submitted at or over the bound logs
-  `LOAD BURST` once.
-- **The 12:43 Xid 32 hit BOTH nodes 3 ms apart** on the same load (inner
-  1000051, job 902, group 0, 33 blocks, identical GPU block ids on both ranks),
-  alone on the head's GPU, with 0 overlaps. Neither burst nor size explains it.
-  The hypothesis has moved to the destination blocks and what the lockstep
-  forward pass is doing with them. Note that upstream's load copy stream (cpu
-  `gpu_worker.py`, `gpu_to_cpu=False`) does **not** `wait_stream` on compute,
-  and `_collect` submits right after the forward is enqueued, with
-  `--async-scheduling` on. So since v0.4.1 every record carries `boot` (pid
-  repeats across container boots), and every load submit records `in_step`
-  (destination blocks in this rank's input-batch block table; `null` +
-  `in_step_why` when unreadable, never 0), `in_step_ids`, `in_step_reqs`,
-  `req` and `req_in_step`. `/kv/workers` counts `loads_in_step`,
-  `loads_not_in_step`, `loads_in_step_unreadable` and `loads_req_in_step`.
-  Last-freed time is not recorded: it lives in the scheduler's BlockPool, in
-  another process.
-- The supervisor copies both nodes' ledger tails, logs and kernel logs to
-  `~/kvdiag/supervisor/<ts>/` on the head before it restarts anything.
+| `load_wait_compute` | loads | incidents |
+|---|---|---|
+| 1 (v0.4.2: organic traffic plus `kvrace.py run --arm on`) | 3,270+ | 0 |
+| 0 (`kvrace.py run --arm off`, otherwise identical) | 36 | Xid 32 on the worker |
+
+The faulting load was group 0, 16 blocks, `wait_compute=False`, alone on the
+GPU, `in_step=0`. The boot self-test (`diag_copy_selftest`) had already shown
+the same destination copies are byte-exact on an idle GPU, so the copy's
+parameters were never the trigger. vLLM 0.31 does the same wait for loads
+(`cpu/gpu_worker.py:690-696`).
+
+**Fix:** `load_wait_compute=1` (v0.4.2, the code default):
+`DiskLoadHandler._arm_compute_wait` makes the stream upstream will pop wait on
+the current stream before each load copy.
+
+- **Non-negotiable: `load_wait_compute` must stay 1 on a serving engine.**
+  0 exists only for DSpark `local-ops/kvrace.py run --arm off`, the
+  reproducer. While it is 0 the engine log says so as a WARNING (on the
+  flip, then every 5 min, also from the watchdog with no load running), and
+  `/kv/workers` counts `compute_wait_off`.
+- **Earlier conclusions to re-read in this light.** "`load_inflight_max=4`
+  killed the engine" and the op-cap and burst hypotheses were all measured
+  without the wait, so they may be this race rather than limits of their own.
+  The ledger (`/kvoffload/diag/ledger-r<rank>.jsonl`, `open_entries()` after
+  a fault, `wait_compute` on every load line), the copy probe and the
+  supervisor's copies to `~/kvdiag/supervisor/<ts>/` stay; they are how the
+  next fault gets read.
+- **Every change to the load path is gated on the reproducer:** `kvrace.py
+  run --arm on --loads 1000` must stay clean, and a 700K restore must stay
+  about 10 s idle. It is an actuator; the vllm-proxy session runs it, with the
+  user's consent.
 
 The write-up is vllm-proxy `docs/kv/history/2026-10-14-xid-outage.md`.
 

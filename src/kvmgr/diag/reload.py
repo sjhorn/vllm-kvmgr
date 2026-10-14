@@ -81,6 +81,10 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     # instance of the reload-destroys-module-state family, and the first one
     # caught by remembering the table exists rather than by a live failure.
     ("kvmgr.diskio", "_watchdog_started", "the stall watchdog's one-shot flag"),
+    # How long load_wait_compute has been 0 (the Xid 32 setting). A reload
+    # resetting it would restart "off for Ns" from zero mid-reproduction.
+    ("kvmgr.diskio", "_WAIT_COMPUTE_OFF",
+     "when load_wait_compute went to 0, and the last warning about it"),
     # Published by the __init__ wrap in register.py, which runs ONCE when the
     # connector is built -- so a reload is the only way to lose it and nothing
     # re-derives it. Same shape as all_managers, one layer out.
