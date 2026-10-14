@@ -40,11 +40,13 @@ import itertools
 import os
 import threading
 import time
+import zlib
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from vllm.logger import init_logger
 
 from . import hooks
+from . import loadfail
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -220,6 +222,71 @@ def exists_all(paths_of_keys, path_of, threads: int = 1) -> list:
 
     keys = list(paths_of_keys)
     return [k for k, ok in zip(keys, _pool_map(one, keys, threads)) if ok]
+
+
+# ---------------------------------------------------------------------------
+# CHECKSUMS, OUTSIDE THE FILE (borrowed from sparkcache, which SHA-256s every
+# chunk and re-hashes at restore). The data file's bytes are the pinned layout
+# (DISK_LAYOUT_FUNCTIONS), and changing them orphans the tier, so the checksum
+# lives in an extended attribute on the file: no layout change, no extra inode
+# for the boot walk, and a file without one (every file written before this)
+# simply reads as unchecked. CRC32 from zlib: stdlib, C, and it releases the
+# GIL on large buffers, so the reader and writer threads run it in parallel.
+# A size check cannot see bytes that are wrong but the right length; this can.
+# ---------------------------------------------------------------------------
+CHECKSUM_XATTR = "user.kvmgr.crc32"
+
+
+def crc_tag(crc: int, size: int) -> bytes:
+    return b"crc32:%08x:%d" % (crc & 0xFFFFFFFF, int(size))
+
+
+def parse_crc_tag(raw) -> tuple:
+    """(crc, size). ValueError on anything else: a tag we cannot read is not
+    one we can vouch for."""
+    try:
+        kind, crc, size = bytes(raw).decode("ascii").split(":")
+        if kind != "crc32":
+            raise ValueError(kind)
+        return int(crc, 16), int(size)
+    except Exception as e:
+        raise ValueError("unreadable checksum tag %r" % (bytes(raw)[:40],)) from e
+
+
+def _xattr_set(path: str, value: bytes) -> None:
+    os.setxattr(path, CHECKSUM_XATTR, value)
+
+
+def _xattr_get(path: str):
+    """The tag, or None when the file has none or the filesystem keeps none."""
+    try:
+        return os.getxattr(path, CHECKSUM_XATTR)
+    except AttributeError:      # no xattrs on this platform (macOS)
+        return None
+    except OSError as e:
+        import errno
+        if e.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA),
+                       errno.ENOTSUP, errno.ENOENT):
+            return None
+        raise
+
+
+def _flag_on(name: str) -> bool:
+    try:
+        from kvmgr import flags as _f
+        return bool(_f.peek(name))
+    except Exception:
+        return False
+
+
+def unlink_bad(path: str) -> bool:
+    """Remove a provably unloadable file (wrong size, wrong checksum), so the
+    next store rewrites it instead of skipping it as present."""
+    try:
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
 
 
 def check_pairing(keys: "Sequence[bytes]", block_ids: "Sequence[int]",
@@ -1512,6 +1579,9 @@ class DiskStoreHandler:
                       # found by the per-class stats audit the moment it was
                       # written, which is this project's pattern for audits.
                       "delete_errors": 0, "deleted": 0,
+                      # disk_checksum_write: tags set, and tags the filesystem
+                      # refused (said once in the log)
+                      "checksum_set": 0, "checksum_set_errors": 0,
                       # *** THE FENCE, MEASURED. *** `handle_preemptions`
                       # calls `worker.wait(jobs_to_flush)` SYNCHRONOUSLY on the
                       # worker's critical path, and our wait() blocks until the
@@ -1893,14 +1963,44 @@ class DiskStoreHandler:
 
     def _write_batch(self, keys, slots, group_idx) -> tuple[int, int]:
         total = files = 0
+        tag = _flag_on("disk_checksum_write")
         for key, slot in zip(keys, slots):
             path = self._mapper.get_file_name(key)
             if os.path.exists(path):
                 # write_chunks renames, so an existing path is never a partial.
                 continue
-            total += write_chunks(path, file_plan(self._refs, group_idx, slot),
-                                  self._read_row)
+            plan = file_plan(self._refs, group_idx, slot)
+            if not tag:
+                total += write_chunks(path, plan, self._read_row)
+                files += 1
+                continue
+            # The CRC of exactly the bytes write_chunks writes, in its order,
+            # taken from the rows it reads -- write_chunks itself is a pinned
+            # layout function and stays as it is.
+            acc = [0]
+
+            def read_row(t, s_, n, _acc=acc):
+                buf = self._read_row(t, s_, n)
+                _acc[0] = zlib.crc32(buf, _acc[0])
+                return buf
+
+            n = write_chunks(path, plan, read_row)
+            total += n
             files += 1
+            try:
+                # After the rename, so a reader can meet the file untagged for
+                # a moment: that reads as unchecked, as every old file does.
+                _xattr_set(path, crc_tag(acc[0], n))
+                self.stats["checksum_set"] = self.stats.get("checksum_set", 0) + 1
+            except Exception as exc:
+                self.stats["checksum_set_errors"] = (
+                    self.stats.get("checksum_set_errors", 0) + 1)
+                if not getattr(self, "_tag_warned", False):
+                    self._tag_warned = True
+                    logger.warning(
+                        "kvmgr: could not tag %s with its checksum (%r); files "
+                        "stay unchecked. Said once; counted as "
+                        "checksum_set_errors.", path, exc)
         return total, files
 
     def reconcile_pool(self) -> None:
@@ -2312,6 +2412,14 @@ class DiskLoadHandler:
                       "saturations": 0, "rounds_done": 0,
                       "compute_waits": 0, "compute_wait_unarmed": 0,
                       "compute_wait_off": 0,
+                      # disk_checksum_verify: matched, untagged (read as
+                      # unchecked), MISMATCHED (the load fails), and provably
+                      # bad files removed so the next store rewrites them
+                      "checksum_ok": 0, "checksum_absent": 0, "checksum_bad": 0,
+                      "bad_unlinked": 0,
+                      # disk_load_failure_recompute: failed jobs reported to
+                      # vLLM as invalid blocks instead of asserting
+                      "failed_recompute": 0,
                       # ask4 item 3: what one scheduler step moves. A step is
                       # one get_finished call; a loading step is one with a
                       # load job open on entry.
@@ -2356,12 +2464,50 @@ class DiskLoadHandler:
 
     def _read_batch(self, keys, slots, group_idx) -> int:
         total = 0
+        verify = _flag_on("disk_checksum_verify")
         for key, slot in zip(keys, slots):
             path = self._mapper.get_file_name(key)
-            total += read_chunks(path, file_plan(self._refs, group_idx, slot),
-                                 self._write_row)
+            try:
+                total += self._read_one(path,
+                                        file_plan(self._refs, group_idx, slot),
+                                        verify)
+            except ValueError:
+                # Wrong size or wrong checksum: provably unloadable. Removed so
+                # the next store writes it again rather than skipping it as
+                # present. A MISSING file raises FileNotFoundError, not this.
+                if unlink_bad(path):
+                    self.stats["bad_unlinked"] = (
+                        self.stats.get("bad_unlinked", 0) + 1)
+                raise
             self.stats["files"] += 1
         return total
+
+    def _read_one(self, path, plan, verify: bool) -> int:
+        tag = None
+        if verify:
+            raw = _xattr_get(path)
+            if raw is None:
+                self.stats["checksum_absent"] = (
+                    self.stats.get("checksum_absent", 0) + 1)
+            else:
+                tag = parse_crc_tag(raw)
+        if tag is None:
+            return read_chunks(path, plan, self._write_row)
+        acc = [0]
+
+        def write_row(t, s_, buf):
+            acc[0] = zlib.crc32(buf, acc[0])
+            self._write_row(t, s_, buf)
+
+        n = read_chunks(path, plan, write_row)
+        if (acc[0], n) != tag:
+            self.stats["checksum_bad"] = self.stats.get("checksum_bad", 0) + 1
+            raise ValueError(
+                "kvmgr: %s FAILED its checksum (crc32 %08x over %d B, tagged "
+                "%08x over %d B). Refusing to load it: the bytes are the right "
+                "length and wrong." % (path, acc[0], n, tag[0], tag[1]))
+        self.stats["checksum_ok"] = self.stats.get("checksum_ok", 0) + 1
+        return n
 
     def _bounds(self) -> tuple[int, int]:
         """(gpu_rows, staging_rows), derived lazily. REBIND-SAFE.
@@ -2485,7 +2631,10 @@ class DiskLoadHandler:
                 batches.append([g, keys[off:off + n], block_ids[off:off + n]])
             off += n
         self._jobs[job_id] = {"batches": batches, "pending": 0, "bytes": 0,
-                              "failed": False, "t0": _now()}
+                              "failed": False, "t0": _now(),
+                              # every group's destination blocks: what a
+                              # failure reports as invalid (kvmgr.loadfail)
+                              "bids_all": block_ids}
         self.stats["submitted"] += 1
         self._pump()
         return True
@@ -2732,11 +2881,18 @@ class DiskLoadHandler:
                 # A dead engine beats wrong tokens. The message read_chunks
                 # raises names the single file and the recovery.
                 self.stats["errors"] += 1
-                logger.critical(
-                    "kvmgr: *** DISK RESTORE FAILED for job %d -- refusing to "
-                    "hand back KV we cannot verify. The engine core will stop. "
-                    "Delete presence.json beside the KV and restart. ***",
-                    job_id, exc_info=True)
+                if loadfail.enabled():
+                    logger.warning(
+                        "kvmgr: DISK RESTORE FAILED for job %d -- the request "
+                        "will be recomputed (disk_load_failure_recompute).",
+                        job_id, exc_info=True)
+                else:
+                    logger.critical(
+                        "kvmgr: *** DISK RESTORE FAILED for job %d -- refusing "
+                        "to hand back KV we cannot verify. The engine core will "
+                        "stop. Delete presence.json beside the KV and restart. "
+                        "(disk_load_failure_recompute=1 recomputes instead.) ***",
+                        job_id, exc_info=True)
                 self._pool.give(slots)
                 if st is not None:
                     st["failed"] = True
@@ -2811,13 +2967,27 @@ class DiskLoadHandler:
         for job_id in [j for j, st in self._jobs.items()
                        if st["pending"] == 0 and (not st["batches"] or st["failed"])]:
             st = self._jobs.pop(job_id)
+            ok = not st["failed"]
+            if not ok and loadfail.enabled():
+                # *** REPORTED AS DONE, ITS BLOCKS AS INVALID. *** upstream
+                # asserts on success=False; the scheduler's invalid-block path
+                # rolls the request back and recomputes instead.
+                loadfail.note_failed(st.get("bids_all") or ())
+                self.stats["failed_recompute"] = (
+                    self.stats.get("failed_recompute", 0) + 1)
+                logger.warning(
+                    "kvmgr: restore job %d FAILED; its %d GPU block(s) go back "
+                    "to vLLM as invalid and the request is recomputed "
+                    "(disk_load_failure_recompute).", job_id,
+                    len(st.get("bids_all") or ()))
+                ok = None
             # The time matters more on this side than on the store's: see
             # DiskStoreHandler.get_finished. A restore with no series is a
             # restore nobody can prove happened.
             out.append(TransferResult(
-                job_id=int(job_id), success=not st["failed"],
+                job_id=int(job_id), success=ok is not False,
                 # int() for the same reason as the store side.
-                transfer_size=(int(st["bytes"]) if not st["failed"] else None),
+                transfer_size=(int(st["bytes"]) if ok else None),
                 transfer_time=_elapsed(st.get("t0")),
                 transfer_type=(self._spec.disk_medium, "GPU")))
         return None

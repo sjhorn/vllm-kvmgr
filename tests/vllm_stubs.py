@@ -88,6 +88,9 @@ class _Logger:
     def exception(self, m, *a, **k):
         self._emit("error", m, *a, **k)
 
+    def critical(self, m, *a, **k):
+        self._emit("critical", m, *a, **k)
+
 
 def install() -> None:
     """Install every stub. Idempotent."""

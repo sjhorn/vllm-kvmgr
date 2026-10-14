@@ -11,7 +11,7 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   restarts, deploys and measurements in its `CLAUDE.md`), and the recipe is the
   DSpark repo. This file is meant to stand alone, but **DSpark's `CLAUDE.md`
   governs the engine** and wins any disagreement about restarting it.
-- Releases are tags (`v0.1.0` … `v0.4.5`), each
+- Releases are tags (`v0.1.0` … `v0.4.6`), each
   naming the vLLM build it is proven on (`pyproject.toml` states the window).
 - **It is the only copy.** The DSpark recipe repo
   (`~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark`) no
@@ -84,6 +84,10 @@ KVMGR_DSPARK_REPO=~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-S
 - **`PYTHONHASHSEED=20261007`** in the deployment, the root of the block-hash
   chain. Changing it turns every file on disk into a silent miss.
 - **`load_wait_compute=1`.** 0 is the Xid 32 (see below). Not a tunable.
+- **`disk_load_failure_recompute`, `disk_checksum_write`/`_verify` stay off**
+  until the vllm-proxy corruption gate has run them (plan item 6). Until a
+  failed restore is proven survivable, the boot walk stays mandatory: it is the
+  only thing standing between a missing file and a dead engine.
 - **`load_ops_max=2048`, `load_inflight_max=1`** as code defaults. Inflight 4
   caused GPU faults (Xid 32), measured before `load_wait_compute` existed. **But until v0.4.0 the knob did not bound the
   GPU stage**: `_pump` checked it before a file read and `_collect` sent every

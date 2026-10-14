@@ -64,11 +64,11 @@ from disk.
 Into a vLLM image:
 
 ```sh
-pip install --no-deps vllm_kvmgr-0.4.5-py3-none-any.whl
+pip install --no-deps vllm_kvmgr-0.4.6-py3-none-any.whl
 ```
 
 The DSpark recipe does not pip install. It mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.4.5.dist-info` into site-packages instead. vLLM finds the
+`deploy/vllm_kvmgr-0.4.6.dist-info` into site-packages instead. vLLM finds the
 plugin through the entry point in that dist-info folder. The folder is made by
 a script:
 
@@ -143,6 +143,24 @@ the engine:
   `blocks_last_step`, `blocks_per_loading_step`, `poll_ms`, `poll_thread`.
   Compare settings by the change in `blocks_to_gpu / steps_loading` over one
   restore. Can be changed while running.
+- **`disk_load_failure_recompute=0` (off).** In stock vLLM a failed restore
+  (missing file, wrong size, bad checksum) stops the engine: the offloading
+  connector asserts. With this on, the restore is reported to vLLM as invalid
+  blocks instead, the request is rolled back, and its keys leave the index
+  (and a provably bad file is deleted, so the next save rewrites it). vLLM
+  then follows `kv_load_failure_policy` in `KV_TRANSFER_CONFIG`: `recompute`
+  reschedules the request, `fail` (vLLM's default) ends it with an error.
+  kvmgr also fixes vLLM 0.21's rollback for models with several KV groups,
+  which would otherwise crash (borrowed from sparkcache). Not yet tested on the
+  cluster. `/kv/workers`: `failed_recompute`, and `loadfail` per worker.
+- **`disk_checksum_write=0`, `disk_checksum_verify=0` (off).** A CRC32 of each
+  KV file, stored in the file's `user.kvmgr.crc32` extended attribute, so the
+  file itself does not change. Write tags new files; verify checks tagged
+  files on restore. Files written before, or on a filesystem without extended
+  attributes, read as unchecked (`checksum_absent`). A mismatch fails the
+  restore, which stops the engine unless `disk_load_failure_recompute` is on.
+  `/kv/workers`: `checksum_set`, `checksum_set_errors`, `checksum_ok`,
+  `checksum_absent`, `checksum_bad`, `bad_unlinked`.
 - **`stall_fail_after_s=240`.** If a save to disk gets stuck, it fails after
   240 s with a log line that says which job it was. Without this, NCCL kills
   the worker after 600 s and leaves no Python trace.

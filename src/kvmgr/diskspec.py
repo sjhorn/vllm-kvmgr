@@ -2953,6 +2953,30 @@ class DiskPresenceManager(OffloadingManager):
             self._unflushed += len(new)
             self.flush_manifest()
 
+    def forget_failed_load(self, keys) -> int:
+        """Drop keys whose load FAILED on some rank (kvmgr.loadfail). Returns
+        how many were in the index.
+
+        Same shape as cross-rank verification dropping a key: out of the index
+        and journalled, so neither the retry nor a reboot can claim it again.
+        The worker has unlinked a provably bad file, so the next store
+        rewrites it. The load hold `prepare_load` took is still released by
+        `complete_load`, which the job's completion calls as usual."""
+        self._ensure_index()
+        gone = [bytes(k) for k in keys if bytes(k) in self._present]
+        freed = sum(self._forget(k) for k in gone)
+        if gone:
+            self._journal_append(JOURNAL_REMOVE, gone)
+            self._unflushed += len(gone)
+        self._stats["load_failed_forgot"] = (
+            self._stats.get("load_failed_forgot", 0) + len(gone))
+        logger.warning(
+            "kvmgr: a disk restore FAILED and was turned into a recompute; "
+            "%d of its %d key(s) (%.2f GB) leave the index so the retry "
+            "cannot hit them again. The next store re-offers them.",
+            len(gone), len(keys), freed / 1e9)
+        return len(gone)
+
     def complete_load(
         self, keys: "Collection[OffloadKey]", req_context: "ReqContext"
     ) -> None:

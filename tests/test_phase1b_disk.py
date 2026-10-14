@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the PACKAGE root
@@ -379,7 +380,8 @@ def mkhandler(pool_size, nrefs=REFS):
                # Added when the real constructor gained them, which the
                # fixture-parity assertion below is here to force.
                "skipped_before_copy": 0, "delete_errors": 0, "deleted": 0,
-               "saturations": 0, "capped": 0}
+               "saturations": 0, "capped": 0,
+               "checksum_set": 0, "checksum_set_errors": 0}
     h._read_row = lambda t, s, n: b"\xab" * n
     # *** THE FIXTURE MUST DECLARE ITS TRANSFER BOUNDS. *** `_bounds()` derives
     # them from the real tensors, which this shell does not have -- so without
@@ -2868,6 +2870,8 @@ def mkloadhandler(pool_size, nrefs=REFS):
                "saturations": 0, "rounds_done": 0,
                "compute_waits": 0, "compute_wait_unarmed": 0,
                "compute_wait_off": 0,
+               "checksum_ok": 0, "checksum_absent": 0, "checksum_bad": 0,
+               "bad_unlinked": 0, "failed_recompute": 0,
                "steps": 0, "steps_loading": 0,
                "blocks_to_gpu": 0, "blocks_step_max": 0,
                "blocks_to_gpu_poll": 0, "rounds_to_gpu_poll": 0,
@@ -3377,6 +3381,146 @@ check("...keeps poll submits out of the in_step counts",
       '_k = ("loads_via_poll" if via == "poll" else' in _lg8)
 check("...and reports the stream the arm waited on",
       'cs = getattr(h, "_armed_on", None)' in _lg8)
+
+# ---- C9 (borrowed from sparkcache): checksums, and failure -> recompute ------
+print("\n== (C9) checksums outside the file, and a failed restore as invalid blocks ==")
+from kvmgr import loadfail as _LF  # noqa: E402
+
+_XA = {}                     # path -> tag: the filesystem's xattrs, faked
+_real_set, _real_get = diskio._xattr_set, diskio._xattr_get
+diskio._xattr_set = lambda path, v: _XA.__setitem__(path, bytes(v))
+diskio._xattr_get = lambda path: _XA.get(path)
+try:
+    _C9K = gkeys(0, 3, salt=91)
+    _pat = lambda t, s_, n: bytes(((t * 31 + s_ * 7 + i) % 251) for i in range(n))
+    # -- write: off, then on
+    F.write(disk_checksum_write=0)
+    flags.reset_for_tests()
+    hs9 = mkhandler(8)
+    hs9._read_row = _pat
+    hs9._write_batch(_C9K[:1], [1], 0)
+    _p0 = hs9._mapper.get_file_name(_C9K[0])
+    check("write off: the file is written, untagged", os.path.exists(_p0)
+          and _p0 not in _XA)
+    F.write(disk_checksum_write=1)
+    flags.reset_for_tests()
+    hs9._write_batch(_C9K[1:], [2, 3], 0)
+    _p1, _p2 = (hs9._mapper.get_file_name(k) for k in _C9K[1:])
+    _want = zlib.crc32(open(_p1, "rb").read())
+    eq("*** write on: the tag is the CRC32 of exactly the file's bytes ***",
+       diskio.parse_crc_tag(_XA[_p1]),
+       (_want, os.path.getsize(_p1)))
+    eq("...counted", hs9.stats["checksum_set"], 2)
+    check("...and the file itself is byte-for-byte what write_chunks writes "
+          "untagged (the layout does not move)",
+          open(_p1, "rb").read() == b"".join(
+              _pat(c.tensor_idx, c.slot, c.nbytes)
+              for c in diskio.file_plan(REFS, 0, 2)))
+    diskio._xattr_set = lambda path, v: (_ for _ in ()).throw(OSError(95, "ENOTSUP"))
+    harness.clear_log()
+    _C9X = gkeys(0, 2, salt=92)
+    hs9._write_batch(_C9X, [4, 5], 0)
+    eq("a filesystem that refuses xattrs: counted", hs9.stats["checksum_set_errors"], 2)
+    eq("...said once", harness.log_text().count("could not tag"), 1)
+    check("...and the files are still written", all(
+        os.path.exists(hs9._mapper.get_file_name(k)) for k in _C9X))
+    diskio._xattr_set = lambda path, v: _XA.__setitem__(path, bytes(v))
+
+    # -- read: verify on
+    F.write(disk_checksum_write=1, disk_checksum_verify=1)
+    flags.reset_for_tests()
+    hl9 = mkloadhandler(8)
+    del hl9._read_batch
+    hl9._mapper = hs9._mapper
+    _rows = {}
+    hl9._write_row = lambda t, s_, buf: _rows.__setitem__((t, s_), bytes(buf))
+    n9 = hl9._read_batch(_C9K, [0, 1, 2], 0)
+    eq("verify on: a tagged file that matches loads", hl9.stats["checksum_ok"], 2)
+    eq("...an untagged one reads as unchecked, COUNTED (absent is not zero)",
+       hl9.stats["checksum_absent"], 1)
+    check("...and every byte reached staging", n9 == 3 * sum(
+        c.nbytes for c in diskio.file_plan(REFS, 0, 0)), n9)
+    # flip one byte in a tagged file, keeping its size
+    _b = bytearray(open(_p1, "rb").read())
+    _b[len(_b) // 2] ^= 0x01
+    open(_p1, "wb").write(bytes(_b))
+    try:
+        hl9._read_batch(_C9K[1:2], [3], 0)
+        check("*** a flipped byte FAILS the load ***", False)
+    except ValueError as e:
+        check("*** a flipped byte FAILS the load ***", "FAILED its checksum" in str(e),
+              str(e))
+    eq("...counted", hl9.stats["checksum_bad"], 1)
+    check("...and the file is UNLINKED, so the next store rewrites it",
+          not os.path.exists(_p1))
+    eq("...counted as bad_unlinked", hl9.stats["bad_unlinked"], 1)
+    # wrong size is also provably bad
+    open(_p2, "ab").write(b"x")
+    try:
+        hl9._read_batch(_C9K[2:3], [4], 0)
+    except ValueError:
+        pass
+    check("a WRONG-SIZE file is unlinked too", not os.path.exists(_p2))
+    # a missing file is not unlinked (nothing to remove) and is not a ValueError
+    try:
+        hl9._read_batch(_C9K[2:3], [4], 0)
+        check("a missing file fails", False)
+    except FileNotFoundError:
+        check("a missing file fails as FileNotFoundError, not 'bad'", True)
+    eq("...and is not counted as unlinked", hl9.stats["bad_unlinked"], 2)
+    _XA[_p0] = b"garbage"
+    try:
+        hl9._read_batch(_C9K[:1], [5], 0)
+        check("an unreadable tag fails the load", False)
+    except ValueError as e:
+        check("an unreadable tag fails the load (cannot vouch)",
+              "unreadable checksum tag" in str(e), str(e))
+    F.write(disk_checksum_verify=0)
+    flags.reset_for_tests()
+    hs9._write_batch(_C9K[:1], [1], 0)      # rewrite _p0 untagged path is gone
+    hl9b = mkloadhandler(8)
+    del hl9b._read_batch
+    hl9b._mapper = hs9._mapper
+    hl9b._write_row = lambda t, s_, buf: None
+    _XA[hs9._mapper.get_file_name(_C9K[0])] = b"garbage"
+    hl9b._read_batch(_C9K[:1], [0], 0)
+    eq("verify off: tags are not read at all", hl9b.stats["checksum_absent"]
+       + hl9b.stats["checksum_ok"] + hl9b.stats["checksum_bad"], 0)
+finally:
+    diskio._xattr_set, diskio._xattr_get = _real_set, _real_get
+
+# -- a failed job: today's assert, or invalid blocks when the knob is on
+for _on in (0, 1):
+    F.write(load_inflight_max=1, load_read_ahead=1, load_batch_max=4,
+            load_ops_max=0, disk_load_failure_recompute=_on)
+    flags.reset_for_tests()
+    _LF.drain()
+    h9 = mkloadhandler(16)
+    load_job(h9, 90 + _on, 6, 1500, 90 + _on)
+    for f in h9._readers.futs:
+        f.finish(fail=True)
+    harness.clear_log()
+    _res = {r.job_id: r for r in h9.get_finished()}
+    _r = _res.get(90 + _on)
+    if not _on:
+        check("knob off: the failed job reports success=False (upstream's "
+              "assert, as before)", _r is not None and _r.success is False)
+        eq("...nothing is reported as invalid", _LF.drain(), set())
+        check("...and the log still says the engine will stop",
+              "The engine core will stop" in harness.log_text())
+    else:
+        check("*** knob on: the failed job is reported DONE, so upstream does "
+              "not assert ***", _r is not None and _r.success is True)
+        eq("...with no size (no transfer stats for bytes never restored)",
+           _r.transfer_size, None)
+        eq("*** ...and ALL its GPU blocks, every group, go to vLLM as invalid ***",
+           _LF.drain(), set(range(1500, 1506)))
+        eq("...counted", h9.stats["failed_recompute"], 1)
+        check("...and the log says recompute, not stop",
+              "will be recomputed" in harness.log_text()
+              and "will stop" not in harness.log_text(), harness.log_text()[-300:])
+F.write(load_inflight_max=1, disk_load_failure_recompute=0)
+flags.reset_for_tests()
 
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:

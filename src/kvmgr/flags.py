@@ -303,6 +303,24 @@ DEFAULTS: dict[str, Any] = {
     # it (phase9 9ak compares serial against parallel). 1 = the serial walk.
     # Hot; the pool lives only for one chunk. Unmeasured: ask5.
     "disk_verify_threads": 16,
+    # *** A FAILED RESTORE BECOMES A RECOMPUTE, NOT A DEAD ENGINE. ***
+    # (kvmgr.loadfail, borrowed from sparkcache.) Upstream asserts on a failed
+    # load; with this on, the load handler reports the job done and its GPU
+    # blocks as invalid, vLLM's scheduler rolls the request back (the
+    # multi-group fix in loadfail makes that path safe on 5 groups), and the
+    # keys leave the index. What vLLM then does is KV_TRANSFER_CONFIG's
+    # kv_load_failure_policy: "recompute" reschedules, "fail" (vLLM's default)
+    # finishes the request with an error. Off until the corruption gate has
+    # run on the cluster. Hot.
+    "disk_load_failure_recompute": False,
+    # CRC32 per KV file, kept in the `user.kvmgr.crc32` extended attribute, so
+    # the file bytes (the pinned layout) do not change. WRITE tags new files;
+    # VERIFY checks tagged files at restore (untagged ones read as unchecked,
+    # counted as checksum_absent). A mismatch fails the load and unlinks the
+    # file -- a dead engine unless disk_load_failure_recompute is on, which is
+    # why verify is separate and both start off. Hot.
+    "disk_checksum_write": False,
+    "disk_checksum_verify": False,
     # How long a lookup may DEFER one key before answering False.
     #
     # *** DEFERRING IS UPSTREAM'S OWN MECHANISM, not a trick. *** `lookup`

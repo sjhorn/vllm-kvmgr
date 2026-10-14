@@ -93,6 +93,11 @@ def register() -> None:
 
     _install_group_geometry_hook(DSparkMLAAttentionManager)
     _install_offload_scheduler_hook()
+    # A failed restore -> invalid blocks -> recompute (kvmgr.loadfail). Both
+    # patches act only once a load has failed; the worker reports failures that
+    # way only while disk_load_failure_recompute is on.
+    from . import loadfail
+    loadfail.install()
     _install_serializer_shim()
 
     # The tiering shims (O_DIRECT, the hybrid relax, verify) moved to

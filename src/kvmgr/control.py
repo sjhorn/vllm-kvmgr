@@ -221,6 +221,11 @@ def install_worker_methods() -> None:
             ]
         except Exception as e:
             out["handlers_error"] = str(e)
+        try:
+            from . import loadfail
+            out["loadfail"] = loadfail.snapshot()
+        except Exception as e:
+            out["loadfail_error"] = str(e)
         return out
 
     def kvmgr_verify_presence(self, keys: "list[str] | None" = None) -> dict:

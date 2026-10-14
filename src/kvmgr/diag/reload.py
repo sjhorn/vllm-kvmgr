@@ -81,6 +81,13 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     # instance of the reload-destroys-module-state family, and the first one
     # caught by remembering the table exists rather than by a live failure.
     ("kvmgr.diskio", "_watchdog_started", "the stall watchdog's one-shot flag"),
+    # Failed loads' GPU blocks not yet drained by the connector, and the lock
+    # and counters around them. The connector and Scheduler wraps installed at
+    # boot keep calling the OLD module's functions, so old and new must share
+    # these objects or a failure noted by the new diskio is never reported.
+    ("kvmgr.loadfail", "_ERRORS", "failed loads' blocks awaiting the connector"),
+    ("kvmgr.loadfail", "_LOCK", "the lock around _ERRORS"),
+    ("kvmgr.loadfail", "STATS", "load-failure counters"),
     # How long load_wait_compute has been 0 (the Xid 32 setting). A reload
     # resetting it would restart "off for Ns" from zero mid-reproduction.
     ("kvmgr.diskio", "_WAIT_COMPUTE_OFF",
@@ -351,7 +358,9 @@ def reload_modules() -> dict:
     # reloads reported success while running the previous code.
     # The reloader reloads ITSELF LAST: the running frame keeps the old code,
     # so a change to this function takes effect on the NEXT reload.
-    for name in ("kvmgr.hooks", "kvmgr.flags", "kvmgr.policy", "kvmgr.diskio",
+    for name in ("kvmgr.hooks", "kvmgr.flags", "kvmgr.policy",
+                 # before diskio, which binds it at import
+                 "kvmgr.loadfail", "kvmgr.diskio",
                  "kvmgr.diskspec", "kvmgr.manager", "kvmgr.stats",
                  "kvmgr.diag.hangdump", "kvmgr.diag.ledger",
                  "kvmgr.diag.copyprobe", "kvmgr.diag.selftest",
