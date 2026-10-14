@@ -18,6 +18,10 @@ license = { text = "Apache-2.0" }
 # re-resolves vLLM inside a tuned image.
 dependencies = ["vllm>=0.21.1rc1.dev0,<0.22"]
 
+[project.urls]
+Homepage = "https://github.com/sjhorn/vllm-kvmgr"
+Issues = "https://github.com/sjhorn/vllm-kvmgr/issues"
+
 [project.entry-points."vllm.general_plugins"]
 kvmgr = "kvmgr:register"
 

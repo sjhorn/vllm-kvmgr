@@ -112,8 +112,11 @@ The write-up is vllm-proxy `docs/kv/history/2026-10-14-xid-outage.md`.
 ## Working agreement
 
 - Work on `main`, and commit each finished, green unit of work.
-- No pushes without asking. The only remotes are the two nodes
-  (`head`, `worker`), and a push there is a deploy (above).
+- No pushes without asking. `origin` is the public GitHub repo
+  (`github.com/sjhorn/vllm-kvmgr`, CI runs pristine mode there). `head` and
+  `worker` are the two nodes, and a push there is a deploy (above).
+- History was rewritten on 2026-10-14 (author email only, trees identical),
+  so commit hashes cited before that date in other repos' docs are stale.
 - Never commit secrets, keys or `data/`.
 - **Where things get written:** rules about this package go here or in
   `README.md`. Measurements, deploy records and dated narrative go in
