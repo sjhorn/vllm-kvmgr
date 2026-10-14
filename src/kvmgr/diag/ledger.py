@@ -543,6 +543,19 @@ def tensor_context(h, group: int) -> dict:
     return got
 
 
+def _keys_field(h) -> dict:
+    """{"keys": [hex, ...]} for this submit, when diag_ledger_keys is on."""
+    try:
+        if not flags.peek("diag_ledger_keys"):
+            return {}
+        keys = getattr(h, "_submit_keys", None)
+        if keys is None:
+            return {"keys": None, "keys_why": "the handler named no keys"}
+        return {"keys": [bytes(k).hex() for k in keys]}
+    except Exception as e:
+        return {"keys": None, "keys_why": ("unreadable: %r" % (e,))[:160]}
+
+
 def stream_context(h) -> dict:
     """The compute stream at submit, and the copy stream upstream will pop.
 
@@ -700,6 +713,9 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
                 **({"wait_compute": getattr(h, "_wait_compute_last", None),
                     "via": via or "step"}
                    if kind == "load" else {}),
+                # diag_ledger_keys: the round's keys, so a gate can see from
+                # THIS rank's own file which keys it loaded or stored
+                **_keys_field(h),
                 **ctx))
             for k2, i2, j2, g2, common in hits:
                 _STATS["overlaps"] += 1

@@ -153,6 +153,7 @@ _DIAGNOSTICS = (
     ("ledger", "diag_transfer_ledger"),
     ("copyprobe", "diag_copy_probe"),
     ("selftest", "diag_copy_selftest"),
+    ("reqkeys", "diag_request_keys"),
     ("serializer", "diag_serializer_walk"),
     ("geometry", "diag_geometry_snapshot"),
     ("tiering", "diag_tiering_shims"),

@@ -1936,6 +1936,7 @@ class DiskStoreHandler:
                     gs[g] = len(_sb)
 
                 self._ledger_note("store", g, _sb, _ss)
+                self._submit_keys = _sk
                 self._ledger_submit("store", inner, job_id, g, _sb, _ss)
                 try:
                     ok = self._inner.transfer_async(
@@ -2705,6 +2706,10 @@ class DiskLoadHandler:
                 n = len(slots)
                 # Stage 1 for a LOAD is the FILE READ, on the thread pool.
                 fut = self._readers.submit(self._read_batch, bkeys[:n], slots, g)
+                try:
+                    fut._kvmgr_keys = bkeys[:n]     # for the ledger's `keys`
+                except Exception:
+                    pass
                 self._reading.append((job_id, fut, slots, bids[:n], g))
                 st["pending"] += 1
                 if n == len(bids):
@@ -2934,6 +2939,7 @@ class DiskLoadHandler:
             self._next_inner += 1
             # Before the ledger line, so the line says whether it held.
             self._submit_via = via
+            self._submit_keys = getattr(fut, "_kvmgr_keys", None)
             self._wait_compute_last = self._arm_compute_wait(
                 None if on_step else self._poll_compute)
             self._ledger_note("load", g, bids, slots)

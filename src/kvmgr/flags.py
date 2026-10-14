@@ -721,6 +721,12 @@ DEFAULTS: dict[str, Any] = {
     # Boot-time replay of known-bad load destinations on an idle GPU, before
     # the engine serves. Writes into FREE KV blocks; bounded; off by default.
     "diag_copy_selftest": False,
+    # GET /kv/keys: one request's keys, files per rank, index state (ask6,
+    # the v0.4.6 recompute gate). Read-only, bounded ring. Boot-time install.
+    "diag_request_keys": True,
+    # Ledger submit lines carry `keys` (hex) for the round. Hot. Off: a
+    # sliding-window round can name hundreds of keys, so it is for a gate run.
+    "diag_ledger_keys": False,
     "diag_serializer_walk": False,   # name a numpy scalar's producer (coercion is core)
     "diag_geometry_snapshot": False, # KV geometry JSON written at handler build
     "diag_tiering_shims": False,     # O_DIRECT / hybrid / verify shims for upstream's tiering

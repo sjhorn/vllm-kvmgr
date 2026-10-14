@@ -69,11 +69,11 @@ from disk.
 Into a vLLM image:
 
 ```sh
-pip install --no-deps vllm_kvmgr-0.4.6-py3-none-any.whl
+pip install --no-deps vllm_kvmgr-0.4.7-py3-none-any.whl
 ```
 
 The DSpark recipe does not pip install. It mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.4.6.dist-info` into site-packages instead. vLLM finds the
+`deploy/vllm_kvmgr-0.4.7.dist-info` into site-packages instead. vLLM finds the
 plugin through the entry point in that dist-info folder. The folder is made by
 a script:
 
@@ -342,6 +342,8 @@ Optional tools for finding problems. Each one has a knob:
 | transfer ledger: which blocks each transfer used, logged on a fault | `diag_transfer_ledger` | **on** |
 | copy probe: is a stuck copy finished on the GPU, and its addresses | `diag_copy_probe` | **on** |
 | boot self-test: replay given load copies on an idle GPU | `diag_copy_selftest` | off |
+| `GET /kv/keys`: one request's keys and its file on every node | `diag_request_keys` | **on** |
+| the round's keys on each ledger line. Can be changed while running | `diag_ledger_keys` | off |
 | the ledger file (below), and the `LEDGER OVERLAP` check. Can be changed while running | `diag_ledger_file` | **on** |
 | find where numpy numbers leak into vLLM's messages | `diag_serializer_walk` | off |
 | write a file with the KV cache layout | `diag_geometry_snapshot` | off |
@@ -349,7 +351,7 @@ Optional tools for finding problems. Each one has a knob:
 | reload the plugin's code in a running engine | `diag_hot_reload` | off |
 
 These are set up when the plugin loads, so changing them needs a restart.
-`diag_ledger_file` is the one exception.
+`diag_ledger_file` and `diag_ledger_keys` are the exceptions.
 
 The main code never imports `kvmgr.diag`. A test checks this. Another test
 checks that with every diag knob off, no diag code is loaded at all.
@@ -435,6 +437,36 @@ from the 2026-10-14 12:36 hang is built in. To add others, write
 
 If `sha` is given and the ids do not match it, the set is skipped. This test
 writes into GPU KV blocks, so turn it on only for a planned boot.
+
+### One request's files
+
+`diag_request_keys` (on by default) answers "which files on disk belong to
+this request?", on the engine-core stats port (`kvmgr_stats_port`):
+
+- `GET /kv/keys` lists the requests it knows: the live ones, and the 32 most
+  recently finished, with their token counts.
+- `GET /kv/keys?req=<id>[&group=G][&limit=N]` gives, for each KV group, the
+  request's keys in prompt order:
+
+| field | meaning |
+|---|---|
+| `i`, `tokens` | the block's index in the prompt, and the tokens it covers |
+| `key` | the key, as hex |
+| `path` | the file on each rank (`"0"`, `"1"`), as seen inside the container (`/kvoffload/...`) |
+| `in_index`, `verified` | whether the disk index holds the key, and whether every node has vouched for it. `null` when unreadable |
+
+  Each group also reports `num_hit_blocks` (blocks the request found cached
+  when it started) and `num_keys`/`truncated` (`limit` defaults to 5000).
+
+The keys come from vLLM's own per-request state, and the paths from vLLM's
+own file mapper with the rank changed, so nothing is recomputed outside the
+engine. A request that is neither live nor among the last 32 finished gets a
+404 that says so. It reads only: no KV bytes and no prompt text. The ring
+holds at most 32 requests and 400,000 keys.
+
+With `diag_ledger_keys` on, each ledger line also lists its round's keys
+(`keys`), so a node's own ledger shows which keys it actually loaded or
+stored.
 
 ## What it changes inside vLLM
 

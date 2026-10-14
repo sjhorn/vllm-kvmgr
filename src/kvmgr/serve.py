@@ -63,7 +63,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from vllm.logger import init_logger
 
-from . import flags, stats
+from . import flags, hooks, stats
 
 # *** THE LOGGER NAME IS LOAD-BEARING, and `__name__` is the wrong one. ***
 #
@@ -122,7 +122,17 @@ class _Handler(BaseHTTPRequestHandler):
                 ).encode()
                 self._send(200, body, "application/json")
             else:
-                self._send(404, b'{"error":"not found"}', "application/json")
+                # diagnostics' read-only routes (kvmgr.diag.reqkeys: /kv/keys)
+                from urllib.parse import parse_qs
+                got = hooks.first("http_get", path,
+                                  parse_qs(self.path.partition("?")[2]))
+                if got is None:
+                    self._send(404, b'{"error":"not found"}', "application/json")
+                else:
+                    code, obj = got
+                    self._send(int(code), json.dumps(
+                        obj, default=str, separators=(",", ":")).encode(),
+                        "application/json")
         except Exception:  # never let a reader take the engine down
             try:
                 self._send(500, b'{"error":"internal"}', "application/json")

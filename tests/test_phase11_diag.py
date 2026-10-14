@@ -121,6 +121,8 @@ WANT = {"diag_hang_dump": True, "diag_transfer_ledger": True,
         "diag_copy_probe": True,
         # ask3 C writes into free KV blocks at boot: never on by default
         "diag_copy_selftest": False,
+        # ask6: GET /kv/keys -- read-only, a bounded ring of key lists
+        "diag_request_keys": True,
         "diag_serializer_walk": False, "diag_geometry_snapshot": False,
         "diag_tiering_shims": False, "diag_hot_reload": False}
 eq("diag knob defaults", {k: flags.DEFAULTS.get(k) for k in WANT}, WANT)
@@ -165,13 +167,15 @@ eq("*** every diag knob off: no kvmgr.diag module is imported ***",
    _off.get("diag"), [])
 eq("...and no diagnostic hook is registered", _off.get("hooks"), [])
 _def = _run({})
-eq("defaults: exactly the hang dump, the ledger and the copy probe are imported",
+eq("defaults: exactly the hang dump, the ledger, the copy probe and the "
+   "request-keys map are imported",
    _def.get("diag"), ["kvmgr.diag", "kvmgr.diag.copyprobe",
-                      "kvmgr.diag.hangdump", "kvmgr.diag.ledger"])
+                      "kvmgr.diag.hangdump", "kvmgr.diag.ledger",
+                      "kvmgr.diag.reqkeys"])
 eq("...and only their hooks are registered (the hang dump needs none)",
-   _def.get("hooks"), ["copy_probe_snapshot", "ledger_done", "ledger_dump",
-                       "ledger_note", "ledger_snapshot", "ledger_submit",
-                       "watchdog_tick"])
+   _def.get("hooks"), ["copy_probe_snapshot", "http_get", "ledger_done",
+                       "ledger_dump", "ledger_note", "ledger_snapshot",
+                       "ledger_submit", "watchdog_tick"])
 
 # ---------------------------------------------------------------------------
 print("\n== (4) off means inert, and says so ==")

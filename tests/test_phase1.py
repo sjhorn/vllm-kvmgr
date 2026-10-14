@@ -362,6 +362,9 @@ PROBE = {
     "disk_verify_threads": (1, 4),
     # borrowed from sparkcache: failed restore -> recompute, and checksums
     "disk_load_failure_recompute": (0, 1),
+    # ask6
+    "diag_request_keys": (0, 1),
+    "diag_ledger_keys": (0, 1),
     "disk_checksum_write": (0, 1),
     "disk_checksum_verify": (0, 1),
     "disk_verify_defer_s": (0.5, 30.0),

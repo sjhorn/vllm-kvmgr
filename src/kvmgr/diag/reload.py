@@ -88,6 +88,11 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     ("kvmgr.loadfail", "_ERRORS", "failed loads' blocks awaiting the connector"),
     ("kvmgr.loadfail", "_LOCK", "the lock around _ERRORS"),
     ("kvmgr.loadfail", "STATS", "load-failure counters"),
+    # The ring of finished requests' keys, its lock and counters: the gate
+    # reads a request that finished BEFORE a reload.
+    ("kvmgr.diag.reqkeys", "_RING", "recently finished requests' keys"),
+    ("kvmgr.diag.reqkeys", "_LOCK", "the lock around _RING"),
+    ("kvmgr.diag.reqkeys", "_STATS", "reqkeys counters"),
     # How long load_wait_compute has been 0 (the Xid 32 setting). A reload
     # resetting it would restart "off for Ns" from zero mid-reproduction.
     ("kvmgr.diskio", "_WAIT_COMPUTE_OFF",
@@ -364,6 +369,7 @@ def reload_modules() -> dict:
                  "kvmgr.diskspec", "kvmgr.manager", "kvmgr.stats",
                  "kvmgr.diag.hangdump", "kvmgr.diag.ledger",
                  "kvmgr.diag.copyprobe", "kvmgr.diag.selftest",
+                 "kvmgr.diag.reqkeys",
                  "kvmgr.diag.serializer", "kvmgr.diag.geometry",
                  "kvmgr.diag.tiering", "kvmgr.serve", "kvmgr.compat.dspark",
                  "kvmgr.register", "kvmgr.control", "kvmgr.diag.reload"):
