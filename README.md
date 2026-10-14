@@ -64,11 +64,11 @@ from disk.
 Into a vLLM image:
 
 ```sh
-pip install --no-deps vllm_kvmgr-0.4.3-py3-none-any.whl
+pip install --no-deps vllm_kvmgr-0.4.4-py3-none-any.whl
 ```
 
 The DSpark recipe does not pip install. It mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.4.3.dist-info` into site-packages instead. vLLM finds the
+`deploy/vllm_kvmgr-0.4.4.dist-info` into site-packages instead. vLLM finds the
 plugin through the entry point in that dist-info folder. The folder is made by
 a script:
 
@@ -132,6 +132,17 @@ the engine:
   repeats a WARNING every 5 minutes and `/kv/workers` counts
   `compute_wait_off`. Each load's ledger line says whether the wait was in
   force (`wait_compute`).
+- **`load_poll_ms=0` (off).** Normally a finished GPU copy is noticed once per
+  scheduler step, so under heavy prefill a restore moves at most
+  `load_inflight_max` rounds per step (an 858K restore took 166 s busy against
+  11 s idle). Above 0, a thread checks every that many ms and starts the next
+  round between steps. That round still waits on the compute stream the last
+  step used, so the Xid 32 fix holds. Not yet measured on the cluster.
+  `/kv/workers` shows what a step moves: `steps_loading`, `blocks_to_gpu`
+  (and `blocks_to_gpu_poll`, the poll thread's share), `blocks_step_max`,
+  `blocks_last_step`, `blocks_per_loading_step`, `poll_ms`, `poll_thread`.
+  Compare settings by the change in `blocks_to_gpu / steps_loading` over one
+  restore. Can be changed while running.
 - **`stall_fail_after_s=240`.** If a save to disk gets stuck, it fails after
   240 s with a log line that says which job it was. Without this, NCCL kills
   the worker after 600 s and leaves no Python trace.
@@ -223,6 +234,8 @@ A block counts as saved only when **both** ranks have written their part.
                         they wait                            (default 1)
   load_wait_compute   = the GPU copy waits for queued compute work first
                         (default 1; 0 is the Xid 32, never on a serving engine)
+  load_poll_ms        = check for finished copies this often between steps
+                                                       (default 0 = off)
 ```
 
 `lookup` checks the index. A prompt reuses blocks in one unbroken run from
@@ -338,6 +351,7 @@ Useful fields on a `submit` line:
 | `in_step` | (loads) how many of the target blocks the current batch is using. `null` means it could not be read, which is not the same as 0 |
 | `req`, `req_in_step` | (loads) the request this load is for, and whether it is in the current batch |
 | `wait_compute` | (loads) whether the copy waited for queued compute work (`load_wait_compute`). `null` means it could not be set up |
+| `via` | (loads) `step`, or `poll` when the poll thread submitted it (`load_poll_ms`). A `poll` line has `in_step: null`: the block table cannot be read from that thread |
 | `dst_span`, `dst_contig_runs` | (loads) highest minus lowest target block id, and how many unbroken runs they form |
 | `bids_sha` | (loads) a short id for the exact block set (sha1 of the `bids` ranges, 12 hex), to match the same copy across ranks |
 | `tensor_idx_set_hash`, `ref_tensors`, `ref_dup_tensors` | (loads) which KV tensors the group's layers use, and how many layers share a tensor with another |

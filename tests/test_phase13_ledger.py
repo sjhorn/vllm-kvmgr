@@ -309,7 +309,7 @@ def method(cls: str, name: str) -> str:
 
 
 for cls, meth, kind in (("DiskStoreHandler", "_pump", "store"),
-                        ("DiskLoadHandler", "_collect", "load")):
+                        ("DiskLoadHandler", "_collect_locked", "load")):
     body = method(cls, meth)
     sub = body.find(f'self._ledger_submit("{kind}", inner,')
     ta = body.find("self._inner.transfer_async(")
@@ -319,7 +319,7 @@ for cls, meth, kind in (("DiskStoreHandler", "_pump", "store"),
     check(f"{cls}: a refused submit closes its entry", fail > ta, fail)
 
 for cls, meth, kind in (("DiskStoreHandler", "_collect", "store"),
-                        ("DiskLoadHandler", "_collect", "load")):
+                        ("DiskLoadHandler", "_collect_locked", "load")):
     body = method(cls, meth)
     pop = body.find("ent = self._inner_to_job.pop(res.job_id, None)")
     dn = body.find(f'self._ledger_done("{kind}", res.job_id, res.success)', pop)

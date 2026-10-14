@@ -498,6 +498,15 @@ def _load_wait_compute() -> bool:
     return v
 
 
+def _load_poll_ms() -> float:
+    """ms between the load poll thread's checks; 0 = no poll thread. Hot."""
+    try:
+        from kvmgr import flags as _f
+        return max(0.0, float(_f.peek("load_poll_ms") or 0))
+    except Exception:
+        return 0.0
+
+
 WAIT_COMPUTE_REWARN_S = 300.0
 # off_since: when the knob was first seen at 0 (None while it is 1);
 # warned_at: the last WARNING, so a long reproduction repeats it rather than
@@ -2191,7 +2200,19 @@ class DiskLoadHandler:
                       "wait_max_pending": 0, "wait_rounds": 0,
                       "saturations": 0, "rounds_done": 0,
                       "compute_waits": 0, "compute_wait_unarmed": 0,
-                      "compute_wait_off": 0}
+                      "compute_wait_off": 0,
+                      # ask4 item 3: what one scheduler step moves. A step is
+                      # one get_finished call; a loading step is one with a
+                      # load job open on entry.
+                      "steps": 0, "steps_loading": 0,
+                      "blocks_to_gpu": 0, "blocks_step_max": 0,
+                      # the share the poll thread submitted (load_poll_ms)
+                      "blocks_to_gpu_poll": 0, "rounds_to_gpu_poll": 0,
+                      "polls": 0, "poll_no_stream": 0, "poll_errors": 0}
+        # Taken by every entry that touches _jobs, _reading, _inner_to_job or
+        # the inner handler: with load_poll_ms > 0 a second thread runs
+        # _collect. See _mu_ for the reload case.
+        self._mu = threading.RLock()
         # REPORT THE FACT, NOT THE ASK. This said "(restore is live)"
         # unconditionally, from __init__, with no gate on the flag -- so a boot
         # whose flags file had disk_restore=False still announced a live
@@ -2277,7 +2298,7 @@ class DiskLoadHandler:
     def _ledger_done(self, kind: str, inner: int, ok: bool) -> None:
         hooks.call("ledger_done", self, kind, inner, ok)
 
-    def _arm_compute_wait(self) -> "bool | None":
+    def _arm_compute_wait(self, compute=None) -> "bool | None":
         """Make the NEXT inner load copy wait for queued compute work.
 
         vLLM 0.31's `transfer_async` does `stream.wait_stream(current_stream)`
@@ -2293,8 +2314,14 @@ class DiskLoadHandler:
         (the connector's get_finished/wait on the worker thread), so the same
         "current stream". No upstream code is copied.
 
+        `compute` is the stream to wait on. None = the current stream, which
+        is right on the step thread. The poll thread passes the stream it
+        captured at the last step, because ITS current stream is not the
+        compute stream (`_poll_once`).
+
         True = armed, False = knob off, None = could not arm (logged once;
         the load proceeds unordered, exactly as before this existed)."""
+        self._armed_on = None
         if not _load_wait_compute():
             self.stats["compute_wait_off"] = (
                 self.stats.get("compute_wait_off", 0) + 1)
@@ -2304,9 +2331,13 @@ class DiskLoadHandler:
             if not isinstance(pool, list):
                 raise TypeError("inner handler has no _stream_pool list")
             import torch
+            if compute is None:
+                compute = torch.cuda.current_stream()
             stream = pool.pop() if pool else torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
+            stream.wait_stream(compute)
             pool.append(stream)
+            # the ledger's compute_stream: the one waited on, whichever thread
+            self._armed_on = compute
         except Exception as exc:
             self.stats["compute_wait_unarmed"] = (
                 self.stats.get("compute_wait_unarmed", 0) + 1)
@@ -2322,6 +2353,10 @@ class DiskLoadHandler:
         return True
 
     def transfer_async(self, job_id: int, spec) -> bool:
+        with self._mu_():
+            return self._transfer_async_locked(job_id, spec)
+
+    def _transfer_async_locked(self, job_id: int, spec) -> bool:
         from vllm.v1.kv_offload.base import get_offload_group_idx
 
         disk_spec, gpu_spec = spec
@@ -2440,25 +2475,116 @@ class DiskLoadHandler:
             # A resize that cannot be computed must never stop a restore.
             pass
 
+    def _mu_(self):
+        """The handler's lock. Created on demand as well as in __init__,
+        because a reload never runs __init__ (see _ready_buf)."""
+        mu = getattr(self, "_mu", None)
+        if mu is None:
+            mu = self._mu = threading.RLock()
+        return mu
+
     def _collect(self) -> None:
+        """The step's pass (get_finished and wait call it)."""
+        with self._mu_():
+            if _load_poll_ms() > 0:
+                self._capture_compute()
+                self._ensure_poller()
+            self._collect_locked("step")
+
+    # ------------------------------------------------------------------
+    # THE POLL THREAD (load_poll_ms, ask4 item 3). Without it a finished copy
+    # is noticed only in the step's get_finished, so a restore under heavy
+    # prefill moves at most load_inflight_max rounds per step (~20 blocks/s
+    # against ~280 idle, 2026-10-14). The thread runs the same _collect pass
+    # between steps, under the same lock.
+    #
+    # *** THE XID 32 FIX MUST HOLD ON THIS THREAD. *** Its current stream is
+    # NOT the compute stream, so a plain `_arm_compute_wait()` here would
+    # order the copy against nothing. The step captures its current stream
+    # (`_capture_compute`) and the poll arms on that. Waiting on it at poll
+    # time covers everything queued on it by then, which includes everything
+    # the step-time arm would have covered: never weaker. No captured stream,
+    # no poll.
+    # ------------------------------------------------------------------
+    def _capture_compute(self) -> None:
+        try:
+            import torch
+            self._poll_compute = torch.cuda.current_stream()
+        except Exception:
+            self._poll_compute = None
+
+    def _ensure_poller(self) -> None:
+        t = getattr(self, "_poll_thread", None)
+        if t is not None and t.is_alive():
+            return
+        self._poll_stop = False
+        t = threading.Thread(target=self._poll_loop, name="kvmgr-loadpoll",
+                             daemon=True)
+        self._poll_thread = t
+        t.start()
+        logger.info("kvmgr: load poll thread started (load_poll_ms=%g): a "
+                    "finished restore copy is followed by the next between "
+                    "steps, still waiting on the compute stream.",
+                    _load_poll_ms())
+
+    def _poll_loop(self) -> None:
+        while not getattr(self, "_poll_stop", False):
+            ms = _load_poll_ms()
+            if ms <= 0:
+                # the next step with the knob > 0 starts a new one
+                logger.info("kvmgr: load poll thread stopped (load_poll_ms=0)")
+                return
+            time.sleep(ms / 1000.0)
+            self._poll_once()
+
+    def _poll_once(self) -> None:
+        """One poll pass. Never raises."""
+        try:
+            if not (self._inner_to_job or self._reading):
+                return
+            with self._mu_():
+                cs = getattr(self, "_poll_compute", None)
+                if cs is None:
+                    self.stats["poll_no_stream"] = (
+                        self.stats.get("poll_no_stream", 0) + 1)
+                    return
+                self.stats["polls"] = self.stats.get("polls", 0) + 1
+                import contextlib
+                import torch
+                dev = getattr(cs, "device", None)
+                with (torch.cuda.device(dev) if dev is not None
+                      else contextlib.nullcontext()):
+                    self._collect_locked("poll")
+        except Exception as exc:
+            self.stats["poll_errors"] = self.stats.get("poll_errors", 0) + 1
+            if not getattr(self, "_poll_err_said", False):
+                self._poll_err_said = True
+                logger.warning("kvmgr: load poll pass failed (%r); the step "
+                               "still collects. Said once; counted as "
+                               "poll_errors.", exc)
+
+    def _collect_locked(self, via: str) -> None:
         from vllm.v1.kv_offload.base import GPULoadStoreSpec
         from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
         from vllm.v1.kv_offload.worker.worker import TransferResult
 
-        self.reconcile_pool()
+        on_step = via == "step"
+        if on_step:
+            self.reconcile_pool()
 
         # Same deadline on the read side. A load that never completes fences
         # nothing, but it holds staging slots for ever and the request behind
         # it never returns -- so it is a hang with a different shape and the
         # same remedy.
-        _nf = honour_stall_fail(self)
+        _nf = honour_stall_fail(self) if on_step else 0
         if _nf:
             ledger_dump(self, "watchdog failed %d stalled job(s)" % _nf)
             logger.error(
                 "kvmgr: marked %d LOAD job(s) failed on the watchdog's "
                 "request -- see the STORE note; the assert is upstream's.", _nf)
 
-        if not _LIVE_CONN_WORKER:
+        # the stack walk finds nothing from the poll thread
+        if on_step and not _LIVE_CONN_WORKER:
             capture_conn_worker_from_caller()
 
         # *** COMPLETIONS FIRST, THEN STAGE 2. *** With the GPU stage bounded
@@ -2540,7 +2666,9 @@ class DiskLoadHandler:
             inner = self._next_inner
             self._next_inner += 1
             # Before the ledger line, so the line says whether it held.
-            self._wait_compute_last = self._arm_compute_wait()
+            self._submit_via = via
+            self._wait_compute_last = self._arm_compute_wait(
+                None if on_step else self._poll_compute)
             self._ledger_note("load", g, bids, slots)
             self._ledger_submit("load", inner, job_id, g, bids, slots)
             ok = self._inner.transfer_async(
@@ -2555,6 +2683,15 @@ class DiskLoadHandler:
                     st["pending"] -= 1
                 continue
             self._inner_to_job[inner] = (job_id, slots)
+            self.stats["blocks_to_gpu"] = (
+                self.stats.get("blocks_to_gpu", 0) + len(bids))
+            self._blocks_this_step = (
+                getattr(self, "_blocks_this_step", 0) + len(bids))
+            if not on_step:
+                self.stats["blocks_to_gpu_poll"] = (
+                    self.stats.get("blocks_to_gpu_poll", 0) + len(bids))
+                self.stats["rounds_to_gpu_poll"] = (
+                    self.stats.get("rounds_to_gpu_poll", 0) + 1)
         self._reading = still
 
         self._pump()
@@ -2619,6 +2756,7 @@ class DiskLoadHandler:
                 len(rem), sorted(rem), len(self._jobs), len(self._reading))
 
     def shutdown(self) -> None:
+        self._poll_stop = True
         self._readers.shutdown(wait=True)
 
     def _ready_buf(self) -> list:
@@ -2648,13 +2786,35 @@ class DiskLoadHandler:
         Keeping the drain in one method is what makes that checkable by reading
         one function instead of auditing every caller.
         """
-        self._collect()
-        out = self._ready_buf()
-        self._ready = []
-        return out
+        with self._mu_():
+            # A STEP, for the per-step counters: blocks submitted since the
+            # previous call, by the step or the poll thread.
+            self.stats["steps"] = self.stats.get("steps", 0) + 1
+            if self._jobs:
+                self.stats["steps_loading"] = (
+                    self.stats.get("steps_loading", 0) + 1)
+            self._collect()
+            n = getattr(self, "_blocks_this_step", 0)
+            self._blocks_last_step, self._blocks_this_step = n, 0
+            self.stats["blocks_step_max"] = max(
+                self.stats.get("blocks_step_max", 0), n)
+            out = self._ready_buf()
+            self._ready = []
+            return out
 
     def snapshot(self) -> dict:
+        _sl = self.stats.get("steps_loading", 0)
+        _pt = getattr(self, "_poll_thread", None)
         return dict(self.stats, jobs_open=len(self._jobs),
+                    # ask4 item 3: blocks moved per loading step, and the poll
+                    # thread's state. Compare arms by the DELTA of
+                    # blocks_to_gpu / steps_loading over one restore.
+                    blocks_last_step=getattr(self, "_blocks_last_step", 0),
+                    blocks_per_loading_step=(
+                        round(self.stats.get("blocks_to_gpu", 0) / _sl, 2)
+                        if _sl else None),
+                    poll_ms=_load_poll_ms(),
+                    poll_thread=bool(_pt is not None and _pt.is_alive()),
                     reads_open=len(self._reading),
                     # *** THE LOAD'S POOL WAS UNOBSERVABLE. *** The store's
                     # snapshot has carried `staging` all along and the load's

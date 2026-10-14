@@ -11,7 +11,7 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   restarts, deploys and measurements in its `CLAUDE.md`), and the recipe is the
   DSpark repo. This file is meant to stand alone, but **DSpark's `CLAUDE.md`
   governs the engine** and wins any disagreement about restarting it.
-- Releases are tags (`v0.1.0` … `v0.4.3`), each
+- Releases are tags (`v0.1.0` … `v0.4.4`), each
   naming the vLLM build it is proven on (`pyproject.toml` states the window).
 - **It is the only copy.** The DSpark recipe repo
   (`~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark`) no
@@ -128,6 +128,11 @@ the current stream before each load copy.
   a fault, `wait_compute` on every load line), the copy probe and the
   supervisor's copies to `~/kvdiag/supervisor/<ts>/` stay; they are how the
   next fault gets read.
+- **Any code that submits a load off the step thread must arm on the step's
+  compute stream.** The load poll thread (`load_poll_ms`, v0.4.4, off by
+  default) does: the step captures its current stream and the poll waits on
+  that, because the poll thread's own current stream orders nothing. A test
+  (phase1b C8) breaks if it arms on its own.
 - **Every change to the load path is gated on the reproducer:** `kvrace.py
   run --arm on --loads 1000` must stay clean, and a 700K restore must stay
   about 10 s idle. It is an actuator; the vllm-proxy session runs it, with the

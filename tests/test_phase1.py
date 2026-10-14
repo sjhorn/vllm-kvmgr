@@ -297,6 +297,8 @@ PROBE = {
     "load_read_ahead": (0, 2),
     # default ON, so inverted like disk_skip_present_before_copy
     "load_wait_compute": (0, 1),
+    # v0.4.4: the load poll thread, off by default
+    "load_poll_ms": (0, 5),
     "load_ops_max": (0, 512),
     # the STORE's per-round budget, added 2026-10-11 after the store path was
     # measured to stall the stream by ~1.1s with no cap at all

@@ -514,6 +514,15 @@ DEFAULTS: dict[str, Any] = {
     # run --arm off). MUST STAY 1 ON A SERVING ENGINE. Hot only so that
     # reproducer can run; diskio warns while it is 0.
     "load_wait_compute": 1,
+    # ms between the load POLL thread's checks; 0 = no thread (v0.4.3 and
+    # before). A finished staging->GPU copy is otherwise noticed only in the
+    # step's get_finished, so under heavy prefill a restore moves at most
+    # load_inflight_max rounds per step. With this > 0 a thread notices the
+    # copy within this many ms and submits the next round at once. That round
+    # still waits on the compute stream captured at the last step (see
+    # diskio.DiskLoadHandler._poll_once), so the Xid 32 fix holds. Hot.
+    # Unmeasured: the arm is ask4 item 3, gated on DSpark kvrace.py --arm on.
+    "load_poll_ms": 0,
     # Max COPY-OP DESCRIPTORS in one staging->GPU submit. This is the quantity
     # upstream's single `cuMemcpyBatchAsync` actually contains --
     # `num_copy_ops += group_size * len(group_data_refs)` -- so a cap in BLOCKS
