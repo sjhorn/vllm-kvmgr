@@ -1,0 +1,145 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="480" viewBox="0 0 1280 480" role="img" aria-labelledby="t d">
+<title id="t">vllm-kvmgr</title>
+<desc id="d">KV cache blocks move from the GPU through pinned staging memory to NVMe drives on each node, and back again after a restart.</desc>
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#0a0f1f"/><stop offset="0.55" stop-color="#121a36"/><stop offset="1" stop-color="#1b1640"/>
+  </linearGradient>
+  <radialGradient id="glowA" cx="0.22" cy="0.72" r="0.45">
+    <stop offset="0" stop-color="#36d1c4" stop-opacity="0.22"/><stop offset="1" stop-color="#36d1c4" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="glowB" cx="0.82" cy="0.7" r="0.4">
+    <stop offset="0" stop-color="#f5b942" stop-opacity="0.18"/><stop offset="1" stop-color="#f5b942" stop-opacity="0"/>
+  </radialGradient>
+  <linearGradient id="save" x1="0" x2="1"><stop offset="0" stop-color="#36d1c4"/><stop offset="1" stop-color="#7c8cff"/></linearGradient>
+  <linearGradient id="restore" x1="1" x2="0"><stop offset="0" stop-color="#f5b942"/><stop offset="1" stop-color="#ff7a59"/></linearGradient>
+  <linearGradient id="card" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1c2650"/><stop offset="1" stop-color="#141c3c"/></linearGradient>
+  <linearGradient id="pcb" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#173b36"/><stop offset="1" stop-color="#11302c"/></linearGradient>
+  <filter id="soft" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="6"/></filter>
+  <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse"><circle cx="1.5" cy="1.5" r="1.2" fill="#ffffff" opacity="0.05"/></pattern>
+  <marker id="headS" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#7c8cff"/></marker>
+  <marker id="headR" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#ff7a59"/></marker>
+</defs>
+<rect width="1280" height="480" rx="22" fill="url(#bg)"/>
+<rect width="1280" height="480" rx="22" fill="url(#dots)"/>
+<rect width="1280" height="480" rx="22" fill="url(#glowA)"/>
+<rect width="1280" height="480" rx="22" fill="url(#glowB)"/>
+<text x="64" y="92" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="54" font-weight="800" fill="#ffffff" letter-spacing="-1">vllm-kvmgr</text>
+<text x="66" y="130" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" fill="#a9b6d8">A KV cache manager and a disk prefix cache for vLLM.</text>
+<text x="66" y="156" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" fill="#a9b6d8">Long prompts come back after a restart, without the prefill.</text>
+<rect x="64" y="196" width="392" height="250" rx="16" fill="url(#card)" stroke="#36d1c4" stroke-opacity="0.45"/>
+<text x="84" y="228" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#e6ecff" letter-spacing="1.5">GPU · KV CACHE</text>
+<rect x="86" y="248" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="119" y="248" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="152" y="248" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="185" y="248" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="218" y="248" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="251" y="248" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="284" y="248" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="317" y="248" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="350" y="248" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="383" y="248" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="416" y="248" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="86" y="281" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="119" y="281" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="152" y="281" width="26" height="26" rx="5" fill="#f5b942" opacity="0.95"/>
+<rect x="185" y="281" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="218" y="281" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="251" y="281" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="284" y="281" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="317" y="281" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="350" y="281" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="383" y="281" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="416" y="281" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="86" y="314" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="119" y="314" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="152" y="314" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="185" y="314" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="218" y="314" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="251" y="314" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="284" y="314" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="317" y="314" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="350" y="314" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="383" y="314" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="416" y="314" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="86" y="347" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="119" y="347" width="26" height="26" rx="5" fill="#2a3768" opacity="1.0"/>
+<rect x="152" y="347" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="185" y="347" width="26" height="26" rx="5" fill="#2a3768" opacity="1.0"/>
+<rect x="218" y="347" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="251" y="347" width="26" height="26" rx="5" fill="#2a3768" opacity="1.0"/>
+<rect x="284" y="347" width="26" height="26" rx="5" fill="#2a3768" opacity="1.0"/>
+<rect x="317" y="347" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="350" y="347" width="26" height="26" rx="5" fill="#2a3768" opacity="1.0"/>
+<rect x="383" y="347" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="416" y="347" width="26" height="26" rx="5" fill="#2a3768" opacity="1.0"/>
+<rect x="86" y="380" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="119" y="380" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="152" y="380" width="26" height="26" rx="5" fill="#2a3768" opacity="1.0"/>
+<rect x="185" y="380" width="26" height="26" rx="5" fill="#2a3768" opacity="1.0"/>
+<rect x="218" y="380" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="251" y="380" width="26" height="26" rx="5" fill="#36d1c4" opacity="0.85"/>
+<rect x="284" y="380" width="26" height="26" rx="5" fill="#2a3768" opacity="1.0"/>
+<rect x="317" y="380" width="26" height="26" rx="5" fill="#2a3768" opacity="1.0"/>
+<rect x="350" y="380" width="26" height="26" rx="5" fill="#2a3768" opacity="1.0"/>
+<rect x="383" y="380" width="26" height="26" rx="5" fill="#2a3768" opacity="1.0"/>
+<rect x="416" y="380" width="26" height="26" rx="5" fill="#2a3768" opacity="1.0"/>
+<rect x="86" y="416" width="12" height="12" rx="3" fill="#f5b942"/>
+<text x="104" y="427" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#a9b6d8">protected</text>
+<rect x="196" y="416" width="12" height="12" rx="3" fill="#36d1c4"/>
+<text x="214" y="427" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#a9b6d8">cached</text>
+<rect x="294" y="416" width="12" height="12" rx="3" fill="#2a3768"/>
+<text x="312" y="427" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#a9b6d8">free</text>
+<text x="652" y="338" text-anchor="middle" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="700" fill="#c9d3f5" letter-spacing="1.5">PINNED STAGING</text>
+<rect x="552" y="268" width="20" height="44" rx="4" fill="#26315e" opacity="0.9"/>
+<rect x="577" y="268" width="20" height="44" rx="4" fill="#7c8cff" opacity="0.9"/>
+<rect x="602" y="268" width="20" height="44" rx="4" fill="#7c8cff" opacity="0.9"/>
+<rect x="627" y="268" width="20" height="44" rx="4" fill="#26315e" opacity="0.9"/>
+<rect x="652" y="268" width="20" height="44" rx="4" fill="#26315e" opacity="0.9"/>
+<rect x="677" y="268" width="20" height="44" rx="4" fill="#7c8cff" opacity="0.9"/>
+<rect x="702" y="268" width="20" height="44" rx="4" fill="#ff7a59" opacity="0.9"/>
+<rect x="727" y="268" width="20" height="44" rx="4" fill="#26315e" opacity="0.9"/>
+<path d="M466,264 C 520,198 780,198 838,264" fill="none" stroke="url(#save)" stroke-width="4" stroke-linecap="round" marker-end="url(#headS)"/>
+<path d="M838,324 C 780,394 520,394 466,324" fill="none" stroke="url(#restore)" stroke-width="4" stroke-linecap="round" marker-end="url(#headR)"/>
+<text x="652" y="404" text-anchor="middle" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#ffb27a">restore after restart</text>
+<text x="652" y="210" text-anchor="middle" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#9aa8ff">save to disk</text>
+<text x="852" y="228" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#e6ecff" letter-spacing="1.5">/kvoffload · NVMe</text>
+<rect x="852" y="260" width="300" height="58" rx="8" fill="url(#pcb)" stroke="#36d1c4" stroke-opacity="0.35"/>
+<rect x="870" y="271" width="58" height="36" rx="4" fill="#0d1a19" stroke="#2c5a54"/>
+<rect x="878" y="279" width="42" height="4" rx="2" fill="#36d1c4" opacity="0.5"/>
+<rect x="942" y="271" width="58" height="36" rx="4" fill="#0d1a19" stroke="#2c5a54"/>
+<rect x="950" y="279" width="42" height="4" rx="2" fill="#36d1c4" opacity="0.5"/>
+<rect x="1014" y="271" width="58" height="36" rx="4" fill="#0d1a19" stroke="#2c5a54"/>
+<rect x="1022" y="279" width="42" height="4" rx="2" fill="#36d1c4" opacity="0.5"/>
+<rect x="1090" y="274" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1096" y="274" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1102" y="274" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1108" y="274" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1114" y="274" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1120" y="274" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1126" y="274" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1132" y="274" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1138" y="274" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<text x="1164" y="295" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" fill="#a9b6d8">rank 0</text>
+<rect x="852" y="346" width="300" height="58" rx="8" fill="url(#pcb)" stroke="#36d1c4" stroke-opacity="0.35"/>
+<rect x="870" y="357" width="58" height="36" rx="4" fill="#0d1a19" stroke="#2c5a54"/>
+<rect x="878" y="365" width="42" height="4" rx="2" fill="#36d1c4" opacity="0.5"/>
+<rect x="942" y="357" width="58" height="36" rx="4" fill="#0d1a19" stroke="#2c5a54"/>
+<rect x="950" y="365" width="42" height="4" rx="2" fill="#36d1c4" opacity="0.5"/>
+<rect x="1014" y="357" width="58" height="36" rx="4" fill="#0d1a19" stroke="#2c5a54"/>
+<rect x="1022" y="365" width="42" height="4" rx="2" fill="#36d1c4" opacity="0.5"/>
+<rect x="1090" y="360" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1096" y="360" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1102" y="360" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1108" y="360" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1114" y="360" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1120" y="360" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1126" y="360" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1132" y="360" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<rect x="1138" y="360" width="3" height="30" fill="#e3b04b" opacity="0.85"/>
+<text x="1164" y="381" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" fill="#a9b6d8">rank 1</text>
+<circle cx="1196" cy="92" r="34" fill="#f5b942" opacity="0.15"/>
+<path d="M1180,98 A18,18 0 1 0 1184,80" fill="none" stroke="#f5b942" stroke-width="4" stroke-linecap="round"/>
+<path d="M1176,72 L1185,79 L1175,85" fill="none" stroke="#f5b942" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="1196" y="148" text-anchor="middle" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#f5d08a">survives restarts</text>
+</svg>

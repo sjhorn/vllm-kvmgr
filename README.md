@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="docs/assets/kvmgr-banner.svg" width="100%"
+       alt="vllm-kvmgr: KV cache blocks are saved from the GPU through pinned staging memory to NVMe on each node, and restored after a restart">
+</p>
+
 # vllm-kvmgr
 
 A vLLM plugin that does two jobs:
