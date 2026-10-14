@@ -27,6 +27,13 @@ with the process. So, below the summary machinery:
     blocks with an in-flight one and either is a load. It never refuses or
     alters a transfer; it tests the leading hypothesis (a load writing a block
     another transfer is using) on live traffic, before the next Xid.
+
+*** v0.4.0: BURST DEPTH ON EVERY SUBMIT. *** The 10:12:17 Xid 32 showed 0
+overlaps and three loads open, submitted within 3 ms, with load_inflight_max=1:
+the bound had never applied to the GPU stage. Each submit line now carries
+`gpu_loads`/`gpu_stores` (already on the GPU) and `ops` (copy descriptors), the
+high-water marks `max_gpu_loads`/`max_gpu_stores` reach /kv/workers, and a load
+submitted at or over the bound logs `LOAD BURST` once.
 """
 
 from __future__ import annotations
@@ -242,8 +249,12 @@ _LOCK = threading.Lock()
 # INNER id with its kind because each direction's SingleDirectionOffloadingHandler
 # numbers its own transfers from 0, so a bare id collides across directions.
 _INFLIGHT: dict = {}
+# max_gpu_*: the most transfers of that kind on the GPU at once, INCLUDING the
+# one being submitted, so an engine whose load bound holds reads 1.
+# burst_canary: loads submitted while `load_inflight_max` were already on it.
 _STATS = {"overlaps": 0, "overlap_same_group": 0, "overlap_last": None,
-          "wal_lines": 0, "wal_errors": 0, "wal_rotations": 0}
+          "wal_lines": 0, "wal_errors": 0, "wal_rotations": 0,
+          "max_gpu_loads": 0, "max_gpu_stores": 0, "burst_canary": 0}
 _WAL = {"fd": None, "path": None, "bytes": 0, "why": "nothing submitted yet"}
 
 
@@ -330,6 +341,30 @@ def overlaps(kind: str, bids, inflight: dict) -> list:
     return out
 
 
+def submit_ops(h, group, nblocks):
+    """Copy-op descriptors in one submit: blocks x refs for the group. Pure.
+
+    The quantity upstream's single `cuMemcpyBatchAsync` contains. None when the
+    refs cannot be read -- an absence, never a guess -- and never raises."""
+    try:
+        refs = h._refs[int(group)]
+        if not isinstance(refs, (list, tuple)):
+            return None
+        return int(nblocks) * len(refs)
+    except Exception:
+        return None
+
+
+def _load_bound():
+    """The effective load_inflight_max, or None. Diag may import core; core
+    must never import diag -- so this import is lazy and one-way."""
+    try:
+        from kvmgr import diskio
+        return diskio._load_inflight_max()
+    except Exception:
+        return None
+
+
 def _wal_write(h, line: str) -> None:
     """Append under _LOCK. Never raises; a failure is counted and said once."""
     try:
@@ -388,7 +423,27 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
         job = int(job) if job is not None else None
         group = int(group)
         now = time.time()
+        # *** BURST DEPTH AND COPY SIZE, ON THE LINE ITSELF. *** The 10:12:17
+        # Xid had three loads open, two at 2,046 descriptors, and both facts had
+        # to be reconstructed from timestamps and refs. ops is computed from the
+        # SUBMITTED block list, before any de-duplication.
+        ops = submit_ops(h, group, len(bids or ()))
+        bound = _load_bound() if kind == "load" else None
+        canary = False
         with _LOCK:
+            gpu_loads = sum(1 for k, _ in _INFLIGHT if k == "load")
+            gpu_stores = sum(1 for k, _ in _INFLIGHT if k == "store")
+            # .get: a hot reload preserves the OLD _STATS (diag/reload.py),
+            # which lacks these keys, and a KeyError here would lose the line.
+            if kind == "load":
+                _STATS["max_gpu_loads"] = max(_STATS.get("max_gpu_loads") or 0,
+                                              gpu_loads + 1)
+                if bound is not None and gpu_loads >= bound:
+                    _STATS["burst_canary"] = (_STATS.get("burst_canary") or 0) + 1
+                    canary = _STATS["burst_canary"] == 1
+            elif kind == "store":
+                _STATS["max_gpu_stores"] = max(_STATS.get("max_gpu_stores") or 0,
+                                               gpu_stores + 1)
             hits = overlaps(kind, bset, _INFLIGHT)
             _INFLIGHT[(kind, int(inner))] = {"bids": bset, "group": group,
                                             "job": job, "ts": now}
@@ -397,6 +452,7 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
                 n=len(bset), bid_min=min(bset) if bset else None,
                 bid_max=max(bset) if bset else None, bids=ranges(bset),
                 slots=ranges(slots or ()),
+                gpu_loads=gpu_loads, gpu_stores=gpu_stores, ops=ops,
                 overlap=[[k2, i2] for k2, i2, *_ in hits] or None))
             for k2, i2, j2, g2, common in hits:
                 _STATS["overlaps"] += 1
@@ -406,6 +462,13 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
                     "ts": now, "new": [kind, int(inner), group],
                     "old": [k2, int(i2), g2],
                     "blocks": len(common)}
+        if canary:
+            logger.warning(
+                "kvmgr: LOAD BURST -- load inner=%s job=%s submitted with %d "
+                "load(s) already on the GPU, at or over load_inflight_max=%s. "
+                "The GPU-stage bound is not holding. Said once per process; "
+                "counted as burst_canary in /kv/workers.", inner, job,
+                gpu_loads, bound)
         for k2, i2, j2, g2, common in hits:
             logger.warning(
                 "kvmgr: LEDGER OVERLAP %s<->%s blocks=%s -- new %s inner=%s "
@@ -438,7 +501,10 @@ def wal_snapshot() -> dict:
                 "overlap_last": _STATS["overlap_last"],
                 "wal_lines": int(_STATS["wal_lines"]),
                 "wal_errors": int(_STATS["wal_errors"]),
-                "wal_rotations": int(_STATS["wal_rotations"])}
+                "wal_rotations": int(_STATS["wal_rotations"]),
+                "max_gpu_loads": int(_STATS.get("max_gpu_loads") or 0),
+                "max_gpu_stores": int(_STATS.get("max_gpu_stores") or 0),
+                "burst_canary": int(_STATS.get("burst_canary") or 0)}
 
 
 def install() -> None:

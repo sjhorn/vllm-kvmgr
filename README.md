@@ -45,10 +45,10 @@ A conversational prefix comes back at 98.7% after the GPU cache is dropped.
 
 Into a vLLM image:
 
-    pip install --no-deps vllm_kvmgr-0.3.0-py3-none-any.whl
+    pip install --no-deps vllm_kvmgr-0.4.0-py3-none-any.whl
 
 The DSpark recipe instead bind-mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.3.0.dist-info` into site-packages. The dist-info is
+`deploy/vllm_kvmgr-0.4.0.dist-info` into site-packages. The dist-info is
 **generated** (`python3 deploy/gen-dist-info.py`; `--check` fails when it is
 stale) because the entry point vLLM looks for lives in it.
 
@@ -67,7 +67,7 @@ Knobs are read from a JSON flags file, `VLLM_KV_FLAGS_FILE` (default
 precedence is: **in-memory override** (set over HTTP), then `VLLM_<NAME>` env,
 then the file, then the default.
 
-**The authoritative list is `DEFAULTS` in `src/kvmgr/flags.py`** (50 knobs),
+**The authoritative list is `DEFAULTS` in `src/kvmgr/flags.py`** (52 knobs),
 and `GET /kv` publishes every one with its effective value and **the source
 that won**. A hand-written table here once listed 6 of 24, so there is none.
 The defaults are inert by design: an empty file behaves exactly as upstream.
@@ -76,7 +76,11 @@ them:
 
 - **`load_ops_max=2048`, `load_inflight_max=1`.** Four restores in flight
   killed the engine with a GPU fault (Xid 32) while the batch size was pinned
-  at 2048. One costs nothing: 1 and 2 restore 700K in the same 12s.
+  at 2048, and 1 and 2 restored 700K in the same 12s. **Both were measured
+  before v0.4.0, when the knob did not bound the GPU stage**: finished reads
+  went to the GPU unchecked, up to 7 at once. Since v0.4.0 it bounds
+  staging->GPU copies, and `load_read_ahead` (default 1, hot) bounds how many
+  rounds may read from disk beyond it, so the disk overlaps the copy.
 - **`stall_fail_after_s=240`.** A store job that cannot complete fails with
   our line naming it, before NCCL's 600s watchdog aborts the worker in C++
   with no Python traceback.

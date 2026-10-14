@@ -17,6 +17,8 @@ set. The claims, each asserted:
   5. diag_ledger_file off means NO file (and says so); the registry still runs.
   6. diskio calls submit BEFORE transfer_async on both paths, and done on every
      observed completion and every failed submit.
+  7. (v0.4.0) burst depth and copy size on every submit line, the high-water
+     marks, and the LOAD BURST canary.
 """
 
 from __future__ import annotations
@@ -316,6 +318,103 @@ for cls, meth, kind in (("DiskStoreHandler", "_collect", "store"),
     dn = body.find(f'self._ledger_done("{kind}", res.job_id, res.success)', pop)
     check(f"*** {cls}: every observed completion appends done ***",
           0 <= pop < dn, (pop, dn))
+
+# ---------------------------------------------------------------------------
+print("\n== (7) v0.4.0: burst depth, copy size, high-water marks, canary ==")
+# The 10:12:17 Xid had three loads open, submitted within 3 ms, two of them at
+# 2,046 descriptors -- and both facts had to be rebuilt by hand from timestamps
+# and refs. They go on the line now.
+tmp = fresh()
+F.write(diag_ledger_file=1, load_inflight_max=1)
+flags.reset_for_tests()
+
+
+def rhandler(refs, rank=0):
+    h = handler(rank)
+    h._refs = refs
+    return h
+
+
+hr = rhandler([[0] * 62, [0] * 2])
+cap = Cap()
+_real_logger, L.logger = L.logger, cap
+try:
+    L.submit(hr, "store", 0, 1, 0, [1, 2], [0, 1])
+    L.submit(hr, "load", 0, 2, 0, list(range(100, 133)), list(range(33)))
+    L.submit(hr, "load", 1, 3, 1, [200], [40])
+    L.submit(hr, "load", 2, 4, 1, [201], [41])
+finally:
+    L.logger = _real_logger
+p = os.path.join(tmp, "ledger-r0.jsonl")
+recs = [json.loads(x) for x in lines(p)]
+eq("*** each submit line carries gpu_loads / gpu_stores ALREADY in flight ***",
+   [(r.get("gpu_loads"), r.get("gpu_stores")) for r in recs],
+   [(0, 0), (0, 1), (1, 1), (2, 1)])
+eq("*** and ops = blocks x refs for the group: 33 x 62 = 2,046 ***",
+   [r.get("ops") for r in recs], [124, 2046, 2, 2])
+eq("high-water marks INCLUDE the new transfer",
+   (L._STATS["max_gpu_loads"], L._STATS["max_gpu_stores"]), (3, 1))
+snap = L.wal_snapshot()
+eq("...and reach /kv/workers as ints",
+   (snap.get("max_gpu_loads"), snap.get("max_gpu_stores")), (3, 1))
+check("...builtin ints", type(snap.get("max_gpu_loads")) is int)
+eq("*** the canary counts every load submitted at or over the bound ***",
+   L._STATS["burst_canary"], 2)
+eq("...but logs ONCE per process",
+   sum("LOAD BURST" in x for x in cap.lines), 1)
+check("...naming the bound", any("load_inflight_max=1" in x for x in cap.lines),
+      cap.lines)
+
+# a correctly bounded engine: one load at a time reads 1 and never fires
+tmp = fresh()
+eq("fresh() resets the high-water marks and the canary",
+   (L._STATS["max_gpu_loads"], L._STATS["max_gpu_stores"],
+    L._STATS["burst_canary"]), (0, 0, 0))
+cap = Cap()
+_real_logger, L.logger = L.logger, cap
+try:
+    for i in range(5):
+        L.submit(hr, "load", i, i, 0, [i], [i])
+        L.done(hr, "load", i, True)
+finally:
+    L.logger = _real_logger
+eq("*** serial loads read max_gpu_loads == 1 -- the deploy check ***",
+   L._STATS["max_gpu_loads"], 1)
+eq("...and the canary stays silent", (L._STATS["burst_canary"],
+   sum("LOAD BURST" in x for x in cap.lines)), (0, 0))
+
+# hostile refs: ops is an ABSENCE, and the line is still written
+for label, refs in (("None", None), ("short", [[0]]), ("non-list", [7, 7])):
+    tmp = fresh()
+    L.submit(rhandler(refs), "load", 0, 1, 1, [5, 6], [0, 1])
+    rec = first(os.path.join(tmp, "ledger-r0.jsonl"))
+    eq(f"refs {label}: ops is None, never a guess", rec.get("ops", "MISSING"),
+       None)
+    eq(f"...and the line is still written", rec.get("ev"), "submit")
+eq("submit_ops on a handler with no _refs at all", L.submit_ops(handler(), 0, 3),
+   None)
+
+# numpy-scalar bids and group (the stand-in from section 1)
+tmp = fresh()
+L.submit(hr, "load", NpInt(7), NpInt(9), NpInt(0), [NpInt(5), NpInt(6)],
+         [NpInt(0), NpInt(1)])
+rec = first(os.path.join(tmp, "ledger-r0.jsonl"))
+eq("*** numpy-like bids and group: ops computed, line written ***",
+   (rec.get("ev"), rec.get("ops"), rec.get("gpu_loads")), ("submit", 124, 0))
+
+# a hot reload preserves the v0.3.0 _STATS dict, which has none of the new keys
+tmp = fresh()
+for k in ("max_gpu_loads", "max_gpu_stores", "burst_canary"):
+    L._STATS.pop(k, None)
+L.submit(hr, "load", 0, 1, 0, [5], [0])
+L.submit(hr, "load", 1, 2, 0, [6], [1])
+eq("*** a reload-preserved v0.3.0 _STATS still writes every submit line ***",
+   [json.loads(x).get("ev") for x in lines(os.path.join(tmp, "ledger-r0.jsonl"))],
+   ["submit", "submit"])
+eq("...and the marks start from it",
+   (L._STATS.get("max_gpu_loads"), L.wal_snapshot().get("burst_canary")), (2, 1))
+F.write(diag_ledger_file=1)
+flags.reset_for_tests()
 
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:

@@ -488,7 +488,21 @@ DEFAULTS: dict[str, Any] = {
     # pair without anyone touching concurrency at all. A safe value that exists
     # only as an override is not a safe default; it is a safe value you lose on
     # the next boot, silently, because a default is not a change.
+    #
+    # *** UNTIL v0.4.0 THIS DID NOT BOUND THE GPU STAGE. *** `_pump` checked it
+    # against GPU copies before starting a FILE READ, and `_collect` sent every
+    # finished read to the GPU unchecked -- so the 2026-10-10 arms above, "1 and
+    # 2 are indistinguishable" AND "4 killed the engine", were all measured with
+    # up to 7 loads on the GPU at once (the v0.3.0 ledger at the 2026-10-14
+    # 10:12:17 Xid showed 3 submitted within 3 ms, with this at 1). It now
+    # bounds staging->GPU copies outstanding, which is what its name says.
     "load_inflight_max": 1,
+    # Load rounds allowed to be READING from disk beyond load_inflight_max: one
+    # round reads while one copies, so the disk overlaps the copy. A finished
+    # read waits for the GPU bound, holding its staging slots, so staging use is
+    # at most (inflight + read_ahead) x the per-round cap. 0 = strictly serial
+    # (read, copy, read). Unmeasured: 0/1/2 against a 700K restore is the test.
+    "load_read_ahead": 1,
     # Max COPY-OP DESCRIPTORS in one staging->GPU submit. This is the quantity
     # upstream's single `cuMemcpyBatchAsync` actually contains --
     # `num_copy_ops += group_size * len(group_data_refs)` -- so a cap in BLOCKS

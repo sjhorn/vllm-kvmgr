@@ -415,6 +415,17 @@ def _load_inflight_max() -> int:
     more than one that kills the worker, and the whole point of the measurement
     this enables is that `1` makes the path fully serial and therefore a clean
     test of the hypothesis.
+
+    *** UNTIL v0.4.0 THIS BOUNDED THE WRONG STAGE. *** `_pump` compared it
+    against `_inner_to_job` before starting a FILE READ, and `_collect` then
+    handed every finished read to `transfer_async` with no check at all -- so
+    reads piled up in `_reading` and reached the GPU together. The v0.3.0
+    ledger at the 2026-10-14 10:12:17 Xid 32 showed three loads submitted
+    within 3 ms, and up to 7 had been on the GPU at once, with this knob at 1.
+    Every "inflight 1 is safe" and "inflight 4 faulted" measurement was taken
+    without the bound in force. It now bounds what it names: `_collect` holds a
+    finished read until the GPU stage has room, and `_pump` bounds the read
+    stage separately, by this plus `_load_read_ahead()`.
     """
     try:
         from kvmgr import flags as _f
@@ -428,6 +439,31 @@ def _load_inflight_max() -> int:
         return int(_f.DEFAULTS["load_inflight_max"]) or 1
     except Exception:
         return 1
+
+
+def _load_read_ahead() -> int:
+    """Load rounds that may be READING from disk beyond the GPU bound. Hot.
+
+    `_pump` starts a read only while reads + GPU copies are below
+    `_load_inflight_max() + this`, so staging use is bounded by
+    `(inflight + read_ahead) x cap`. 1 lets the next round read while the
+    current one copies, so the disk overlaps the copy. 0 is allowed and means
+    strictly serial: read, copy, read. A read that finishes early is HELD in
+    `_reading`, still owning its slots, until the GPU stage has room -- the read
+    ahead never widens the GPU stage, which `_load_inflight_max` alone bounds.
+    """
+    try:
+        from kvmgr import flags as _f
+    except Exception:
+        return 1
+    try:
+        v = int(_f.peek("load_read_ahead"))
+        if v >= 0:
+            return v
+    except Exception:
+        pass
+    # the DECLARED default, never a second copy (see _load_inflight_max)
+    return int(_f.DEFAULTS["load_read_ahead"])
 
 
 def _load_batch_max() -> int:
@@ -922,9 +958,11 @@ def _handler_progress():
                 if t0 is not None:
                     oldest = max(oldest, now - t0)
             st = getattr(h, "stats", {}) or {}
+            # rounds_done: a load round HELD behind the GPU bound while copies
+            # complete is progress, never a stall.
             fp.append((type(h).__name__, st.get("files"), st.get("bytes"),
                        st.get("submitted"), st.get("errors"),
-                       st.get("wait_rounds")))
+                       st.get("wait_rounds"), st.get("rounds_done")))
         except Exception:
             continue
     return outstanding, oldest, tuple(fp)
@@ -2076,7 +2114,7 @@ class DiskLoadHandler:
                       "bytes": 0, "errors": 0,
                       "wait_calls": 0, "wait_ours": 0, "wait_blocked_ms": 0,
                       "wait_max_pending": 0, "wait_rounds": 0,
-                      "saturations": 0}
+                      "saturations": 0, "rounds_done": 0}
         # REPORT THE FACT, NOT THE ASK. This said "(restore is live)"
         # unconditionally, from __init__, with no gate on the flag -- so a boot
         # whose flags file had disk_restore=False still announced a live
@@ -2185,15 +2223,27 @@ class DiskLoadHandler:
         for job_id, st in self._jobs.items():
             while st["batches"] and not st["failed"]:
                 # *** BOUND THE ROUNDS IN FLIGHT, not just each round's size.
-                # `_inner_to_job` holds every round whose staging->GPU copy is
-                # outstanding; upstream chains them on one stream with an event
-                # each and bounds nothing. The 700K test respected the 192
+                # Upstream chains every staging->GPU copy on one stream with an
+                # event each and bounds nothing. The 700K test respected the 192
                 # per-round cap and still died at 861 keys, so the count is the
                 # variable the cap cannot reach. Returning here is safe and is
                 # not a refusal: `_pump` is called again from `_collect` on
                 # every scheduler step, and `kv_connector_no_forward` means
                 # those steps keep coming even with nothing scheduled -- so the
                 # work resumes as soon as a round completes.
+                #
+                # *** THIS CHECK USED TO BOUND THE WRONG STAGE. *** It compared
+                # `_load_inflight_max()` against `_inner_to_job` alone, while
+                # this loop starts a FILE READ -- and `_collect` then sent every
+                # finished read to the GPU unchecked. So rounds piled up in
+                # `_reading` and landed on the GPU together: up to 7 at once
+                # with the knob at 1 (v0.3.0 ledger, 2026-10-14 10:12:17 Xid).
+                # The GPU stage is bounded in `_collect` now; this bounds the
+                # READ stage, so staging use is at most
+                # (inflight + read_ahead) x cap.
+                if (len(self._reading) + len(self._inner_to_job)
+                        >= _load_inflight_max() + _load_read_ahead()):
+                    return
                 g, bkeys, bids = st["batches"][0]
                 # No reserve: see the store's _pump. This pool is the LOAD's
                 # alone now, so a write floor inside it would starve the load to
@@ -2223,8 +2273,6 @@ class DiskLoadHandler:
                 _cap = min(_load_batch_max(),
                            load_ops_budget(self._refs, g, len(bids),
                                            _load_ops_max()))
-                if len(self._inner_to_job) >= _load_inflight_max():
-                    return
                 slots = self._pool.take_upto(min(len(bids), _cap))
                 if not slots:
                     # COUNT IT. `saturations` was declared here and never
@@ -2288,7 +2336,28 @@ class DiskLoadHandler:
         if not _LIVE_CONN_WORKER:
             capture_conn_worker_from_caller()
 
+        # *** COMPLETIONS FIRST, THEN STAGE 2. *** With the GPU stage bounded
+        # at 1, a round that finished this step would otherwise still hold the
+        # bound while stage 2 runs, and every round would lose a step.
+        for res in self._inner.get_finished():
+            ent = self._inner_to_job.pop(res.job_id, None)
+            if ent is None:
+                continue
+            self._ledger_done("load", res.job_id, res.success)
+            # .get: a reload never runs __init__ (see _ready_buf).
+            self.stats["rounds_done"] = self.stats.get("rounds_done", 0) + 1
+            job_id, slots = ent
+            self._pool.give(slots)
+            st = self._jobs.get(job_id)
+            if st is None:
+                continue
+            if not res.success:
+                ledger_dump(self, "load transfer reported FAILURE")
+                st["failed"] = True
+            st["pending"] -= 1
+
         ngroups = len(self._refs)
+        _lim = _load_inflight_max()
         still = []
         for job_id, fut, slots, bids, g in self._reading:
             if not fut.done():
@@ -2311,14 +2380,9 @@ class DiskLoadHandler:
                     st["failed"] = True
                     st["pending"] -= 1
                 continue
-            if st is not None:
-                st["bytes"] += nbytes
-            self.stats["bytes"] += nbytes
             # Stage 2: staging -> GPU.
             gs = [0] * ngroups
             gs[g] = len(bids)
-            inner = self._next_inner
-            self._next_inner += 1
             _gr, _sr = self._bounds()
             why = check_bounds(bids, slots, _gr, _sr, gs, "staging->GPU")
             if why is not None:
@@ -2334,6 +2398,22 @@ class DiskLoadHandler:
                     st["failed"] = True
                     st["pending"] -= 1
                 continue
+            # *** THE GPU BOUND. *** Until v0.4.0 every finished read went to
+            # transfer_async here unchecked, which is how up to 7 loads were on
+            # the GPU with load_inflight_max=1. A read that would exceed the
+            # bound is HELD, in its FIFO place and still owning its slots, and
+            # submitted on a later step. Failures above are not held: a bad
+            # file or index fails its job now.
+            if len(self._inner_to_job) >= _lim:
+                still.append((job_id, fut, slots, bids, g))
+                continue
+            # bytes counted at SUBMIT, so a held round re-read next step is
+            # counted once
+            if st is not None:
+                st["bytes"] += nbytes
+            self.stats["bytes"] += nbytes
+            inner = self._next_inner
+            self._next_inner += 1
             self._ledger_note("load", g, bids, slots)
             self._ledger_submit("load", inner, job_id, g, bids, slots)
             ok = self._inner.transfer_async(
@@ -2349,21 +2429,6 @@ class DiskLoadHandler:
                 continue
             self._inner_to_job[inner] = (job_id, slots)
         self._reading = still
-
-        for res in self._inner.get_finished():
-            ent = self._inner_to_job.pop(res.job_id, None)
-            if ent is None:
-                continue
-            self._ledger_done("load", res.job_id, res.success)
-            job_id, slots = ent
-            self._pool.give(slots)
-            st = self._jobs.get(job_id)
-            if st is None:
-                continue
-            if not res.success:
-                ledger_dump(self, "load transfer reported FAILURE")
-                st["failed"] = True
-            st["pending"] -= 1
 
         self._pump()
 
@@ -2475,6 +2540,10 @@ class DiskLoadHandler:
                     # and every arm printed "size=?".
                     inflight=len(self._inner_to_job),
                     inflight_max=_load_inflight_max(),
+                    # the read stage's own bound, and the finished reads held
+                    # behind the GPU bound -- non-zero means the bound binds
+                    read_ahead=_load_read_ahead(),
+                    reads_held=sum(1 for r in self._reading if r[1].done()),
                     # *** THE GEOMETRY THAT SETS THE REAL LIMIT, and it was
                     # invisible. *** One submit contains blocks x refs[group]
                     # descriptors, so without these the op budget cannot be

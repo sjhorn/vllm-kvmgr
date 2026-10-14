@@ -11,7 +11,7 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   restarts, deploys and measurements in its `CLAUDE.md`), and the recipe is the
   DSpark repo. This file is meant to stand alone, but **DSpark's `CLAUDE.md`
   governs the engine** and wins any disagreement about restarting it.
-- Releases are tags (`v0.1.0` … `v0.3.0`), each
+- Releases are tags (`v0.1.0` … `v0.4.0`), each
   naming the vLLM build it is proven on (`pyproject.toml` states the window).
 - **It is the only copy.** The DSpark recipe repo
   (`~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark`) no
@@ -84,7 +84,12 @@ KVMGR_DSPARK_REPO=~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-S
 - **`PYTHONHASHSEED=20261007`** in the deployment, the root of the block-hash
   chain. Changing it turns every file on disk into a silent miss.
 - **`load_ops_max=2048`, `load_inflight_max=1`** as code defaults. Inflight 4
-  caused GPU faults (Xid 32).
+  caused GPU faults (Xid 32). **But until v0.4.0 the knob did not bound the
+  GPU stage**: `_pump` checked it before a file read and `_collect` sent every
+  finished read to the GPU unchecked. So "inflight 1 is safe" and "inflight 4
+  faulted" were both measured without the bound, with up to 7 loads on the GPU
+  at once. v0.4.0 bounds staging->GPU copies by it, and the read stage by it
+  plus `load_read_ahead` (default 1, hot, not yet measured).
 
 ## The open question this repo is carrying (2026-10-14)
 
@@ -104,6 +109,14 @@ using. v0.3.0's write-ahead ledger exists to settle it:
   /kv/workers` (`:8888`). It was 0 after the first 700K restore. A non-zero
   count is the first evidence for the hypothesis. It is not proof, because an
   entry's span is submit-to-OBSERVED completion.
+- **The 2026-10-14 10:12:17 Xid 32 (head)** had 0 overlaps, which is evidence
+  AGAINST the hypothesis, and three load copies open, all submitted within
+  3 ms: two at the op cap (33 blocks × 62 refs = 2,046 descriptors) and one
+  small one, with `load_inflight_max=1`. That burst is what v0.4.0 fixes. Since
+  v0.4.0 each submit line carries `gpu_loads`, `gpu_stores` and `ops`,
+  `/kv/workers` carries `max_gpu_loads`/`max_gpu_stores` (the deploy check is
+  `max_gpu_loads == 1`), and a load submitted at or over the bound logs
+  `LOAD BURST` once.
 - The supervisor copies both nodes' ledger tails, logs and kernel logs to
   `~/kvdiag/supervisor/<ts>/` on the head before it restarts anything.
 

@@ -22,6 +22,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the PACKAGE root
 sys.path.insert(0, os.path.join(REPO, "src"))
 
+# *** THESE SUITES MUST NOT DEPEND ON THE HOST'S FREE DISK. *** With the default
+# disk_free_floor_gb=64, a host with less free space than that (a GitHub runner
+# has ~20 GB) puts the presence manager in the FROZEN band, which admits one key
+# per store round -- so the store tests here failed in CI and passed on a
+# workstation. The bands are tested in test_phase9_verify.py with explicit
+# values; here the floor is off. Env, because it beats the flags file these
+# suites rewrite as they go.
+os.environ["VLLM_DISK_FREE_FLOOR_GB"] = "0"
+
 import harness  # noqa: E402
 
 PASS = 0

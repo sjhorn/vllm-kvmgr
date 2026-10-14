@@ -19,6 +19,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the PACKAGE root
 sys.path.insert(0, os.path.join(REPO, "src"))
 
+# *** THESE SUITES MUST NOT DEPEND ON THE HOST'S FREE DISK. *** With the default
+# disk_free_floor_gb=64, a host with less free space than that (a GitHub runner
+# has ~20 GB) puts the presence manager in the FROZEN band, which admits one key
+# per store round -- so the store tests here failed in CI and passed on a
+# workstation. The bands are tested in test_phase9_verify.py with explicit
+# values; here the floor is off. Env, because it beats the flags file these
+# suites rewrite as they go.
+os.environ["VLLM_DISK_FREE_FLOOR_GB"] = "0"
+
 import harness  # noqa: E402
 
 PASS = 0
@@ -2487,8 +2496,13 @@ check("...and the default is SMALL -- a less parallel restore beats a dead "
 _csrc = open(os.path.join(REPO, "src", "kvmgr",
                           "diskio.py")).read()
 _cload = _csrc[_csrc.index("class DiskLoadHandler"):]
-check("*** the LOAD pump bounds rounds in flight before taking slots ***",
-      "if len(self._inner_to_job) >= _load_inflight_max():" in _cload)
+# v0.4.0: the pump bounds the READ stage (reads + copies against inflight +
+# read_ahead); the GPU stage is bounded in _collect, and section (b17) drives it.
+_PUMP_BOUND = ("if (len(self._reading) + len(self._inner_to_job)\n"
+               "                        >= _load_inflight_max() + _load_read_ahead()):")
+check("*** the LOAD pump bounds reads + copies in flight before taking slots ***",
+      _PUMP_BOUND in _cload
+      and _cload.index(_PUMP_BOUND) < _cload.index("self._pool.take_upto("))
 check("...and the STORE pump does NOT -- its direction never faulted this way, "
       "and a shared bound would be a coincidence not a reason",
       "_load_inflight_max()" not in _csrc[_csrc.index("class DiskStoreHandler"):
@@ -2523,8 +2537,7 @@ flags.reset_for_tests()
 # kv_connector_no_forward means those steps keep coming with nothing scheduled.
 check("*** hitting the bound RETURNS rather than failing the job -- the work "
       "resumes on the next step ***",
-      "if len(self._inner_to_job) >= _load_inflight_max():\n                    return"
-      in _cload)
+      _PUMP_BOUND + "\n                    return" in _cload)
 
 
 
@@ -2579,7 +2592,7 @@ check("...and refs_per_group is EXPOSED, or the op arithmetic checks against "
       "refs_per_group=[len(r) for r in (self._refs or [])]," in _oload)
 check("...with the live cap beside it", "ops_max=_load_ops_max()," in _oload)
 check("the inflight bound is applied ONCE, not duplicated by the edit",
-      _oload.count("if len(self._inner_to_job) >= _load_inflight_max():") == 1)
+      _oload.count(_PUMP_BOUND) == 1)
 
 
 # ---------------------------------------------------------------------------
@@ -2769,6 +2782,274 @@ for _i, _v in enumerate(_rng):
 # bid_min/bid_max pair and the snapshot pair -- four assertions, not one, which
 # is the point. A single type check would have passed on the slots while the
 # bids stayed poisoned.
+
+# ===========================================================================
+print("\n== (b17) v0.4.0: load_inflight_max bounds the GPU STAGE ==")
+# ===========================================================================
+# The v0.3.0 ledger at the 2026-10-14 10:12:17 Xid 32 showed three loads
+# submitted within 3 ms with load_inflight_max=1, and up to 7 had been on the
+# GPU at once. `_pump` checked the knob before a FILE READ, and `_collect` sent
+# every finished read to transfer_async unchecked -- so finished reads piled up
+# and reached the GPU together. These drive the real _pump/_collect against a
+# reader whose futures finish only when the test says so.
+from kvmgr.diskio import DiskLoadHandler  # noqa: E402
+
+os.environ["KVMGR_LEDGER_DIR"] = tempfile.mkdtemp(prefix="kv1b-led-")
+
+
+class ManualReaders:
+    """A ThreadPoolExecutor stand-in whose futures finish on command."""
+
+    class _F:
+        def __init__(self, fn):
+            self._fn, self._done, self._v, self._e = fn, False, None, None
+
+        def done(self):
+            return self._done
+
+        def result(self):
+            if self._e:
+                raise self._e
+            return self._v
+
+        def finish(self, fail=False):
+            if fail:
+                self._e = OSError("short read: /kvoffload/x/abc_g0.bin")
+            else:
+                self._v = self._fn()
+            self._done = True
+
+    def __init__(self):
+        self.futs = []
+
+    def submit(self, fn, *a):
+        f = ManualReaders._F(lambda: fn(*a))
+        self.futs.append(f)
+        return f
+
+    def shutdown(self, wait=True):
+        pass
+
+
+class _CapLogKw(_CapLog):
+    """_CapLog that also takes logging's keyword arguments (exc_info=...)."""
+
+    def _rec(self, fmt, *a, **_kw):
+        _CapLog._rec(self, fmt, *a)
+
+    info = warning = error = exception = critical = _rec
+
+
+class FakeLoadInner(FakeInner):
+    """FakeInner for the LOAD direction, whose spec is (CPU, GPU)."""
+
+    def transfer_async(self, job_id, spec):
+        cpu, gpu = spec
+        return FakeInner.transfer_async(self, job_id, (gpu, cpu))
+
+
+def mkloadhandler(pool_size, nrefs=REFS):
+    """A DiskLoadHandler shell, as mkhandler() builds the store's."""
+    h = DiskLoadHandler.__new__(DiskLoadHandler)
+    h._spec = type("S", (), {"disk_medium": "DSPARK_DISK"})()
+    h._mapper = None
+    h._refs = nrefs
+    h._inner = FakeLoadInner()
+    h._pool = diskio.SlotPool(pool_size)
+    h._readers = ManualReaders()
+    h._jobs, h._reading, h._inner_to_job = {}, [], {}
+    h._next_inner = 1_000_000
+    h._ready = []
+    # mirrored from DiskLoadHandler.__init__
+    h.stats = {"submitted": 0, "refused_pairing": 0, "files": 0,
+               "refused_bounds": 0, "bytes": 0, "errors": 0,
+               "wait_calls": 0, "wait_ours": 0, "wait_blocked_ms": 0,
+               "wait_max_pending": 0, "wait_rounds": 0,
+               "saturations": 0, "rounds_done": 0}
+    h._read_batch = lambda bkeys, slots, g: 100 * len(bkeys)
+    h._bounds_cache = (22756, pool_size)
+    return h
+
+
+def load_job(h, job_id, n, start, salt):
+    ks = gkeys(0, n, salt=salt)
+    gpu = base.GPULoadStoreSpec(list(range(start, start + n)),
+                                group_sizes=[n, 0, 0, 0, 0],
+                                block_indices=[0] * 5)
+    return h.transfer_async(job_id, (diskspec.DiskLoadStoreSpec(ks), gpu))
+
+
+def step(h):
+    """One scheduler step: the connector polls get_finished."""
+    return {r.job_id: r.success for r in h.get_finished()}
+
+
+def gpu_bids(h):
+    return [s[1] for s in h._inner.subs]   # (job, gpu bids, sizes, slots)
+
+
+# ---- C1: the burst --------------------------------------------------------
+F.write(load_inflight_max=1, load_read_ahead=2, load_batch_max=4,
+        load_ops_max=0)
+flags.reset_for_tests()
+_LED._INFLIGHT.clear()
+_LED._STATS["max_gpu_loads"] = 0
+_LED._STATS["burst_canary"] = 0
+hb = mkloadhandler(16)
+check("a 12-block load (3 rounds of 4) is accepted", load_job(hb, 7, 12, 500, 31))
+eq("*** the pump starts inflight + read_ahead = 3 reads ***",
+   len(hb._reading), 3)
+eq("...and none reaches the GPU before its read finishes", len(hb._inner.subs), 0)
+for f in hb._readers.futs:
+    f.finish()
+per_step, done_at = [], None
+for i in range(6):
+    _n0 = len(hb._inner.subs)
+    out = step(hb)
+    per_step.append(len(hb._inner.subs) - _n0)
+    if 7 in out:
+        done_at, ok7 = i, out[7]
+        break
+eq("*** three reads finished together reach the GPU ONE PER STEP, not as a "
+   "burst of three ***", per_step, [1, 1, 1, 0])
+eq("...so the job completes on the 4th step", done_at, 3)
+check("...successfully", done_at is not None and ok7 is True)
+eq("...in the order they were read (FIFO)", [b[0] for b in gpu_bids(hb)],
+   [500, 504, 508])
+eq("...with inner ids allocated only at submit -- none burned on held rounds",
+   [s[0] for s in hb._inner.subs], [1_000_000, 1_000_001, 1_000_002])
+eq("...and the staging pool is fully returned", len(hb._pool._free), 16)
+eq("...and every completion counted in rounds_done", hb.stats["rounds_done"], 3)
+eq("...and bytes counted ONCE per round, though held rounds were revisited",
+   hb.stats["bytes"], 1200)
+eq("*** the ledger's high-water mark reads 1 load on the GPU ***",
+   _LED._STATS["max_gpu_loads"], 1)
+eq("...and the burst canary never fired", _LED._STATS["burst_canary"], 0)
+
+# ---- C2: the pump bounds the READ stage -----------------------------------
+for _ra, _inf, _want in ((0, 1, 1), (1, 1, 2), (1, 2, 3)):
+    F.write(load_inflight_max=_inf, load_read_ahead=_ra, load_batch_max=4,
+            load_ops_max=0)
+    flags.reset_for_tests()
+    hp = mkloadhandler(64)
+    load_job(hp, 1, 40, 0, 32 + _ra + _inf)
+    eq(f"*** read_ahead={_ra} inflight={_inf}: the pump starts {_want} "
+       f"read(s), not one per pool-full ***", len(hp._reading), _want)
+    hp._pump()
+    eq("...and pumping again with reads outstanding starts no more",
+       len(hp._reading), _want)
+F.write(load_read_ahead=-2)
+flags.reset_for_tests()
+eq("a negative read_ahead falls back to the DECLARED default",
+   diskio._load_read_ahead(), flags.DEFAULTS["load_read_ahead"])
+F.write(load_read_ahead="lots")
+flags.reset_for_tests()
+eq("...and so does an unreadable one", diskio._load_read_ahead(),
+   flags.DEFAULTS["load_read_ahead"])
+F.write(load_read_ahead=0)
+flags.reset_for_tests()
+eq("...but 0 is honoured: strictly serial", diskio._load_read_ahead(), 0)
+
+# ---- C3: FIFO and failures behind a held round ----------------------------
+F.write(load_inflight_max=1, load_read_ahead=3, load_batch_max=4,
+        load_ops_max=0)
+flags.reset_for_tests()
+hf = mkloadhandler(16)
+load_job(hf, 1, 8, 100, 40)          # rounds A1, A2
+load_job(hf, 2, 4, 200, 41)          # round B1
+eq("three reads in flight", len(hf._reading), 3)
+_a1, _a2, _b1 = hf._readers.futs
+_a1.finish()
+_a2.finish()
+_b1.finish(fail=True)
+_cap17 = _CapLogKw()
+_rl, diskio.logger = diskio.logger, _cap17
+try:
+    out = step(hf)
+finally:
+    diskio.logger = _rl
+eq("A1 is submitted, A2 held behind it", [b[0] for b in gpu_bids(hf)], [100])
+eq("*** the failed read BEHIND the held round fails its job NOW ***", out,
+   {2: False})
+eq("...and gives its slots back now: only A1 and A2 hold slots",
+   len(hf._pool._free), 8)
+check("...and says why", any("DISK RESTORE FAILED for job 2" in x
+                             for x in _cap17.lines), _cap17.lines[-3:])
+eq("the held round is still in _reading, in place", len(hf._reading), 1)
+out = step(hf)
+eq("next step: A2 goes, after A1", [b[0] for b in gpu_bids(hf)], [100, 104])
+out = step(hf)
+eq("...and job 1 completes", out, {1: True})
+eq("...with the pool whole", len(hf._pool._free), 16)
+
+# ---- C4: the watchdog with held rounds ------------------------------------
+F.write(load_inflight_max=1, load_read_ahead=2, load_batch_max=4,
+        load_ops_max=0)
+flags.reset_for_tests()
+hw = mkloadhandler(16)
+load_job(hw, 9, 12, 300, 50)
+for f in hw._readers.futs:
+    f.finish()
+step(hw)                              # one on the GPU, two held
+eq("one on the GPU, two held", (len(hw._inner_to_job), len(hw._reading)), (1, 2))
+eq("...and the snapshot says two are held", hw.snapshot()["reads_held"], 2)
+_saved_live = list(diskio._LIVE_HANDLERS)
+diskio._LIVE_HANDLERS[:] = [hw]
+_saved_req = diskio._STALL_FAIL_REQUEST
+diskio._STALL_FAIL_REQUEST = 1.0
+_cap17b = _CapLogKw()
+_rl, diskio.logger = diskio.logger, _cap17b
+_rl2, _LED.logger = _LED.logger, _cap17b
+try:
+    results, fps, rd = {}, [], []
+    for i in range(6):
+        fps.append(diskio._handler_progress()[2])
+        rd.append(hw.stats["rounds_done"])
+        results.update(step(hw))
+        if 9 in results:
+            break
+    fps.append(diskio._handler_progress()[2])
+    rd.append(hw.stats["rounds_done"])
+finally:
+    diskio._STALL_FAIL_REQUEST = _saved_req
+    diskio._LIVE_HANDLERS[:] = _saved_live
+    diskio.logger = _rl
+    _LED.logger = _rl2
+eq("*** a stall-fail with held rounds drains: the job reports FAILED ***",
+   results, {9: False})
+eq("...with no staging slot leaked", len(hw._pool._free), 16)
+eq("...and nothing left reading or on the GPU",
+   (len(hw._reading), len(hw._inner_to_job)), (0, 0))
+eq("rounds_done advances by one per observed completion", rd, [0, 1, 2, 3])
+check("*** the step that only COMPLETES a copy (no read, no submit, no bytes) "
+      "still moves the watchdog fingerprint -- held rounds are progress ***",
+      fps[-2] != fps[-1], (fps[-2], fps[-1]))
+
+# ---- C5: source lint -------------------------------------------------------
+_lsrc = open(os.path.join(REPO, "src", "kvmgr", "diskio.py")).read()
+_lc = _lsrc[_lsrc.index("class DiskLoadHandler"):]
+_lc = _lc[_lc.index("    def _collect("):]
+_lc = _lc[:_lc.index("\n    def ", 10)]
+_lc_code = "\n".join(l.split("#", 1)[0] for l in _lc.splitlines())
+_drain = _lc_code.find("for res in self._inner.get_finished():")
+_loop = _lc_code.find("for job_id, fut, slots, bids, g in self._reading:")
+_gate = _lc_code.find("if len(self._inner_to_job) >= _lim:", _loop)
+_ta = _lc_code.find("self._inner.transfer_async(", _loop)
+_end = _lc_code.find("self._reading = still", _loop)
+check("*** _collect drains get_finished BEFORE stage 2 ***",
+      0 <= _drain < _loop, (_drain, _loop))
+check("*** stage 2's transfer_async sits behind the inflight check, inside "
+      "the same loop ***", 0 <= _loop < _gate < _ta < _end,
+      (_loop, _gate, _ta, _end))
+check("...and the bound it checks is load_inflight_max",
+      "_lim = _load_inflight_max()" in _lc_code)
+check("...and a held round is kept, not dropped",
+      "still.append((job_id, fut, slots, bids, g))"
+      in _lc_code[_gate:_ta])
+check("the watchdog fingerprint carries rounds_done",
+      'st.get("rounds_done")' in
+      _lsrc[_lsrc.index("def _handler_progress"):
+            _lsrc.index("def _watchdog_loop")])
 
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
