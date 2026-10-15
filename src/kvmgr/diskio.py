@@ -2685,7 +2685,11 @@ class DiskLoadHandler:
         the worker's view of the external hit: blocks x the group's GPU block
         size, from the load spec; None (with a reason) when the size is
         unknown, never 0."""
+        # 0.21: gpu_block_size; 0.31: tokens_per_block (per group, the same
+        # meaning). Neither -> ext_tokens None with a reason.
         bsz = getattr(self._spec, "gpu_block_size", None)
+        if bsz is None:
+            bsz = getattr(self._spec, "tokens_per_block", None)
         idx = list(getattr(gpu_spec, "block_indices", None) or ())
         out = {"job_blocks": {}, "cap": {}, "rounds_planned": {},
                "ext_tokens": {}, "ext_start_token": {}}

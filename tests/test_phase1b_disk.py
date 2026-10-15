@@ -3536,6 +3536,11 @@ eq("67 blocks: rounds_planned 3, the last a 1-block tail",
    [(1, 3, 34, False), (2, 3, 1, False), (3, 3, 0, True)])
 eq("ext_tokens = blocks x the group's block size; start from block_indices",
    (_plan["ext_tokens"], _plan["ext_start_token"]), ({"0": 67 * 256}, {"0": 0}))
+h10t = mkloadhandler(80)
+h10t._spec.tokens_per_block = (64, 64, 64, 4, 8)      # 0.31's name
+_run_job(h10t, 106, 5, 4000, _busy_step)
+eq("0.31's tokens_per_block gives ext_tokens too",
+   [r for r in _led_lines(106) if r["ev"] == "plan"][0]["ext_tokens"], {"0": 5 * 64})
 eq("a step with a forward pass reports its tokens",
    {r["step_tokens"] for r in _subs}, {4096})
 
