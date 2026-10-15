@@ -1,10 +1,10 @@
 # Plan: kvmgr on vLLM 0.31, run end to end on this Mac (2026-10-15)
 
 Branch `spike/vllm-0.31-local`, worktree `../vllm-kvmgr-031-local`, cut from
-`main` at `f0bbe35` (v0.4.7 plus docs). Local only: nothing is pushed to `head` or
+`main` at v0.4.8 (`66d3b55`; rebased 2026-10-15). Local only: nothing is pushed to `head` or
 `worker`, and nothing to `origin` unless asked. The earlier offline spike
 (`spike/vllm-0.31`, `620c3a8`) is the reference, not the base. It predates
-v0.4.2–v0.4.7 (load_wait_compute, the poll thread, the parallel walk, loadfail,
+v0.4.2–v0.4.8 (load_wait_compute, the parallel walk, loadfail,
 checksums, /kv/keys), and the port has to carry those.
 
 ## What was checked before writing this (2026-10-15)
