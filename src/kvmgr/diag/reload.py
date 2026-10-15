@@ -81,6 +81,7 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     # instance of the reload-destroys-module-state family, and the first one
     # caught by remembering the table exists rather than by a live failure.
     ("kvmgr.diskio", "_watchdog_started", "the stall watchdog's one-shot flag"),
+    ("kvmgr.diskio", "_POLL_REMOVED", "when load_poll_ms > 0 was last warned"),
     # Failed loads' GPU blocks not yet drained by the connector, and the lock
     # and counters around them. The connector and Scheduler wraps installed at
     # boot keep calling the OLD module's functions, so old and new must share

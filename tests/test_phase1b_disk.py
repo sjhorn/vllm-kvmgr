@@ -2873,9 +2873,7 @@ def mkloadhandler(pool_size, nrefs=REFS):
                "checksum_ok": 0, "checksum_absent": 0, "checksum_bad": 0,
                "bad_unlinked": 0, "failed_recompute": 0,
                "steps": 0, "steps_loading": 0,
-               "blocks_to_gpu": 0, "blocks_step_max": 0,
-               "blocks_to_gpu_poll": 0, "rounds_to_gpu_poll": 0,
-               "polls": 0, "poll_no_stream": 0, "poll_errors": 0}
+               "blocks_to_gpu": 0, "blocks_step_max": 0}
     h._read_batch = lambda bkeys, slots, g: 100 * len(bkeys)
     h._bounds_cache = (22756, pool_size)
     return h
@@ -3242,17 +3240,17 @@ check("the wait is armed BEFORE the ledger line and the submit",
       < _c7.index('self._ledger_submit("load"')
       < _c7.index("self._inner.transfer_async("))
 
-# ---- C8 (v0.4.4, ask4 item 3): the load POLL thread and per-step counters --
-print("\n== (C8) load_poll_ms: rounds between steps, still waiting on compute ==")
+# ---- C8 (v0.4.8, ask7): NO load copy is submitted off the step thread -------
+# v0.4.4's poll thread did, armed on the last step's compute stream, and the
+# cluster faulted with Xid 32 after 27 loads, all `via=poll`. It is removed;
+# load_poll_ms is read only to warn. The per-step counters stay.
+print("\n== (C8) load copies only on the step; load_poll_ms is ignored, loudly ==")
 import threading as _th8
-import time as _time8
 
-_STEPCS = object()      # the compute stream, as the STEP thread sees it
-_POLLCS = object()      # what the poll thread's own current stream would be
-_cur8 = {"s": _STEPCS}
+_STEPCS = object()
 _had_cuda8 = hasattr(_torch7, "cuda")
 _torch7.cuda = type("C", (), {"Stream": _Stream7,
-                              "current_stream": staticmethod(lambda: _cur8["s"])})
+                              "current_stream": staticmethod(lambda: _STEPCS)})
 
 
 def _finish_reads(h):
@@ -3262,106 +3260,38 @@ def _finish_reads(h):
 
 
 try:
-    # -- off: one round per step, counted
     _K8 = dict(load_inflight_max=1, load_read_ahead=1, load_batch_max=4,
                load_ops_max=0, load_wait_compute=1)
-    F.write(load_poll_ms=0, **_K8)
-    flags.reset_for_tests()
-    h8 = mkloadhandler(16)
-    h8._inner = _Inner7()
-    load_job(h8, 81, 12, 1100, 81)
-    for _ in range(10):
-        _finish_reads(h8)
-        if 81 in step(h8):
-            break
-    eq("poll off: all 12 blocks reached the GPU", h8.stats["blocks_to_gpu"], 12)
-    eq("...one round (4 blocks) per step at most", h8.stats["blocks_step_max"], 4)
-    check("...over at least 3 loading steps", h8.stats["steps_loading"] >= 3,
-          h8.stats)
-    eq("...none by the poll thread", h8.stats["blocks_to_gpu_poll"], 0)
-    check("...and no poll thread exists", getattr(h8, "_poll_thread", None) is None)
-
-    # -- on, driven by hand (the thread is the loop around _poll_once)
-    F.write(load_poll_ms=5, **_K8)
-    flags.reset_for_tests()
-    h8b = mkloadhandler(16)
-    h8b._inner = _Inner7()
-    h8b._ensure_poller = lambda: None
-    load_job(h8b, 82, 12, 1200, 82)
-    _finish_reads(h8b)
-    eq("the step submits round 1", step(h8b), {})
-    eq("...4 blocks", h8b.stats["blocks_to_gpu"], 4)
-    check("...and captured the step's compute stream",
-          h8b._poll_compute is _STEPCS)
-    _cur8["s"] = _POLLCS             # from here on, "another thread"
-    h8b._poll_once()                 # drains round 1, submits round 2
-    _finish_reads(h8b)
-    h8b._poll_once()                 # drains round 2, submits round 3
-    eq("*** two polls between steps submit rounds 2 and 3 ***",
-       h8b.stats["rounds_to_gpu_poll"], 2)
-    eq("...8 blocks by the poll", h8b.stats["blocks_to_gpu_poll"], 8)
-    check("*** every poll-submitted copy waited on the STEP's compute stream, "
-          "never the poll thread's own ***",
-          len(h8b._inner.used) == 3
-          and all(w and w[-1] is _STEPCS and _POLLCS not in w
-                  for w in h8b._inner.used[1:]),
-          repr(h8b._inner.used))
-    eq("...the ledger is told it was the poll", h8b._submit_via, "poll")
-    eq("...and which stream was waited on", h8b._armed_on, _STEPCS)
-    _cur8["s"] = _STEPCS
-    h8b._poll_once()                 # drains round 3: the job is complete
-    eq("*** the completion still reaches vLLM only at the step ***",
-       step(h8b), {82: True})
-    eq("...which counts the 8 poll blocks as its step's",
-       h8b._blocks_last_step, 8)
-    eq("...and the max", h8b.stats["blocks_step_max"], 8)
-
-    # -- no captured stream: the poll does nothing rather than arm on the wrong one
-    h8c = mkloadhandler(16)
-    h8c._inner = _Inner7()
-    h8c._ensure_poller = lambda: None
-    load_job(h8c, 83, 8, 1300, 83)
-    _finish_reads(h8c)
-    h8c._poll_compute = None
-    h8c._poll_once()
-    eq("no captured stream: nothing submitted", len(h8c._inner.used), 0)
-    eq("...counted as poll_no_stream", h8c.stats["poll_no_stream"], 1)
-
-    # -- an exception in a pass is counted and said once, never raised
-    h8c._poll_compute = _STEPCS
-    _real = h8c._collect_locked
-    h8c._collect_locked = lambda via: (_ for _ in ()).throw(RuntimeError("x"))
-    harness.clear_log()
-    h8c._poll_once()
-    h8c._poll_once()
-    eq("a failing pass is counted", h8c.stats["poll_errors"], 2)
-    eq("...and said once", harness.log_text().count("load poll pass failed"), 1)
-    h8c._collect_locked = _real
-
-    # -- the real thread: started by a step, stopped by the knob
-    F.write(load_poll_ms=1, **_K8)
-    flags.reset_for_tests()
-    h8d = mkloadhandler(16)
-    h8d._inner = _Inner7()
-    load_job(h8d, 84, 40, 1400, 84)
-    _finish_reads(h8d)
-    step(h8d)
-    check("a step with load_poll_ms > 0 starts the thread",
-          h8d._poll_thread.is_alive())
-    _t0 = _time8.monotonic()
-    while (h8d.stats["blocks_to_gpu"] < 40
-           and _time8.monotonic() - _t0 < 5.0):
-        _finish_reads(h8d)
-        _time8.sleep(0.002)
-    eq("*** the thread moved the restore with no step at all ***",
-       h8d.stats["blocks_to_gpu"], 40)
-    check("...most of it by the poll", h8d.stats["blocks_to_gpu_poll"] >= 32,
-          h8d.stats)
-    F.write(load_poll_ms=0, **_K8)
-    flags.reset_for_tests()
-    h8d._poll_thread.join(timeout=3.0)
-    check("knob back to 0: the thread exits", not h8d._poll_thread.is_alive())
-    eq("...and the job completes at the next step", step(h8d), {84: True})
+    for _pm in (0, 5):
+        F.write(load_poll_ms=_pm, **_K8)
+        flags.reset_for_tests()
+        diskio._POLL_REMOVED["warned_at"] = None
+        harness.clear_log()
+        h8 = mkloadhandler(16)
+        h8._inner = _Inner7()
+        load_job(h8, 80 + _pm, 12, 1100, 80 + _pm)
+        for _ in range(10):
+            _finish_reads(h8)
+            if 80 + _pm in step(h8):
+                break
+        _tag = "load_poll_ms=%d" % _pm
+        eq("%s: all 12 blocks reached the GPU" % _tag, h8.stats["blocks_to_gpu"], 12)
+        eq("*** %s: one round (4 blocks) per step, never more ***" % _tag,
+           h8.stats["blocks_step_max"], 4)
+        check("%s: over at least 3 loading steps" % _tag,
+              h8.stats["steps_loading"] >= 3, h8.stats)
+        check("*** %s: no poll thread exists ***" % _tag,
+              not any(t.name == "kvmgr-loadpoll" for t in _th8.enumerate()))
+        check("%s: every copy waited on the step's compute stream" % _tag,
+              all(w and w[-1] is _STEPCS for w in h8._inner.used), h8._inner.used)
+        if _pm:
+            check("*** load_poll_ms > 0 WARNS that it is ignored, naming the "
+                  "Xid 32 ***", "IGNORED" in harness.log_text()
+                  and "Xid 32" in harness.log_text(), harness.log_text()[-300:])
+            eq("...once per step burst, not on every step",
+               harness.log_text().count("load_poll_ms=5 is IGNORED"), 1)
+        else:
+            check("load_poll_ms=0: no warning", "IGNORED" not in harness.log_text())
 finally:
     if not _had_cuda8:
         del _torch7.cuda
@@ -3369,18 +3299,21 @@ finally:
     flags.reset_for_tests()
 
 _cl8 = _lsrc[_lsrc.index("class DiskLoadHandler"):]
-for _m in ("def transfer_async", "def get_finished", "def _collect(self)",
-           "def _poll_once"):
+check("*** the load handler starts no thread of its own (the poll thread is "
+      "gone) ***", "threading.Thread(" not in _cl8)
+check("...and nothing in it submits a copy outside _collect_locked",
+      _cl8.count("self._inner.transfer_async(") == 1
+      and _cl8.index("def _collect_locked") < _cl8.index("self._inner.transfer_async("))
+check("...which only the step's _collect calls",
+      _cl8.count("self._collect_locked(") == 1)
+check("/kv/workers shows a leftover load_poll_ms as poll_ms_ignored",
+      "poll_ms_ignored=_load_poll_ms()" in _cl8)
+check("the compute wait takes no stream argument: always the step's current one",
+      "def _arm_compute_wait(self) ->" in _cl8)
+for _m in ("def transfer_async", "def get_finished", "def _collect(self)"):
     _b = _cl8[_cl8.index(_m):]
     _b = _b[:_b.index("\n    def ", 10)]
     check("%s takes the handler lock" % _m, "with self._mu_():" in _b)
-_lg8 = open(os.path.join(REPO, "src", "kvmgr", "diag", "ledger.py")).read()
-check("the ledger's load line says which thread submitted it",
-      '"via": via or "step"' in _lg8)
-check("...keeps poll submits out of the in_step counts",
-      '_k = ("loads_via_poll" if via == "poll" else' in _lg8)
-check("...and reports the stream the arm waited on",
-      'cs = getattr(h, "_armed_on", None)' in _lg8)
 
 # ---- C9 (borrowed from sparkcache): checksums, and failure -> recompute ------
 print("\n== (C9) checksums outside the file, and a failed restore as invalid blocks ==")

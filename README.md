@@ -69,11 +69,11 @@ from disk.
 Into a vLLM image:
 
 ```sh
-pip install --no-deps vllm_kvmgr-0.4.7-py3-none-any.whl
+pip install --no-deps vllm_kvmgr-0.4.8-py3-none-any.whl
 ```
 
 The DSpark recipe does not pip install. It mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.4.7.dist-info` into site-packages instead. vLLM finds the
+`deploy/vllm_kvmgr-0.4.8.dist-info` into site-packages instead. vLLM finds the
 plugin through the entry point in that dist-info folder. The folder is made by
 a script:
 
@@ -140,17 +140,16 @@ the engine:
   repeats a WARNING every 5 minutes and `/kv/workers` counts
   `compute_wait_off`. Each load's ledger line says whether the wait was in
   force (`wait_compute`).
-- **`load_poll_ms=0` (off).** Normally a finished GPU copy is noticed once per
-  scheduler step, so under heavy prefill a restore moves at most
-  `load_inflight_max` rounds per step (an 858K restore took 166 s busy against
-  11 s idle). Above 0, a thread checks every that many ms and starts the next
-  round between steps. That round still waits on the compute stream the last
-  step used, so the Xid 32 fix holds. Not yet measured on the cluster.
-  `/kv/workers` shows what a step moves: `steps_loading`, `blocks_to_gpu`
-  (and `blocks_to_gpu_poll`, the poll thread's share), `blocks_step_max`,
-  `blocks_last_step`, `blocks_per_loading_step`, `poll_ms`, `poll_thread`.
-  Compare settings by the change in `blocks_to_gpu / steps_loading` over one
-  restore. Can be changed while running.
+- **`load_poll_ms` is ignored (removed in v0.4.8).** v0.4.4 added a thread
+  that started restore copies between scheduler steps. On the cluster it
+  brought the Xid 32 fault back within 27 restores, so it is gone: restore
+  copies are only ever started on the scheduler step. A value above 0 logs a
+  WARNING every 5 minutes and shows on `/kv/workers` as `poll_ms_ignored`.
+  Restore speed under load is tuned with `load_inflight_max` and
+  `load_ops_max` instead. `/kv/workers` shows what a step moves:
+  `steps_loading`, `blocks_to_gpu`, `blocks_step_max`, `blocks_last_step`,
+  `blocks_per_loading_step`. Compare settings by the change in
+  `blocks_to_gpu / steps_loading` over one restore.
 - **`disk_load_failure_recompute=0` (off).** In stock vLLM a failed restore
   (missing file, wrong size, bad checksum) stops the engine: the offloading
   connector asserts. With this on, the restore is reported to vLLM as invalid
@@ -260,8 +259,6 @@ A block counts as saved only when **both** ranks have written their part.
                         they wait                            (default 1)
   load_wait_compute   = the GPU copy waits for queued compute work first
                         (default 1; 0 is the Xid 32, never on a serving engine)
-  load_poll_ms        = check for finished copies this often between steps
-                                                       (default 0 = off)
 ```
 
 `lookup` checks the index. A prompt reuses blocks in one unbroken run from
@@ -390,7 +387,6 @@ Useful fields on a `submit` line:
 | `in_step` | (loads) how many of the target blocks the current batch is using. `null` means it could not be read, which is not the same as 0 |
 | `req`, `req_in_step` | (loads) the request this load is for, and whether it is in the current batch |
 | `wait_compute` | (loads) whether the copy waited for queued compute work (`load_wait_compute`). `null` means it could not be set up |
-| `via` | (loads) `step`, or `poll` when the poll thread submitted it (`load_poll_ms`). A `poll` line has `in_step: null`: the block table cannot be read from that thread, and `/kv/workers` counts it as `loads_via_poll` rather than as unreadable |
 | `keys` | the round's keys, as hex, when `diag_ledger_keys` is on. `null` with `keys_why` if the handler named none |
 | `dst_span`, `dst_contig_runs` | (loads) highest minus lowest target block id, and how many unbroken runs they form |
 | `bids_sha` | (loads) a short id for the exact block set (sha1 of the `bids` ranges, 12 hex), to match the same copy across ranks |

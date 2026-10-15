@@ -272,8 +272,7 @@ _STATS = {"overlaps": 0, "overlap_same_group": 0, "overlap_last": None,
           "wal_lines": 0, "wal_errors": 0, "wal_rotations": 0,
           "max_gpu_loads": 0, "max_gpu_stores": 0, "burst_canary": 0,
           "loads_in_step": 0, "loads_not_in_step": 0,
-          "loads_in_step_unreadable": 0, "loads_req_in_step": 0,
-          "loads_via_poll": 0}
+          "loads_in_step_unreadable": 0, "loads_req_in_step": 0}
 _WAL = {"fd": None, "path": None, "bytes": 0, "why": "nothing submitted yet"}
 # The per-process identity. Lazy and checked against the pid, so a worker
 # FORKED from a parent that imported this module gets its own token rather than
@@ -564,13 +563,8 @@ def stream_context(h) -> dict:
     CUDA handles as ints; null with a reason when unreadable."""
     out: dict = {}
     try:
-        # the stream the arm waited on (the poll thread's current stream is
-        # not the compute stream), else the current one
-        cs = getattr(h, "_armed_on", None)
-        if cs is None:
-            import torch
-            cs = torch.cuda.current_stream()
-        out["compute_stream"] = int(cs.cuda_stream)
+        import torch
+        out["compute_stream"] = int(torch.cuda.current_stream().cuda_stream)
     except Exception as e:
         out["compute_stream"] = None
         out["compute_stream_why"] = ("unreadable: %r" % (e,))[:160]
@@ -668,11 +662,6 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
         bound = _load_bound() if kind == "load" else None
         # Outside the lock: it walks the stack and reads the block table.
         ctx = dest_context(job, group, bset) if kind == "load" else {}
-        via = getattr(h, "_submit_via", None) if kind == "load" else None
-        if via == "poll":
-            # no model runner on the poll thread's stack: not "unreadable"
-            ctx["in_step"] = None
-            ctx["in_step_why"] = "submitted by the load poll thread"
         if kind == "load":
             ctx.update(dest_shape(h, group, bset))
         canary = False
@@ -688,8 +677,7 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
                     _STATS["burst_canary"] = (_STATS.get("burst_canary") or 0) + 1
                     canary = _STATS["burst_canary"] == 1
                 _n = ctx.get("in_step")
-                _k = ("loads_via_poll" if via == "poll" else
-                      "loads_in_step_unreadable" if _n is None else
+                _k = ("loads_in_step_unreadable" if _n is None else
                       "loads_in_step" if _n > 0 else "loads_not_in_step")
                 _STATS[_k] = (_STATS.get(_k) or 0) + 1
                 if ctx.get("req_in_step"):
@@ -710,8 +698,7 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
                 overlap=[[k2, i2] for k2, i2, *_ in hits] or None,
                 # loads: did the copy wait on compute? True/False/None
                 # (None = could not arm). Absent on stores.
-                **({"wait_compute": getattr(h, "_wait_compute_last", None),
-                    "via": via or "step"}
+                **({"wait_compute": getattr(h, "_wait_compute_last", None)}
                    if kind == "load" else {}),
                 # diag_ledger_keys: the round's keys, so a gate can see from
                 # THIS rank's own file which keys it loaded or stored
@@ -775,9 +762,6 @@ def wal_snapshot() -> dict:
                 "loads_in_step_unreadable": int(
                     _STATS.get("loads_in_step_unreadable") or 0),
                 "loads_req_in_step": int(_STATS.get("loads_req_in_step") or 0),
-                # submitted by the load poll thread (load_poll_ms): in_step
-                # cannot be read there, so they are kept out of the three above
-                "loads_via_poll": int(_STATS.get("loads_via_poll") or 0),
                 "boot": _ID.get("boot")}
 
 
