@@ -21,7 +21,10 @@ NAME="${NAME:-kvmgr031}"
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 VOL="${VOL:-kvlocal}"
 DIST="$(ls -d "$W"/deploy/vllm_kvmgr-*.dist-info | head -1)"
-KVCFG='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"DSparkDiskOffloadingSpec","staging_blocks":64,"staging_load_blocks":64,"write_threads":4,"root_dir":"/kvoffload"}}'
+# POLICY=recompute adds vLLM's kv_load_failure_policy (default "fail").
+KVPOL=""
+[ -n "${POLICY:-}" ] && KVPOL="\"kv_load_failure_policy\":\"$POLICY\","
+KVCFG="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",${KVPOL}\"kv_connector_extra_config\":{\"spec_name\":\"DSparkDiskOffloadingSpec\",\"staging_blocks\":64,\"staging_load_blocks\":64,\"write_threads\":4,\"root_dir\":\"/kvoffload\"}}"
 
 case "${1:-up}" in
   up)

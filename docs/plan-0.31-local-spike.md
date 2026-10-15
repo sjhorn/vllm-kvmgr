@@ -149,6 +149,39 @@ and the multi-rank invalid-block union that offline testing couldn't prove.
   0.31, and a validation boot.
 - Update `docs/plan-2026-10-14.md` item 4 on `main`.
 
+## Results so far (2026-10-15)
+
+Apple `container` 1.5.0, `vllm/vllm-openai-cpu:v0.31.0-arm64` (vLLM 0.31.0,
+torch 2.13 CPU, Python 3.12), Qwen3-0.6B (one KV group, 128-token blocks,
+14.7 MB a block over 28 layers), 8 CPUs / 16 GB, `scripts/local031.sh`.
+
+| step | result |
+|---|---|
+| plugin load in 0.31 | entry point, loadfail (both hooks), reqkeys, disk spec registered; GPU manager skipped as designed |
+| first wall | `/dev/shm` too small for vLLM's engine queue: `--shm-size 4G` |
+| second wall | 0.31's copy handler asserts CUDA/XPU tensors: `HostCopyHandler` (plain torch) on non-CUDA |
+| third gap | the stats port (`/kv`, `/kv/keys`) only started from the GPU manager: now also from the disk manager |
+| prime, 4,850-token canary | 19.19 s; 37 files (543 MB), 37 CRC32 xattrs, journal and ledger written |
+| restart + restore | journal replayed 37; BOOT WALK 37/37; **37 blocks restored, 4,736 external-hit tokens, 1.87 s, identical reply** |
+| checksum verify on | 37/37 matched at restore; +0.04 s |
+| Gate B rehearsal (flip 1 byte in block 18, POLICY=recompute) | checksum caught it; file unlinked; job's 37 blocks reported invalid; vLLM "Recovered from KV load failure"; 37 keys left the index (journalled); engine up; identical reply in 19.06 s (a full recompute) |
+| self-heal | **on the NEXT request with that prefix**: 36 stores skipped (file present), 1 rewritten, with the original CRC; index back to 37/38 |
+
+Notes for the real port and for the vllm-proxy gates:
+- The rewrite is not in the same request: the connector marks loaded blocks
+  as stored for that request, so the heal comes from the next request with
+  the prefix. Gate B should send the canary twice after the corruption. The
+  0.21 connector does the same (`next_stored_block_idx = num_blocks` on a
+  load), so this is not 0.31-specific.
+- `loadfail`'s snapshot is per process: `/kv/workers` shows the worker's
+  side (`noted_jobs`, `drained_blocks`); the scheduler side's `forgot_keys`
+  shows as the manager's `load_failed_forgot`, not here.
+- Our compute wait on a CPU backend reports "could not arm" once (no stream
+  pool), which is correct there.
+
+Phases still open: 4 (a two-group model: Gemma 3 270M needs an HF token),
+5 (TP=2 on one host, optional), 6 (report and main plan update).
+
 ## Recommendation: keep our own spec, don't move to the built-in tiers
 
 Unchanged from the first spike, with two new reasons from today's checks.
