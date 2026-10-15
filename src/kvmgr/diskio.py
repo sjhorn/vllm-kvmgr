@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from vllm.logger import init_logger
 
+from . import copyapi
 from . import hooks
 from . import loadfail
 
@@ -2423,6 +2424,14 @@ class DiskLoadHandler:
             kv_cache_groups_data_refs=self._refs,
             gpu_to_cpu=False,
         )
+        # ask9: this handler's copy goes through load_copy_api. The proxy sits
+        # in the handler module's `ops` global, but it is inert unless OUR
+        # submit sets a mode on this thread, so stores keep upstream's call.
+        self._copy_api_why = copyapi.install_on(self._inner)
+        if self._copy_api_why:
+            logger.warning("kvmgr: load_copy_api cannot take effect (%s); every "
+                           "load uses upstream's one batch call",
+                           self._copy_api_why)
         self._readers = ThreadPoolExecutor(max_workers=read_threads,
                                           thread_name_prefix="kvmgr_diskrd")
         self._jobs: dict[int, dict] = {}
@@ -2933,12 +2942,24 @@ class DiskLoadHandler:
             self._submit_keys = getattr(fut, "_kvmgr_keys", None)
             self._submit_round = getattr(fut, "_kvmgr_round", None)
             self._wait_compute_last = self._arm_compute_wait()
+            # ask9: the path this copy takes, chosen per submit and named on
+            # the ledger line BEFORE the call, so a fault says which it was
+            _mode, _chunk = copyapi.selected()
+            if getattr(self, "_copy_api_why", "not installed"):
+                _mode = "batch"
+            self._copy_last = {
+                "copy_api": _mode,
+                "copy_calls": copyapi.calls_for(
+                    _mode, load_ops_for(self._refs, g, len(bids)), _chunk)}
             self._ledger_note("load", g, bids, slots)
             self._ledger_submit("load", inner, job_id, g, bids, slots)
-            ok = self._inner.transfer_async(
-                inner, (CPULoadStoreSpec(slots),
-                        GPULoadStoreSpec(bids, group_sizes=gs,
-                                         block_indices=[0] * ngroups)))
+            with copyapi.active(_mode, _chunk) as _rec:
+                ok = self._inner.transfer_async(
+                    inner, (CPULoadStoreSpec(slots),
+                            GPULoadStoreSpec(bids, group_sizes=gs,
+                                             block_indices=[0] * ngroups)))
+            self.stats["copy_calls_" + _mode] = (
+                self.stats.get("copy_calls_" + _mode, 0) + _rec["calls"])
             if not ok:
                 self._ledger_done("load", inner, False)
                 self._pool.give(slots)
@@ -3124,6 +3145,14 @@ class DiskLoadHandler:
                     # fingerprint that would otherwise carry them.
                     refs_per_group=[len(r) for r in (self._refs or [])],
                     ops_max=_load_ops_max(),
+                    # ask9: the copy path loads take now, and why not if the
+                    # proxy could not be installed
+                    copy_api=("batch" if getattr(self, "_copy_api_why",
+                                                 "not installed")
+                              else copyapi.selected()[0]),
+                    copy_chunk=copyapi.selected()[1],
+                    copy_api_why=getattr(self, "_copy_api_why",
+                                         "not installed"),
                     # *** THESE WERE MISSING AND I MISREAD THEIR ABSENCE. ***
                     # Only the store handler reported its bounds, so the load
                     # handler showed gpu_rows=None -- and I read "the key is

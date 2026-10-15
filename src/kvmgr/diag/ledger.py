@@ -742,6 +742,11 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
                 # (None = could not arm). Absent on stores.
                 **({"wait_compute": getattr(h, "_wait_compute_last", None)}
                    if kind == "load" else {}),
+                # ask9: the copy path (batch|chunk|loop) and the driver calls
+                # it will make, so a fault names its path. Absent on stores.
+                **((getattr(h, "_copy_last", None)
+                    or {"copy_api": None, "copy_calls": None})
+                   if kind == "load" else {}),
                 # ask8: the copy's place in its job, and whether the step
                 # that submitted it had a forward pass
                 **(dict(_round_fields(h), **step_tokens())

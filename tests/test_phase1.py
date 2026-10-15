@@ -300,6 +300,9 @@ PROBE = {
     # v0.4.4: the load poll thread, off by default
     "load_poll_ms": (0, 5),
     "load_ops_max": (0, 512),
+    # ask9: the load copy path and its chunk size
+    "load_copy_api": ("loop", "chunk"),
+    "load_copy_chunk": (16, 256),
     # the STORE's per-round budget, added 2026-10-11 after the store path was
     # measured to stall the stream by ~1.1s with no cap at all
     "store_batch_max": (0, 16),

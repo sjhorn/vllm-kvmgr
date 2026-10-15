@@ -69,11 +69,11 @@ from disk.
 Into a vLLM image:
 
 ```sh
-pip install --no-deps vllm_kvmgr-0.4.9-py3-none-any.whl
+pip install --no-deps vllm_kvmgr-0.4.10-py3-none-any.whl
 ```
 
 The DSpark recipe does not pip install. It mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.4.9.dist-info` into site-packages instead. vLLM finds the
+`deploy/vllm_kvmgr-0.4.10.dist-info` into site-packages instead. vLLM finds the
 plugin through the entry point in that dist-info folder. The folder is made by
 a script:
 
@@ -140,6 +140,23 @@ the engine:
   repeats a WARNING every 5 minutes and `/kv/workers` counts
   `compute_wait_off`. Each load's ledger line says whether the wait was in
   force (`wait_compute`).
+- **`load_copy_api=batch` (v0.4.10, hot, loads only).** This sets how a
+  restore's GPU copy reaches the CUDA driver:
+  - `batch` (the default) is upstream's single `cuMemcpyBatchAsync`.
+  - `chunk` is the same call on slices of `load_copy_chunk` (default 64)
+    descriptors, back to back on the same stream.
+  - `loop` is one `cuMemcpyAsync` per descriptor.
+
+  The Xid 32/13 faults on group-0 loads (class B) are a fault in
+  `cuMemcpyBatchAsync` itself on GB10, reproduced with only ctypes and libcuda
+  (DSpark `local-ops/kvbatchrepro.py`). In that reproducer, chunks and
+  per-copy ran clean, but production once faulted on a 992-descriptor batch.
+
+  Only restores are affected: saves keep upstream's call. The stream, events,
+  completion and `wait_compute` don't change. Each load's ledger line says
+  which path it took (`copy_api`, `copy_calls`), and `/kv/workers` shows
+  `copy_api`, `copy_chunk` and the `copy_calls_*` counters. It stays `batch`
+  until the vllm-proxy session has run `kvrace` on each mode.
 - **`load_poll_ms` is ignored (removed in v0.4.8).** v0.4.4 added a thread
   that started restore copies between scheduler steps. On the cluster it
   brought the Xid 32 fault back within 27 restores, so it is gone: restore
@@ -259,6 +276,8 @@ A block counts as saved only when **both** ranks have written their part.
                         they wait                            (default 1)
   load_wait_compute   = the GPU copy waits for queued compute work first
                         (default 1; 0 is the Xid 32, never on a serving engine)
+  load_copy_api       = batch | chunk | loop: one driver call, slices of
+                        load_copy_chunk, or one per descriptor (default batch)
 ```
 
 `lookup` checks the index. A prompt reuses blocks in one unbroken run from
@@ -387,6 +406,7 @@ Useful fields on a `submit` line:
 | `in_step` | (loads) how many of the target blocks the current batch is using. `null` means it could not be read, which is not the same as 0 |
 | `req`, `req_in_step` | (loads) the request this load is for, and whether it is in the current batch |
 | `wait_compute` | (loads) whether the copy waited for queued compute work (`load_wait_compute`). `null` means it could not be set up |
+| `copy_api`, `copy_calls` | (loads) the path this copy takes (`batch`, `chunk`, `loop`; `load_copy_api`) and how many driver calls it makes, written before the copy starts |
 | `keys` | the round's keys, as hex, when `diag_ledger_keys` is on. `null` with `keys_why` if the handler named none |
 | `round`, `rounds_planned`, `blocks_left`, `last` | (loads) this copy's number within its job for its group, how many copies the job should take now, the blocks still to go after it, and whether it is the last (`blocks_left == 0`). `rounds_planned` is an estimate that can grow if the staging pool hands out a short round; `last` is exact |
 | `step_tokens` | (loads) the submitting step's `total_num_scheduled_tokens`. 0 means a step with no forward pass. `null` with `step_tokens_why` if it could not be read |

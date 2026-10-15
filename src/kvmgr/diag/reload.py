@@ -91,6 +91,13 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     ("kvmgr.loadfail", "STATS", "load-failure counters"),
     # The ring of finished requests' keys, its lock and counters: the gate
     # reads a request that finished BEFORE a reload.
+    # ask9: the proxy installed in the copy handler's module keeps the OLD
+    # copyapi's globals, so the thread-local mode the NEW diskio sets must be
+    # the same object, or a reload silently puts every load back on batch.
+    ("kvmgr.copyapi", "_TLS", "the per-thread load copy mode the proxy reads"),
+    ("kvmgr.copyapi", "STATS", "copy-path counters"),
+    ("kvmgr.copyapi", "_WARNED", "copy-path warnings already given"),
+    ("kvmgr.copyapi", "_LIB", "the resolved libcuda cuMemcpyAsync"),
     ("kvmgr.diag.reqkeys", "_RING", "recently finished requests' keys"),
     ("kvmgr.diag.reqkeys", "_LOCK", "the lock around _RING"),
     ("kvmgr.diag.reqkeys", "_STATS", "reqkeys counters"),
@@ -366,7 +373,7 @@ def reload_modules() -> dict:
     # so a change to this function takes effect on the NEXT reload.
     for name in ("kvmgr.hooks", "kvmgr.flags", "kvmgr.policy",
                  # before diskio, which binds it at import
-                 "kvmgr.loadfail", "kvmgr.diskio",
+                 "kvmgr.loadfail", "kvmgr.copyapi", "kvmgr.diskio",
                  "kvmgr.diskspec", "kvmgr.manager", "kvmgr.stats",
                  "kvmgr.diag.hangdump", "kvmgr.diag.ledger",
                  "kvmgr.diag.copyprobe", "kvmgr.diag.selftest",

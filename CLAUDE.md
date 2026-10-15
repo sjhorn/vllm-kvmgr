@@ -11,7 +11,7 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   restarts, deploys and measurements in its `CLAUDE.md`), and the recipe is the
   DSpark repo. This file is meant to stand alone, but **DSpark's `CLAUDE.md`
   governs the engine** and wins any disagreement about restarting it.
-- Releases are tags (`v0.1.0` … `v0.4.9`), each
+- Releases are tags (`v0.1.0` … `v0.4.10`), each
   naming the vLLM build it is proven on (`pyproject.toml` states the window).
 - **It is the only copy.** The DSpark recipe repo
   (`~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark`) no
@@ -54,8 +54,9 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   `get_block_ids_with_load_errors`), `diskio._arm_compute_wait` (upstream's
   `_stream_pool`), `register.py` (OffloadingConnectorScheduler `__init__`,
   KVCacheCoordinator `__init__`), `diag/reqkeys.py` (OffloadingConnectorScheduler
-  `request_finished`). Tests pin the upstream code each of the first, second
-  and last relies on (phase15, phase1b C7, phase16); the `__init__` wraps
+  `request_finished`), `copyapi.py` (the `ops` global of the copy handler's
+  module). Tests pin the upstream code each of the first, second, fourth and
+  last relies on (phase15, phase1b C7, phase16, phase17); the `__init__` wraps
   only need the classes to exist.
 - `tests/upstream/` holds pristine vLLM sources the tests load (see its
   MANIFEST). Re-vendor it from the target build when porting.
@@ -148,6 +149,15 @@ the current stream before each load copy.
   copy could wait on is known to be right. v0.4.8 removed the thread, and
   `load_poll_ms > 0` now only warns. Tests (phase1b C8) fail if the load
   handler starts a thread or submits a copy outside the step's `_collect`.
+- **Class B is `cuMemcpyBatchAsync` itself (ask9, 2026-10-15).** This was
+  reproduced with only ctypes and libcuda (DSpark `local-ops/kvbatchrepro.py`).
+  `load_copy_api` (v0.4.10, default `batch`) can split a load's copy
+  (`chunk`) or issue one `cuMemcpyAsync` per descriptor (`loop`). It works
+  through a proxy for `ops` in the copy handler's module. The proxy acts only
+  inside `DiskLoadHandler`'s own call (a thread-local), so stores and every
+  other caller are untouched. `kvmgr.copyapi` must stay in `_PRESERVE`, or a
+  reload silently puts every load back on `batch`. The default changes only
+  after kvrace has run each mode.
 - **Every change to the load path is gated on the reproducer:** `kvrace.py
   run --arm on --loads 1000` must stay clean, and a 700K restore must stay
   about 10 s idle. It is an actuator; the vllm-proxy session runs it, with the

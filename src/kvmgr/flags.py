@@ -553,6 +553,18 @@ DEFAULTS: dict[str, Any] = {
     # largest block size) reaches any limit first. 0 = unbounded.
     # The DIMENSION is read from upstream; the threshold is still empirical.
     "load_ops_max": 2048,
+    # ask9: how a LOAD's copy descriptors reach the driver. "batch" = one
+    # `ops.swap_blocks_batch` (upstream's `cuMemcpyBatchAsync`, today);
+    # "chunk" = the same call on slices of load_copy_chunk descriptors, back to
+    # back on the same stream; "loop" = one cuMemcpyAsync per descriptor.
+    # *** class B (Xid 32/13 on a group-0 load) is a fault in
+    # *** cuMemcpyBatchAsync on GB10 *** (DSpark local-ops/kvbatchrepro.py):
+    # chunks of 1,024/256/64 and per-copy ran clean there, but production
+    # faulted once on a 992-descriptor copy. Stays "batch" until vllm-proxy
+    # has run kvrace on each candidate. Hot, read per submit; loads only.
+    "load_copy_api": "batch",
+    # Descriptors per call when load_copy_api=chunk. <= 0 -> this default.
+    "load_copy_chunk": 64,
     # --- the STORE's per-round budget. ---------------------------------
     # *** THE STORE PATH HAD NO CAP AND IT STALLED THE STREAM BY ~1.1s. ***
     # Measured 2026-10-11 by scripts/test-meter.sh section 1 (vllm-proxy):
