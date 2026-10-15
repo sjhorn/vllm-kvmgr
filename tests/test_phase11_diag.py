@@ -174,8 +174,8 @@ eq("defaults: exactly the hang dump, the ledger, the copy probe and the "
                       "kvmgr.diag.reqkeys"])
 eq("...and only their hooks are registered (the hang dump needs none)",
    _def.get("hooks"), ["copy_probe_snapshot", "http_get", "ledger_done",
-                       "ledger_dump", "ledger_note", "ledger_snapshot",
-                       "ledger_submit", "watchdog_tick"])
+                       "ledger_dump", "ledger_job", "ledger_note",
+                       "ledger_snapshot", "ledger_submit", "watchdog_tick"])
 
 # ---------------------------------------------------------------------------
 print("\n== (4) off means inert, and says so ==")

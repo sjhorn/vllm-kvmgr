@@ -3455,6 +3455,123 @@ for _on in (0, 1):
 F.write(load_inflight_max=1, disk_load_failure_recompute=0)
 flags.reset_for_tests()
 
+# ---- C10 (ask8): every load copy names its place in the job, and the step --
+print("\n== (C10) round / rounds_planned / last, plan + job_end, step_tokens ==")
+import types as _ty10
+
+
+def _led_lines(job):
+    _p = os.path.join(os.environ["KVMGR_LEDGER_DIR"], "ledger-rx.jsonl")
+    out = []
+    for ln in open(_p):
+        try:
+            r = json.loads(ln)
+        except Exception:
+            continue
+        if r.get("job") == job:
+            out.append(r)
+    return out
+
+
+def _run_job(h, job, n, start, step_fn):
+    load_job(h, job, n, start, job)
+    for _ in range(20):
+        for f in h._readers.futs:
+            if not getattr(f, "_done", False):
+                f.finish()
+        if job in step_fn(h):
+            break
+
+
+def _empty_step(h):
+    scheduler_output = _ty10.SimpleNamespace(total_num_scheduled_tokens=0)  # noqa
+    return step(h)
+
+
+def _busy_step(h):
+    scheduler_output = _ty10.SimpleNamespace(total_num_scheduled_tokens=4096)  # noqa
+    return step(h)
+
+
+F.write(load_inflight_max=1, load_read_ahead=1, load_batch_max=33,
+        load_ops_max=0, diag_ledger_file=1)
+flags.reset_for_tests()
+h10 = mkloadhandler(80)
+_run_job(h10, 101, 66, 3000, _empty_step)
+_L = _led_lines(101)
+_plan = [r for r in _L if r["ev"] == "plan"]
+_subs = [r for r in _L if r["ev"] == "submit"]
+_end = [r for r in _L if r["ev"] == "job_end"]
+eq("one plan event", len(_plan), 1)
+eq("*** plan: job_blocks {'0': 66} ***", _plan[0]["job_blocks"], {"0": 66})
+eq("*** ...rounds_planned {'0': 2}, not 3 with an empty tail ***",
+   _plan[0]["rounds_planned"], {"0": 2})
+eq("...at the cap in force", _plan[0]["cap"], {"0": 33})
+eq("...ext_tokens unknown here (no gpu_block_size): None, not 0",
+   (_plan[0]["ext_tokens"], "ext_tokens_why" in _plan[0]), ({"0": None}, True))
+eq("*** two submits: round 1/2 then 2/2, last only on the second ***",
+   [(r["round"], r["rounds_planned"], r["blocks_left"], r["last"]) for r in _subs],
+   [(1, 2, 33, False), (2, 2, 0, True)])
+eq("*** a step with no forward pass is step_tokens 0 (class B) ***",
+   [r["step_tokens"] for r in _subs], [0, 0])
+eq("*** exactly one job_end ***", len(_end), 1)
+eq("job_end: ok, and both copies submitted",
+   (_end[0]["ok"], _end[0]["rounds_submitted"], _end[0]["rounds_read"])
+   if _end else None, (True, {"0": 2}, {"0": 2}))
+check("plan and job_end are not open entries (no submit/done pairing)",
+      not any(k[1] == "load" and k[2] == -1 for k in _LED.open_entries(
+          open(os.path.join(os.environ["KVMGR_LEDGER_DIR"],
+                            "ledger-rx.jsonl")).read().splitlines())))
+
+h10b = mkloadhandler(80)
+h10b._spec.gpu_block_size = (256, 64, 64, 4, 8)
+_run_job(h10b, 102, 67, 3200, _busy_step)
+_L = _led_lines(102)
+_plan = [r for r in _L if r["ev"] == "plan"][0]
+_subs = [r for r in _L if r["ev"] == "submit"]
+eq("67 blocks: rounds_planned 3, the last a 1-block tail",
+   [(r["round"], r["rounds_planned"], r["blocks_left"], r["last"]) for r in _subs],
+   [(1, 3, 34, False), (2, 3, 1, False), (3, 3, 0, True)])
+eq("ext_tokens = blocks x the group's block size; start from block_indices",
+   (_plan["ext_tokens"], _plan["ext_start_token"]), ({"0": 67 * 256}, {"0": 0}))
+eq("a step with a forward pass reports its tokens",
+   {r["step_tokens"] for r in _subs}, {4096})
+
+h10c = mkloadhandler(80)
+_run_job(h10c, 103, 10, 3400, step)          # no scheduler_output anywhere
+_subs = [r for r in _led_lines(103) if r["ev"] == "submit"]
+eq("*** no scheduler_output on the stack: step_tokens None, with a reason ***",
+   (_subs[0]["step_tokens"], _subs[0].get("step_tokens_why")),
+   (None, "no scheduler_output on the call stack"))
+
+# a cut-short job shows it: reads fail after the first round
+h10d = mkloadhandler(80)
+load_job(h10d, 104, 66, 3600, 104)
+h10d._readers.futs[0].finish()
+step(h10d)
+for f in h10d._readers.futs[1:]:
+    f.finish(fail=True)
+try:
+    step(h10d)
+except Exception:
+    pass
+_e = [r for r in _led_lines(104) if r["ev"] == "job_end"]
+eq("*** a failed job's job_end is ok=False with fewer copies than planned ***",
+   (_e[0]["ok"], _e[0]["rounds_submitted"]) if _e else None, (False, {"0": 1}))
+
+# ZERO-BLOCK COPIES CANNOT HAPPEN: the op budget never returns 0 for a
+# non-empty group, and an empty slot grant returns without submitting.
+eq("load_ops_budget is never 0 for a positive group",
+   min(diskio.load_ops_budget(REFS, g, 1, 1) for g in range(5)), 1)
+h10e = mkloadhandler(4)
+h10e._pool.take_upto(4)                       # starve the pool
+load_job(h10e, 105, 8, 3800, 105)
+eq("*** a starved pool starts no read and submits nothing (no 0-block copy) ***",
+   (len(h10e._readers.futs), len(h10e._inner.subs), h10e.stats["saturations"] > 0),
+   (0, 0, True))
+F.write(load_inflight_max=1, load_batch_max=192, load_ops_max=2048)
+flags.reset_for_tests()
+
 print(f"{PASS} passed, {len(FAIL)} failed")
 if FAIL:
     for f in FAIL:

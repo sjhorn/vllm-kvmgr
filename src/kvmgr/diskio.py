@@ -2655,10 +2655,47 @@ class DiskLoadHandler:
                               "failed": False, "t0": _now(),
                               # every group's destination blocks: what a
                               # failure reports as invalid (kvmgr.loadfail)
-                              "bids_all": block_ids}
+                              "bids_all": block_ids,
+                              # ask8: copies made per group so far (at read
+                              # start, and at GPU submit)
+                              "rounds": {}, "gpu_rounds": {}}
         self.stats["submitted"] += 1
+        self._ledger_job("plan", job_id, self._job_plan(batches, gpu_spec))
         self._pump()
         return True
+
+    def _job_plan(self, batches, gpu_spec) -> dict:
+        """ask8: what a job is meant to do, per group, as the ledger's `plan`.
+
+        `rounds_planned` is an ESTIMATE at acceptance: the per-copy cap is
+        min(load_batch_max, the op budget), both hot, and a round takes fewer
+        blocks when the staging pool cannot grant a full one. Each submit line
+        re-estimates it and carries the exact `blocks_left`. `ext_tokens` is
+        the worker's view of the external hit: blocks x the group's GPU block
+        size, from the load spec; None (with a reason) when the size is
+        unknown, never 0."""
+        bsz = getattr(self._spec, "gpu_block_size", None)
+        idx = list(getattr(gpu_spec, "block_indices", None) or ())
+        out = {"job_blocks": {}, "cap": {}, "rounds_planned": {},
+               "ext_tokens": {}, "ext_start_token": {}}
+        for g, _keys, bids in batches:
+            n, k = len(bids), str(g)
+            cap = min(_load_batch_max(),
+                      load_ops_budget(self._refs, g, n, _load_ops_max()))
+            out["job_blocks"][k] = n
+            out["cap"][k] = cap
+            out["rounds_planned"][k] = -(-n // cap) if cap else None
+            try:
+                bs = int(bsz[g])
+                out["ext_tokens"][k] = n * bs
+                out["ext_start_token"][k] = int(idx[g]) * bs if g < len(idx) else None
+            except Exception:
+                out["ext_tokens"][k] = out["ext_start_token"][k] = None
+                out["ext_tokens_why"] = "the spec has no gpu_block_size for the group"
+        return out
+
+    def _ledger_job(self, ev: str, job_id, data: dict) -> None:
+        hooks.call("ledger_job", self, ev, job_id, data)
 
     def _pump(self) -> None:
         for job_id, st in self._jobs.items():
@@ -2726,8 +2763,19 @@ class DiskLoadHandler:
                 n = len(slots)
                 # Stage 1 for a LOAD is the FILE READ, on the thread pool.
                 fut = self._readers.submit(self._read_batch, bkeys[:n], slots, g)
+                # ask8: this copy's place in its group. One batch per group,
+                # taken in FIFO order, so the read order is the submit order.
+                # `last` is exact (no blocks left), `rounds_planned`
+                # re-estimated with the cap in force now.
+                _r = st.setdefault("rounds", {})
+                _r[g] = _r.get(g, 0) + 1
+                _left = len(bids) - n
                 try:
                     fut._kvmgr_keys = bkeys[:n]     # for the ledger's `keys`
+                    fut._kvmgr_round = {
+                        "round": _r[g], "blocks_left": _left,
+                        "rounds_planned": _r[g] + (-(-_left // _cap) if _left else 0),
+                        "last": _left == 0}
                 except Exception:
                     pass
                 self._reading.append((job_id, fut, slots, bids[:n], g))
@@ -2883,6 +2931,7 @@ class DiskLoadHandler:
             self._next_inner += 1
             # Before the ledger line, so the line says whether it held.
             self._submit_keys = getattr(fut, "_kvmgr_keys", None)
+            self._submit_round = getattr(fut, "_kvmgr_round", None)
             self._wait_compute_last = self._arm_compute_wait()
             self._ledger_note("load", g, bids, slots)
             self._ledger_submit("load", inner, job_id, g, bids, slots)
@@ -2898,6 +2947,9 @@ class DiskLoadHandler:
                     st["pending"] -= 1
                 continue
             self._inner_to_job[inner] = (job_id, slots)
+            if st is not None:
+                _gr = st.setdefault("gpu_rounds", {})
+                _gr[g] = _gr.get(g, 0) + 1
             self.stats["blocks_to_gpu"] = (
                 self.stats.get("blocks_to_gpu", 0) + len(bids))
             self._blocks_this_step = (
@@ -2911,6 +2963,13 @@ class DiskLoadHandler:
                        if st["pending"] == 0 and (not st["batches"] or st["failed"])]:
             st = self._jobs.pop(job_id)
             ok = not st["failed"]
+            # ask8: a job cut short shows fewer copies than its plan
+            self._ledger_job("job_end", job_id, {
+                "ok": ok,
+                "recompute": (not ok) and loadfail.enabled(),
+                "rounds_read": {str(k): v for k, v in st.get("rounds", {}).items()},
+                "rounds_submitted": {str(k): v for k, v in
+                                     st.get("gpu_rounds", {}).items()}})
             if not ok and loadfail.enabled():
                 # *** REPORTED AS DONE, ITS BLOCKS AS INVALID. *** upstream
                 # asserts on success=False; the scheduler's invalid-block path

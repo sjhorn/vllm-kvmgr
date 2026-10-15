@@ -69,11 +69,11 @@ from disk.
 Into a vLLM image:
 
 ```sh
-pip install --no-deps vllm_kvmgr-0.4.8-py3-none-any.whl
+pip install --no-deps vllm_kvmgr-0.4.9-py3-none-any.whl
 ```
 
 The DSpark recipe does not pip install. It mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.4.8.dist-info` into site-packages instead. vLLM finds the
+`deploy/vllm_kvmgr-0.4.9.dist-info` into site-packages instead. vLLM finds the
 plugin through the entry point in that dist-info folder. The folder is made by
 a script:
 
@@ -388,10 +388,23 @@ Useful fields on a `submit` line:
 | `req`, `req_in_step` | (loads) the request this load is for, and whether it is in the current batch |
 | `wait_compute` | (loads) whether the copy waited for queued compute work (`load_wait_compute`). `null` means it could not be set up |
 | `keys` | the round's keys, as hex, when `diag_ledger_keys` is on. `null` with `keys_why` if the handler named none |
+| `round`, `rounds_planned`, `blocks_left`, `last` | (loads) this copy's number within its job for its group, how many copies the job should take now, the blocks still to go after it, and whether it is the last (`blocks_left == 0`). `rounds_planned` is an estimate that can grow if the staging pool hands out a short round; `last` is exact |
+| `step_tokens` | (loads) the submitting step's `total_num_scheduled_tokens`. 0 means a step with no forward pass. `null` with `step_tokens_why` if it could not be read |
 | `dst_span`, `dst_contig_runs` | (loads) highest minus lowest target block id, and how many unbroken runs they form |
 | `bids_sha` | (loads) a short id for the exact block set (sha1 of the `bids` ranges, 12 hex), to match the same copy across ranks |
 | `tensor_idx_set_hash`, `ref_tensors`, `ref_dup_tensors` | (loads) which KV tensors the group's layers use, and how many layers share a tensor with another |
 | `compute_stream`, `copy_stream` | (loads) the CUDA stream handles at submit. `null` with a `_why` if unreadable |
+
+Each load job also writes two lines of its own, with `inner` -1:
+
+- `plan`, when the job is accepted: `job_blocks` (blocks per group), `cap`
+  (blocks per copy at that moment), `rounds_planned`, and `ext_tokens` /
+  `ext_start_token` (the external hit per group: blocks times the group's
+  block size, and where it starts; `null` if the block size is unknown).
+- `job_end`, when it reports: `ok`, `recompute`, `rounds_read` and
+  `rounds_submitted` per group. A job cut short has fewer copies than planned.
+
+A copy never has zero blocks: an empty staging pool just waits.
 
 A `done` line is written when the plugin *notices* the transfer finished,
 which can be up to one scheduler step late. So `overlap` means "the plugin

@@ -542,6 +542,48 @@ def tensor_context(h, group: int) -> dict:
     return got
 
 
+def step_tokens() -> dict:
+    """ask8: the submitting step's total_num_scheduled_tokens. 0 = a step with
+    no forward pass (class B). Read off the call stack: the copy is submitted
+    inside upstream's get_finished, which runs inside the model runner's step,
+    whose frames hold `scheduler_output`. Absent -> None with a reason."""
+    import sys
+    f = sys._getframe(1)
+    try:
+        for _ in range(_RUNNER_DEPTH):
+            if f is None:
+                break
+            so = f.f_locals.get("scheduler_output")
+            if so is not None and hasattr(so, "total_num_scheduled_tokens"):
+                return {"step_tokens": int(so.total_num_scheduled_tokens)}
+            f = f.f_back
+    except Exception as e:
+        return {"step_tokens": None,
+                "step_tokens_why": ("unreadable: %r" % (e,))[:160]}
+    finally:
+        del f
+    return {"step_tokens": None,
+            "step_tokens_why": "no scheduler_output on the call stack"}
+
+
+def _round_fields(h) -> dict:
+    """ask8: round / rounds_planned / blocks_left / last for a load submit."""
+    r = getattr(h, "_submit_round", None)
+    if not isinstance(r, dict):
+        return {"round": None, "round_why": "the handler named no round"}
+    return {k: (bool(v) if k == "last" else int(v)) for k, v in r.items()}
+
+
+def job_event(h, ev: str, job, data: dict) -> None:
+    """`plan` when a load job is accepted, `job_end` when it reports. Never
+    raises. Not a submit or done, so open_entries ignores them."""
+    try:
+        with _LOCK:
+            _wal_write(h, record(ev, "load", -1, job=int(job), **data))
+    except Exception:
+        return
+
+
 def _keys_field(h) -> dict:
     """{"keys": [hex, ...]} for this submit, when diag_ledger_keys is on."""
     try:
@@ -700,6 +742,10 @@ def submit(h, kind: str, inner: int, job, group: int, bids, slots) -> None:
                 # (None = could not arm). Absent on stores.
                 **({"wait_compute": getattr(h, "_wait_compute_last", None)}
                    if kind == "load" else {}),
+                # ask8: the copy's place in its job, and whether the step
+                # that submitted it had a forward pass
+                **(dict(_round_fields(h), **step_tokens())
+                   if kind == "load" else {}),
                 # diag_ledger_keys: the round's keys, so a gate can see from
                 # THIS rank's own file which keys it loaded or stored
                 **_keys_field(h),
@@ -771,3 +817,4 @@ def install() -> None:
     hooks.register("ledger_dump", ledger_dump)
     hooks.register("ledger_submit", submit)
     hooks.register("ledger_done", done)
+    hooks.register("ledger_job", job_event)
