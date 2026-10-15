@@ -1466,6 +1466,89 @@ def read_chunks(path: str, plan: "Sequence[Chunk]", write_row: Any) -> int:
     return got
 
 
+class HostCopyHandler:
+    """The inner copy for KV tensors that are NOT on a CUDA/XPU device.
+
+    vLLM 0.31's `SingleDirectionOffloadingHandler` asserts
+    `gpu_tensor.is_cuda or gpu_tensor.is_xpu`, so on the CPU backend (the
+    local spike: a Linux container on a Mac) neither it nor any built-in tier
+    can run. This copies the same bytes with plain torch indexing: for each
+    group and each of its layer refs, `page_size_bytes` from the start of the
+    source row to the start of the destination row, block by block -- what
+    upstream's `_fill_direct_ops` describes at blocks_per_chunk == 1, which
+    both handlers assert.
+
+    The members our handlers and diagnostics use, and nothing else:
+    `transfer_async(job, src_spec, dst_spec)`, `get_finished()`, and
+    `_transfer_events` (whose events report done). There is no `_stream_pool`,
+    so `_arm_compute_wait` reports "could not arm" once: on the CPU backend
+    the forward pass and this copy run on the same thread, in order.
+    Synchronous: the copy is done when transfer_async returns, and reported
+    on the next get_finished, the same shape as an async copy observed one
+    step later."""
+
+    class _Done:
+        def query(self) -> bool:
+            return True
+
+        def synchronize(self) -> None:
+            return None
+
+    def __init__(self, gpu_tensors, cpu_tensors, layer_refs_per_group,
+                 gpu_to_cpu: bool):
+        assert len(gpu_tensors) == len(cpu_tensors) and gpu_tensors
+        self.gpu_tensors = gpu_tensors
+        self.cpu_tensors = cpu_tensors
+        self.layer_refs_per_group = layer_refs_per_group
+        self.gpu_to_cpu = gpu_to_cpu
+        self._transfer_events: dict = {}
+        self._finished: list = []
+
+    @staticmethod
+    def wanted(gpu_tensors) -> bool:
+        """True when upstream's handler would refuse these tensors."""
+        t = gpu_tensors[0]
+        return not (getattr(t, "is_cuda", False) or getattr(t, "is_xpu", False))
+
+    def transfer_async(self, job_id: int, src_spec, dst_spec) -> bool:
+        import time as _t
+
+        import numpy as np
+        import torch
+        from vllm.v1.kv_offload.base import TransferResult
+
+        t0 = _t.monotonic()
+        gpu_spec, cpu_spec = ((src_spec, dst_spec) if self.gpu_to_cpu
+                              else (dst_spec, src_spec))
+        gpu_ids = np.asarray(gpu_spec.block_ids, dtype=np.int64)
+        cpu_ids = np.asarray(cpu_spec.block_ids, dtype=np.int64)
+        nbytes, off = 0, 0
+        for g, n in enumerate(gpu_spec.group_sizes):
+            if not n:
+                continue
+            gi = torch.from_numpy(gpu_ids[off:off + n])
+            ci = torch.from_numpy(cpu_ids[off:off + n])
+            for ref in self.layer_refs_per_group[g]:
+                t, sz = int(ref.tensor_idx), int(ref.page_size_bytes)
+                if self.gpu_to_cpu:
+                    self.cpu_tensors[t][ci, :sz] = self.gpu_tensors[t][gi, :sz]
+                else:
+                    self.gpu_tensors[t][gi, :sz] = self.cpu_tensors[t][ci, :sz]
+                nbytes += n * sz
+            off += n
+        self._transfer_events[job_id] = self._Done()
+        self._finished.append(TransferResult(
+            job_id=job_id, success=True, transfer_size=nbytes,
+            transfer_time=_t.monotonic() - t0))
+        return True
+
+    def get_finished(self) -> list:
+        out, self._finished = self._finished, []
+        for r in out:
+            self._transfer_events.pop(r.job_id, None)
+        return out
+
+
 class DiskStoreHandler:
     """GPU -> pinned staging -> file, as one OffloadingHandler.
 
@@ -1509,12 +1592,20 @@ class DiskStoreHandler:
         self._gpu_tensors = gpu_tensors   # the load handler reuses these
         # vLLM 0.31: blocks_per_chunk / layer_refs_per_group, and the inner
         # handler now waits on the compute stream in BOTH directions.
-        self._inner = SingleDirectionOffloadingHandler(
-            gpu_tensors=gpu_tensors, cpu_tensors=self._staging,
-            blocks_per_chunk=spec.blocks_per_chunk,
-            layer_refs_per_group=self._refs, gpu_to_cpu=True,
-            host_memory_is_pinned=pin,
-        )
+        if HostCopyHandler.wanted(gpu_tensors):
+            # not a CUDA/XPU device: upstream's handler would assert
+            self._inner = HostCopyHandler(gpu_tensors, self._staging,
+                                          self._refs, gpu_to_cpu=True)
+            logger.info("kvmgr: KV tensors are on %s, not CUDA/XPU -- the "
+                        "store uses HostCopyHandler (plain torch copies)",
+                        gpu_tensors[0].device)
+        else:
+            self._inner = SingleDirectionOffloadingHandler(
+                gpu_tensors=gpu_tensors, cpu_tensors=self._staging,
+                blocks_per_chunk=spec.blocks_per_chunk,
+                layer_refs_per_group=self._refs, gpu_to_cpu=True,
+                host_memory_is_pinned=pin,
+            )
         # Batching per group is only trivial at factor 1 (block_indices enters
         # the inner arithmetic as `block_idx % factor`). Asserted rather than
         # assumed, because a silently wrong offset is the F8_E8M0 class.
@@ -2417,15 +2508,19 @@ class DiskLoadHandler:
         # Kept so _bounds() can find the row count without reaching through
         # the inner handler, whose attribute name is upstream's to change.
         self._gpu_tensors = getattr(store, "_gpu_tensors", None) or []
-        self._inner = SingleDirectionOffloadingHandler(
-            gpu_tensors=store._gpu_tensors,
-            # Our own rows, so no GPU stream ever writes this buffer.
-            cpu_tensors=self._staging,
-            blocks_per_chunk=spec.blocks_per_chunk,
-            layer_refs_per_group=self._refs,
-            gpu_to_cpu=False,
-            host_memory_is_pinned=pin,
-        )
+        if HostCopyHandler.wanted(store._gpu_tensors):
+            self._inner = HostCopyHandler(store._gpu_tensors, self._staging,
+                                          self._refs, gpu_to_cpu=False)
+        else:
+            self._inner = SingleDirectionOffloadingHandler(
+                gpu_tensors=store._gpu_tensors,
+                # Our own rows, so no GPU stream ever writes this buffer.
+                cpu_tensors=self._staging,
+                blocks_per_chunk=spec.blocks_per_chunk,
+                layer_refs_per_group=self._refs,
+                gpu_to_cpu=False,
+                host_memory_is_pinned=pin,
+            )
         # ask9: this handler's copy goes through load_copy_api. The proxy sits
         # in the handler module's `ops` global, but it is inert unless OUR
         # submit sets a mode on this thread, so stores keep upstream's call.
