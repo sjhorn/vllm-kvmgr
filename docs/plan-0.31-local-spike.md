@@ -1,4 +1,4 @@
-# Plan: kvmgr on vLLM 0.31, run end to end on this Mac (2026-10-15)
+# Plan: kvmgr on vLLM 0.31, run end to end in a Linux container on this Mac (2026-10-15)
 
 Branch `spike/vllm-0.31-local`, worktree `../vllm-kvmgr-031-local`, cut from
 `main` at v0.4.8 (`66d3b55`; rebased 2026-10-15). Local only: nothing is pushed to `head` or
@@ -9,9 +9,16 @@ checksums, /kv/keys), and the port has to carry those.
 
 ## What was checked before writing this (2026-10-15)
 
-- **Latest vLLM is still v0.31.0** (PyPI). Wheels are Linux only. On macOS the
-  docs say "build from source", which gives the CPU backend (FP32/FP16), and
-  "there are no pre-built Apple silicon CPU wheels" or images.
+- **Latest vLLM is still v0.31.0** (PyPI). The release also ships CPU wheels
+  for Linux arm64/x86_64 and (despite the docs) macOS arm64, and Docker Hub
+  has `vllm/vllm-openai-cpu:v0.31.0-arm64`.
+- **Decision (2026-10-15): a Linux arm64 container under Apple's `container`
+  tool**, not a native Mac build. It needs no build, it's the same OS as the
+  cluster, it keeps user xattrs (so the checksums can be tested), and it's the
+  CI-supported CPU path. Apple `container` 1.5.0 (Homebrew) runs each
+  container in its own lightweight VM on macOS 26+. Fallbacks, with the same
+  image and mounts: OrbStack or Colima; the native macOS wheel as a last
+  resort.
 - **This machine:** Apple M5 Pro, 48 GB, macOS 27.0.1, Xcode with Apple Clang
   21, Python 3.12, uv. The Docker CLI is installed but no daemon is running.
 - **Every built-in offload path in 0.31 is CUDA-only.** The OffloadingConnector's
@@ -26,8 +33,14 @@ checksums, /kv/keys), and the port has to carry those.
 - **0.31's load copy already waits on compute** (`gpu_worker.py:690-696`), so
   `load_wait_compute` / `_arm_compute_wait` become redundant there. Keep the
   knob and verify it, rather than delete it in the port.
-- macOS Python has no `os.setxattr`, so the checksum tags read as absent here.
-  Testing checksums needs Linux (Docker later, or the cluster).
+- macOS Python has no `os.setxattr`. Inside the Linux container it works,
+  but only on a container-local volume: keep the tier root off the macOS
+  bind mount.
+- **0.31's copy handler is reached through `current_platform`**
+  (`current_platform.Stream()`, `.current_stream()`), not `torch.cuda`
+  directly, so the CPU backend may get further than "CUDA-only" suggests. The
+  copy op itself (`swap_blocks_batch`) is still the question. Phase 2 finds
+  out.
 
 ## What a local run can and cannot tell us
 
@@ -49,30 +62,44 @@ Those stay with a cluster validation boot, which this spike sizes but doesn't do
 
 ## Phases (time-boxed; stop at the first wall worth reporting)
 
-**0. Re-port onto this branch (offline, ~half a day).**
-- Re-vendor `tests/upstream/` from v0.31.0. The old spike has the file list
-  and MANIFEST.
-- Re-apply `620c3a8`'s port onto v0.4.7. It touched `diskspec.py` (the spec
-  constructor, `get_worker()` and `DiskOffloadingWorker`, `LookupResult`,
-  `on_new_request`, `Medium` events), `diskio.py` (the new handler signature,
-  `TransferResult` from `base`), `register.py` (GPU manager gated off) and
-  the harness.
-- Then port the v0.4.2+ additions:
-  - `loadfail`'s scheduler and connector hooks against 0.31's shapes, the
-    phase15 pins included;
-  - `reqkeys` against 0.31's `request_finished` / `RequestGroupState`;
-  - `_arm_compute_wait` against 0.31's `transfer_async(job, src, dst)`.
-- Gate: `MODES=pristine` green, except the GPU-manager suites, which are
-  expected red as before. DSpark mode doesn't apply on this branch, because
-  its patches target 0.21.
+**0. Re-port onto this branch: DONE (`63d9304`, 2026-10-15).**
+- `620c3a8` replayed onto v0.4.8 with one conflict (the load's
+  `TransferResult`).
+- Then the v0.4.2+ work against 0.31:
+  - selftest is on the new `transfer_async(job, src, dst)`;
+  - reqkeys captures before AND after `request_finished`, because 0.31 keeps
+    the state and appends the final key there, and reads the per-chunk field
+    names;
+  - loadfail is unchanged: 0.31 still asserts, and still unpacks one group;
+  - `_arm_compute_wait` is now a second, harmless wait.
+- Pristine gate: the disk, journal, verify, ledger, copyprobe, loadfail and
+  reqkeys suites are green.
+- phase1/2/3/4/6/10/11 stop at `harness.load()` on the GPU-manager core,
+  which has no hook on 0.31. phase6 (reload audit) and phase11 (diag install)
+  are collateral and worth decoupling from the GPU manager later.
+- **Known gaps carried forward:**
+  - `diag/copyprobe.describe_copy` still mirrors 0.21's copy arithmetic;
+  - `diag/tiering` wraps upstream internals that 0.31 made private.
 
-**1. Build vLLM 0.31.0 on macOS (~1–2 h, mostly compile).**
-- Steps: `uv venv --python 3.12` in a scratch dir, clone the v0.31.0 tag,
-  `uv pip install -r requirements/cpu.txt`, `uv pip install -e .`
-  (`VLLM_TARGET_DEVICE=cpu` is automatic).
-- Smoke test: serve `Qwen/Qwen3-0.6B` (FP16, one KV group, ungated), one
-  completion, `--enable-prefix-caching`.
-- Wall to report if it fails: the build or the CPU backend on macOS 27.
+  Both are diagnostics and both are off the critical path.
+
+**1. Run vLLM 0.31.0 in an Apple `container` (~1 h).**
+- Install: `brew install container && container system start` (the user's
+  step; it adds a system service).
+- Image: `vllm/vllm-openai-cpu:v0.31.0-arm64`.
+- One scripted `container run`, kept in `scripts/local031.sh` on this branch:
+  - `--memory 16G --cpus 8`, port 8000 for the API and the
+    `kvmgr_stats_port` published;
+  - mounts: this worktree's `src/kvmgr` and its generated dist-info (the
+    same shape as DSpark's compose), the flags file, and the HF cache
+    read-only;
+  - the tier root on a container volume, not the macOS bind mount, so
+    xattrs work.
+- Smoke test: serve `Qwen/Qwen3-0.6B` (one KV group, ungated) with
+  `--enable-prefix-caching`, one completion, and the `kvmgr: registered`
+  lines in the log.
+- Walls to report: the image doesn't start under `container`, or the plugin
+  doesn't load from the mount.
 
 **2. A host-copy handler (the one new piece of code, ~half a day).**
 - When the platform isn't CUDA-like, `DiskStoreHandler` and `DiskLoadHandler`
@@ -89,7 +116,9 @@ Those stay with a cluster validation boot, which this spike sizes but doesn't do
 
 **3. End to end, one group (Qwen3-0.6B).**
 - Setup: `KV_TRANSFER_CONFIG` names `DSparkDiskOffloadingSpec`, the tier root
-  is `~/kvlocal`, a local flags file, and `kvmgr_stats_port` is set.
+  is on the container volume, a local flags file, and `kvmgr_stats_port` is
+  set. Turn `disk_checksum_write` on from the first prime, so the
+  restore-time check can run here.
 - The cycle, with `/kv/keys` showing the files and `/kv/workers` the counters:
   1. Prime a ~4K-token exact-echo canary (the same design as vllm-proxy
      `ask1.md`).
