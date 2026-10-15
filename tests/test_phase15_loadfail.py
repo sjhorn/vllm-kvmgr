@@ -180,6 +180,80 @@ eq("*** a failed load's blocks are reported, with upstream's ***",
 eq("...once: the report drains them", c.get_block_ids_with_load_errors(), {99})
 eq("counted", (LF.STATS["noted_jobs"], LF.STATS["drained_blocks"]), (2, 3))
 
+print("\n== (15d2) 0.31: a failed load is reported by REQUEST, never by block ==")
+_hib = next(n for n in ast.walk(ast.parse(_src))
+            if isinstance(n, ast.FunctionDef) and n.name == "_handle_invalid_blocks")
+check("UPSTREAM'S SHAPE: _handle_invalid_blocks raises on >1 group before our "
+      "multi-group fix is reached (found on the spike, Gemma 3)",
+      "if len(self.kv_cache_config.kv_cache_groups) > 1:"
+      in ast.get_source_segment(_src, _hib)
+      and "raise RuntimeError" in ast.get_source_segment(_src, _hib))
+_hfr = next(n for n in ast.walk(ast.parse(_src))
+            if isinstance(n, ast.FunctionDef) and n.name == "_handle_failed_recving")
+check("...and _handle_failed_recving restarts the request from token 0",
+      "request.num_computed_tokens = 0" in ast.get_source_segment(_src, _hfr))
+
+
+class _Results:
+    def __init__(self, fin):
+        self.finished_sending, self.finished_recving = set(), set(fin)
+        self.failed_recving = set()
+
+
+class OffloadingConnector31:
+    def __init__(self):
+        self.connector_worker = types.SimpleNamespace(_load_jobs={3: "r3", 4: "r4"})
+        self.finish = set()
+
+    def get_block_ids_with_load_errors(self):
+        return set()
+
+    def get_transfer_results(self, finished_req_ids):
+        # upstream pops a finished job's mapping, and the handler's
+        # get_finished (inside this call) is where the failure is noted
+        w = self.connector_worker
+        for jid in [j for j, r in w._load_jobs.items() if r in self.finish]:
+            if jid == 3:
+                LF.note_failed([10, 11, 12], job_id=3)
+            del w._load_jobs[jid]
+        return _Results(self.finish)
+
+
+_cm.OffloadingConnector = OffloadingConnector31
+LF._install_connector()
+LF._install_connector()
+c31 = OffloadingConnector31()
+c31.finish = {"r4"}
+r = c31.get_transfer_results(set())
+eq("a good load finishing: no failures", (r.finished_recving, r.failed_recving),
+   ({"r4"}, set()))
+c31.finish = {"r3"}
+r = c31.get_transfer_results(set())
+eq("*** a failed job's request is in failed_recving, in the same result that "
+   "finishes it ***", (r.finished_recving, r.failed_recving), ({"r3"}, {"r3"}))
+eq("*** ...and NO block ids: they raise on a multi-group model ***",
+   c31.get_block_ids_with_load_errors(), set())
+eq("...reported once", LF.snapshot()["pending_jobs"], 0)
+check("request-level mode is on", LF.snapshot()["request_level"])
+
+_sm.Scheduler._handle_failed_recving = (
+    lambda self, ids: (setattr(self, "_seen", set(ids)), set())[1])
+del _sm.Scheduler._update_requests_with_invalid_blocks._kvmgr_wrapped
+LF._install_scheduler()
+check("the scheduler's failed_recving handler is wrapped",
+      getattr(_sm.Scheduler._handle_failed_recving, "_kvmgr_wrapped", False))
+_forgot.clear()
+harness.clear_log()
+S = _sm.Scheduler(FIVE, 5)
+eq("upstream's handler runs and its answer is passed through",
+   (S._handle_failed_recving({"a"}), S._seen), (set(), {"a"}))
+eq("*** the failed request's LOAD keys leave the index ***", _forgot, [{_KA, _KB}])
+check("...and it is logged", "request-level" in harness.log_text())
+_dsrc = open(os.path.join(REPO, "src", "kvmgr", "diskio.py")).read()
+check("the load handler names the job when it notes a failure",
+      'loadfail.note_failed(st.get("bids_all") or (), job_id=job_id)' in _dsrc)
+LF._REQUEST_LEVEL[0] = False
+
 print("\n== (15e) the presence manager drops a failed load's keys, journalled ==")
 
 

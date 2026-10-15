@@ -42,6 +42,17 @@ THREE PIECES, all off unless `disk_load_failure_recompute` is set:
      bad file, so the next store rewrites it: the same self-heal as boot
      verification.
 
+*** vLLM 0.31: REQUEST-LEVEL, NOT BLOCK-LEVEL. *** 0.31's `_handle_invalid_blocks`
+raises RuntimeError on any model with more than one KV group ("Connectors must
+report failed requests via KVConnectorTransferResults.failed_recving instead")
+before `_update_requests_with_invalid_blocks` -- piece 2 -- is reached. Found on
+the local spike with Gemma 3 (six groups): the corrupted restore was caught,
+reported as invalid blocks, and the engine core died on that raise. So where
+the connector has `get_transfer_results` (0.31), a failed job's REQUEST id goes
+into `failed_recving` in the same result that lists it as finished, no block
+ids are reported, and `_handle_failed_recving` (which restarts the request from
+token 0, piece 2's semantics) is where piece 3 forgets the keys.
+
 The aggregation across TP ranks (one rank fails, the other does not) is
 upstream's: `KVOutputAggregator` unions `invalid_block_ids` over workers (read in
 0.31's `kv_connector/utils.py`; 0.21's is not vendored here -- the cluster's
@@ -60,12 +71,16 @@ logger = init_logger("vllm." + __name__)
 
 # Worker process: GPU block ids of failed loads, until the connector drains them.
 _ERRORS: set = set()
+# 0.31: failed load job ids (-> their block count), until the connector maps
+# them to a request in get_transfer_results.
+_FAILED_JOBS: dict = {}
+_REQUEST_LEVEL = [False]
 _LOCK = threading.Lock()
 # Counters, plain ints (they reach /kv through msgpack).
 STATS = {"installed_connector": False, "installed_scheduler": False,
          "noted_jobs": 0, "noted_blocks": 0, "drained_blocks": 0,
          "hma_requests": 0, "hma_tokens": 0, "forgot_keys": 0,
-         "forget_errors": 0}
+         "forget_errors": 0, "failed_requests": 0, "failed_recving_reqs": 0}
 
 
 def enabled() -> bool:
@@ -75,13 +90,31 @@ def enabled() -> bool:
         return False
 
 
-def note_failed(block_ids) -> None:
+def note_failed(block_ids, job_id=None) -> None:
     """A load job failed: its destination blocks hold nothing trustworthy."""
     ids = {int(b) for b in block_ids}
     with _LOCK:
-        _ERRORS.update(ids)
+        if _REQUEST_LEVEL[0] and job_id is not None:
+            _FAILED_JOBS[int(job_id)] = len(ids)
+        else:
+            _ERRORS.update(ids)
         STATS["noted_jobs"] += 1
         STATS["noted_blocks"] += len(ids)
+
+
+def take_failed_requests(load_jobs: dict, finished_recving) -> set:
+    """0.31: the requests whose failed load job is finishing in this result.
+    `load_jobs` is the worker's job -> request map from BEFORE upstream's
+    get_finished popped it. A failed job not finishing here stays noted."""
+    out = set()
+    with _LOCK:
+        for jid in list(_FAILED_JOBS):
+            rid = load_jobs.get(jid)
+            if rid is not None and rid in finished_recving:
+                out.add(rid)
+                del _FAILED_JOBS[jid]
+        STATS["failed_recving_reqs"] += len(out)
+    return out
 
 
 def drain() -> set:
@@ -183,9 +216,33 @@ def _install_scheduler() -> None:
 
     _update_requests_with_invalid_blocks._kvmgr_wrapped = True
     cls._update_requests_with_invalid_blocks = _update_requests_with_invalid_blocks
+    _install_failed_recving(cls)
     STATS["installed_scheduler"] = True
     logger.info("kvmgr: Scheduler invalid-block handling made multi-group safe "
                 "(sparkcache 031 semantics) -- only reached when a load fails")
+
+
+def _install_failed_recving(cls) -> None:
+    """0.31: piece 3 for request-level failures. Upstream's handler already
+    restarts the request from token 0 (with kv_load_failure_policy=recompute)."""
+    orig = getattr(cls, "_handle_failed_recving", None)
+    if orig is None or getattr(orig, "_kvmgr_wrapped", False):
+        return
+
+    def _handle_failed_recving(self, failed_req_ids):
+        failed = set(failed_req_ids)
+        out = orig(self, failed_req_ids)
+        if failed:
+            STATS["failed_requests"] += len(failed)
+            logger.warning(
+                "kvmgr: %d request(s) had a KV load fail (request-level, "
+                "failed_recving); upstream restarts them from token 0. Their "
+                "disk keys leave the index.", len(failed))
+            forget_failed_loads(self, failed)
+        return out
+
+    _handle_failed_recving._kvmgr_wrapped = True
+    cls._handle_failed_recving = _handle_failed_recving
 
 
 # -- 1. the connector's report ----------------------------------------------
@@ -219,7 +276,30 @@ def _install_connector() -> None:
 
     get_block_ids_with_load_errors._kvmgr_wrapped = True
     cls.get_block_ids_with_load_errors = get_block_ids_with_load_errors
+    _install_transfer_results(cls)
     STATS["installed_connector"] = True
+
+
+def _install_transfer_results(cls) -> None:
+    """0.31: report a failed load by request (`failed_recving`), never by
+    block -- block ids raise on a multi-group model there."""
+    orig = getattr(cls, "get_transfer_results", None)
+    if orig is None or getattr(orig, "_kvmgr_wrapped", False):
+        return
+
+    def get_transfer_results(self, finished_req_ids):
+        w = getattr(self, "connector_worker", None)
+        jobs = dict(getattr(w, "_load_jobs", None) or {})
+        res = orig(self, finished_req_ids)
+        if _FAILED_JOBS:
+            failed = take_failed_requests(jobs, res.finished_recving)
+            if failed:
+                res.failed_recving = set(res.failed_recving or ()) | failed
+        return res
+
+    get_transfer_results._kvmgr_wrapped = True
+    cls.get_transfer_results = get_transfer_results
+    _REQUEST_LEVEL[0] = True
 
 
 def install() -> None:
@@ -234,4 +314,6 @@ def install() -> None:
 
 def snapshot() -> dict:
     with _LOCK:
-        return dict(STATS, enabled=enabled(), pending_blocks=len(_ERRORS))
+        return dict(STATS, enabled=enabled(), pending_blocks=len(_ERRORS),
+                    pending_jobs=len(_FAILED_JOBS),
+                    request_level=_REQUEST_LEVEL[0])

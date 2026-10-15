@@ -3096,7 +3096,7 @@ class DiskLoadHandler:
                 # *** REPORTED AS DONE, ITS BLOCKS AS INVALID. *** upstream
                 # asserts on success=False; the scheduler's invalid-block path
                 # rolls the request back and recomputes instead.
-                loadfail.note_failed(st.get("bids_all") or ())
+                loadfail.note_failed(st.get("bids_all") or (), job_id=job_id)
                 self.stats["failed_recompute"] = (
                     self.stats.get("failed_recompute", 0) + 1)
                 logger.warning(
