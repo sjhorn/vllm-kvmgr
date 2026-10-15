@@ -166,6 +166,15 @@ torch 2.13 CPU, Python 3.12), Qwen3-0.6B (one KV group, 128-token blocks,
 | checksum verify on | 37/37 matched at restore; +0.04 s |
 | Gate B rehearsal (flip 1 byte in block 18, POLICY=recompute) | checksum caught it; file unlinked; job's 37 blocks reported invalid; vLLM "Recovered from KV load failure"; 37 keys left the index (journalled); engine up; identical reply in 19.06 s (a full recompute) |
 | self-heal | **on the NEXT request with that prefix**: 36 stores skipped (file present), 1 rewritten, with the original CRC; index back to 37/38 |
+| **phase 4**: Gemma 3 270M (`unsloth/gemma-3-270m-it`, the ungated mirror) | 0.31 makes **six** KV groups of 3 layers (five sliding-window, one full); 128-token blocks |
+| prime, 5,014 tokens | 4.0 s; **59 files**: the full group stores all 39 blocks, each sliding group only its last 4 (window 512): upstream's tail pruning, through our spec |
+| restart + restore | 59/59 blocks restored, 59/59 CRC ok, **0.28 s against 4.0 s**, identical reply |
+| **fourth wall**: Gate B on six groups | the checksum caught it, but **the engine core died**: 0.31's `_handle_invalid_blocks` raises on more than one group before our multi-group fix is reached ("report failed requests via `failed_recving` instead") |
+| fix (`b43a455`) | on 0.31 a failed load is reported by REQUEST (`failed_recving`), never by block; `_handle_failed_recving` restarts it from token 0 and is where the keys leave the index |
+| Gate B rerun, group 2 block 36 | checksum caught; engine up; identical reply after a 3.93 s recompute; all 59 keys left the index; next request restored the index; reboot restores 59/59 with CRC ok |
+| **phase 5**: TP=2 on one host (Qwen3-0.6B, `CPUBIND="0-3\|4-7"`) | both ranks write their half page (7.3 of 14.7 MB): 37 files each in `_r0` and `_r1`; boot walk across both ranks |
+| restart + restore, TP=2 | 37 blocks per rank, CRC ok, 1.77 s against 16.6 s, identical reply (and identical to TP=1's) |
+| Gate B, **rank 1 only** (block 18) | rank 1's checksum failed while rank 0's 18 reads were fine; the failure reached the scheduler through upstream's cross-rank aggregation; recompute 16.8 s, engine up, identical; heal on the next request; reboot restores 37/37 per rank |
 
 Notes for the real port and for the vllm-proxy gates:
 - The rewrite is not in the same request: the connector marks loaded blocks
@@ -179,8 +188,70 @@ Notes for the real port and for the vllm-proxy gates:
 - Our compute wait on a CPU backend reports "could not arm" once (no stream
   pool), which is correct there.
 
-Phases still open: 4 (a two-group model: Gemma 3 270M needs an HF token),
-5 (TP=2 on one host, optional), 6 (report and main plan update).
+Notes from phases 4 and 5:
+- **The 0.31 port needs request-level failure reporting** (above). A
+  block-level report is fatal on any multi-group model there, and DeepSeek V4
+  has five groups. The 0.21 path (invalid blocks, our multi-group scheduler
+  fix) stays: 0.21 has no such raise and no `get_transfer_results`.
+- On 0.31 a failure restarts the whole request (upstream's
+  `_handle_failed_recving`), single group or not. That is the same as our 0.21
+  multi-group semantics, and the cost of a corrupt file is one cold prefill.
+- The cross-rank case works through upstream's `KVOutputAggregator`. A request
+  is failed when any rank reports it, and only once every rank has finished
+  it. This is the one the cluster's Gate B has to prove on 0.21.
+- **The presence index is not per model.** `presence.json` sits at the format
+  root, and the index is keyed by block hash. Changing the model (or TP, which
+  changes the fingerprint directory) makes the boot walk drop the other
+  directory's keys, and those files are then invisible to the index. The same
+  is true on `main`. It's harmless with one model, but worth a look at what
+  budget/LRU eviction does with the old directory's files after a fingerprint
+  change. Not measured here.
+- vLLM's CPU backend needs threads bound by hand for TP=2 on one NUMA node
+  (`VLLM_CPU_OMP_THREADS_BIND`, the script's `CPUBIND`).
+
+All phases are done. Report below.
+
+## Report (2026-10-15)
+
+**What ran:** kvmgr's disk tier, on vLLM 0.31.0, end to end in a real engine.
+- one group (Qwen3-0.6B), six groups (Gemma 3 270M) and TP=2;
+- prime, restart, journal replay, boot walk and restore, with checksums;
+- Gate B (a flipped byte) on each, including a failure on rank 1 only.
+
+Every restore gave the identical reply. Every corruption became a recompute
+with the engine up, and the tier healed itself.
+
+**Walls, in order:**
+1. `/dev/shm` size, a container flag.
+2. 0.31's copy handler is CUDA/XPU only: `HostCopyHandler`.
+3. The stats port started only from the GPU manager.
+4. 0.31 raises on block-level load failures with more than one KV group.
+
+Only 4 matters for the cluster port.
+
+**Lines changed in `src/`, from v0.4.9:** +393/−186 over six files.
+- **The API port (phase 0, `373ebe6`):** `diskspec.py` and `register.py`, the
+  0.31 field names in `diag/reqkeys.py`, and the new `transfer_async`
+  signature in `diag/selftest.py`.
+- **Phases 1–5:** +210/−20 in three files:
+  - `diskio.py`: the host copy, and the job id on a failure;
+  - `diskspec.py`: starting the stats port;
+  - `loadfail.py`: request-level reporting, +90.
+
+**What this spike cannot say:**
+- the CUDA copy path and stream ordering (the Xid class);
+- DeepSeek V4 / MLA / NVFP4 on 0.31, and the DSpark patches;
+- two nodes, and throughput.
+
+**Revised effort for the real port:**
+- disk tier: 1–2 days to bring this branch to a mergeable state, plus a
+  validation boot. Lower than the first estimate, because the integration
+  questions are answered;
+- GPU manager: drop it (item 3 of the main plan decides);
+- DSpark patches: 1–3 weeks, unchanged and still the real cost.
+
+The recommendation below is unchanged: phase 4's wall is one more piece of
+safety the built-in tiers would not have given us.
 
 ## Recommendation: keep our own spec, don't move to the built-in tiers
 

@@ -21,6 +21,8 @@ NAME="${NAME:-kvmgr031}"
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 VOL="${VOL:-kvlocal}"
 DIST="$(ls -d "$W"/deploy/vllm_kvmgr-*.dist-info | head -1)"
+# TP=2: EXTRA="--tensor-parallel-size 2" CPUBIND="0-3|4-7" (one NUMA node
+# here, so vLLM's CPU backend needs each worker's threads bound by hand).
 # POLICY=recompute adds vLLM's kv_load_failure_policy (default "fail").
 KVPOL=""
 [ -n "${POLICY:-}" ] && KVPOL="\"kv_load_failure_policy\":\"$POLICY\","
@@ -46,6 +48,7 @@ case "${1:-up}" in
       -e VLLM_KV_FLAGS_FILE=/etc/vllm-kv-flags/flags.json \
       -e VLLM_CPU_KVCACHE_SPACE="${KVSPACE:-4}" \
       ${HF_TOKEN:+-e HF_TOKEN="$HF_TOKEN"} \
+      ${CPUBIND:+-e VLLM_CPU_OMP_THREADS_BIND="$CPUBIND"} \
       "$IMAGE" \
       "$MODEL" --host 0.0.0.0 --port 8000 \
       --max-model-len "${MAXLEN:-8192}" --enable-prefix-caching \
