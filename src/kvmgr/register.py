@@ -123,8 +123,14 @@ def register() -> None:
 def _register_gpu_manager() -> bool:
     """Register DSparkMLAAttentionManager for MLAAttentionSpec. False when
     this vLLM has no hook for it."""
-    from vllm.v1.core import single_type_kv_cache_manager as stm
-    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    try:
+        from vllm.v1.core import single_type_kv_cache_manager as stm
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    except ImportError as exc:
+        logger.warning("kvmgr: no single_type_kv_cache_manager/MLAAttentionSpec "
+                       "to hook (%s); the GPU KV manager is NOT registered. The "
+                       "disk tier still loads.", exc)
+        return False
 
     # vLLM 0.31 removed spec_manager_map, MLAAttentionManager and all prompt
     # block protection; spec->manager now goes through KVCacheSpecRegistry.
