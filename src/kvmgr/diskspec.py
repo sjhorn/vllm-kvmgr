@@ -166,6 +166,23 @@ def model_dir(model: str, revision: "str | None" = None,
     return snap if _os.path.isdir(snap) else None
 
 
+def fingerprint_dtype(d) -> str:
+    """The cache dtype as the tier's fingerprint names it. PURE.
+
+    *** vLLM 0.31 FORKS THIS FIELD BETWEEN THE TWO PROCESSES. *** DeepSeek V4's
+    attention (models/deepseek_v4/attention.py, _resolve_dsv4_kv_cache_dtype)
+    rewrites cache_config.cache_dtype from `fp8` to `fp8_ds_mla` while it
+    initialises -- in the WORKERS only. The engine core keeps the CLI's `fp8`.
+    Measured on GB10, 2026-10-16: the worker wrote under ..._e73ad090c60d,
+    the engine core looked under ..._8e81dab33659 (the 2026-10-07 fork again,
+    another field). So `fp8_ds_mla` is named `fp8` here, in both. Every other
+    dtype (nvfp4_ds_mla above all) stays distinct, so bytes of one format are
+    never restored as another.
+    """
+    d = str(d).replace("torch.", "")
+    return "fp8" if d == "fp8_ds_mla" else d
+
+
 def model_content_id(d: "str | None", _hash=None) -> str:
     """A 12-hex identity for the model's KV-RELEVANT CONTENT, or `unknown`.
 
@@ -3536,7 +3553,7 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
                 pcp_size=parallel.pcp_size,
                 dcp_size=parallel.dcp_size,
                 rank=parallel.rank,
-                dtype=cfg.model.dtype,
+                dtype=fingerprint_dtype(cfg.model.dtype),
                 kv_cache_groups=[
                     {
                         "tokens_per_block": group.tokens_per_block,

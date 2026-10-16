@@ -128,6 +128,12 @@ for label, kw in (("model", {"model": "other/model"}), ("dtype", {"dtype": "fp8"
     check(f"a changed {label} refuses the old bytes",
           mapper_for(**kw).base_path != worker.base_path)
 
+print("\n--- the dtype fork (0.31 rewrites fp8 -> fp8_ds_mla in the WORKERS only) ---")
+eq("*** worker fp8_ds_mla and engine core fp8 share ONE base ***",
+   mapper_for(dtype="fp8_ds_mla").base_path, mapper_for(dtype="fp8").base_path)
+check("...and nvfp4_ds_mla is still a different tier from fp8",
+      mapper_for(dtype="nvfp4_ds_mla").base_path != mapper_for(dtype="fp8").base_path)
+
 print("\n--- upstream drift: a new field must fail LOUDLY, not be dropped ---")
 probe = FileMapper(
     root_dir="/x", model_name="m", tokens_per_hash=4, blocks_per_file=1,
