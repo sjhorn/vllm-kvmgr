@@ -155,8 +155,13 @@ the engine:
   Only restores are affected: saves keep upstream's call. The stream, events,
   completion and `wait_compute` don't change. Each load's ledger line says
   which path it took (`copy_api`, `copy_calls`), and `/kv/workers` shows
-  `copy_api`, `copy_chunk` and the `copy_calls_*` counters. It stays `batch`
-  until the vllm-proxy session has run `kvrace` on each mode.
+  `copy_api`, `copy_chunk` and the `copy_calls_*` counters.
+
+  **`loop` fixed it (2026-10-16):** 1,503 restores of the faulting shape in
+  the reproducer, then 15 hours of production, with no Xid and no measurable
+  restore cost. The cluster boots with `loop` from DSpark's
+  `flags.reference.json`; the code default is still `batch`. Don't use
+  `chunk`: production faulted once on a 992-descriptor batch.
 - **`load_poll_ms` is ignored (removed in v0.4.8).** v0.4.4 added a thread
   that started restore copies between scheduler steps. On the cluster it
   brought the Xid 32 fault back within 27 restores, so it is gone: restore
