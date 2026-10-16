@@ -2,10 +2,12 @@
 # kvmgr on vLLM 0.31 in a Linux arm64 container (Apple `container`), CPU only.
 # Spike branch spike/vllm-0.31-local. Never touches the cluster.
 #
-#   scripts/local031.sh up      start the engine (detached)
+#   scripts/local031.sh up      start the container service if needed, then the engine
 #   scripts/local031.sh logs    follow its log
-#   scripts/local031.sh down    stop and remove it (the tier volume survives)
+#   scripts/local031.sh down    stop and remove it, then STOP the container service
+#                               (its VM and apiserver), so nothing runs while unused
 #   scripts/local031.sh wipe    also delete the tier volume
+#   scripts/local031.sh status  what is running
 #
 # Layout inside the container, the same shape as DSpark's compose:
 #   /opt/kvmgr/kvmgr                       <- this worktree's src/kvmgr (ro)
@@ -28,8 +30,12 @@ KVPOL=""
 [ -n "${POLICY:-}" ] && KVPOL="\"kv_load_failure_policy\":\"$POLICY\","
 KVCFG="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",${KVPOL}\"kv_connector_extra_config\":{\"spec_name\":\"DSparkDiskOffloadingSpec\",\"staging_blocks\":64,\"staging_load_blocks\":64,\"write_threads\":4,\"root_dir\":\"/kvoffload\"}}"
 
+svc_up() { container system status >/dev/null 2>&1 || container system start >/dev/null; }
+svc_down() { container system stop >/dev/null 2>&1 || true; }
+
 case "${1:-up}" in
   up)
+    svc_up
     container volume inspect "$VOL" >/dev/null 2>&1 || container volume create "$VOL" >/dev/null
     mkdir -p "$HOME/.cache/huggingface"
     container delete "$NAME" >/dev/null 2>&1 || true   # a stopped leftover
@@ -56,7 +62,17 @@ case "${1:-up}" in
     echo "started $NAME: logs with '$0 logs'; API :8000, kvmgr stats :8899"
     ;;
   logs) container logs -f "$NAME" ;;
-  down) container stop "$NAME" 2>/dev/null || true; container delete "$NAME" ;;
-  wipe) "$0" down 2>/dev/null || true; container volume delete "$VOL" ;;
-  *) echo "usage: $0 up|logs|down|wipe" >&2; exit 2 ;;
+  down) if container system status >/dev/null 2>&1; then
+          container stop "$NAME" 2>/dev/null || true
+          container delete "$NAME" 2>/dev/null || true
+        fi
+        svc_down; echo "stopped $NAME and the container service" ;;
+  # the volume lives in the service, so it is started for the delete
+  wipe) svc_up; container stop "$NAME" 2>/dev/null || true
+        container delete "$NAME" 2>/dev/null || true
+        container volume delete "$VOL"; svc_down ;;
+  status) if container system status >/dev/null 2>&1; then
+            echo "container service: RUNNING"; container ls -a
+          else echo "container service: stopped (nothing running)"; fi ;;
+  *) echo "usage: $0 up|logs|down|wipe|status" >&2; exit 2 ;;
 esac
