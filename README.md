@@ -69,11 +69,11 @@ from disk.
 Into a vLLM image:
 
 ```sh
-pip install --no-deps vllm_kvmgr-0.4.10-py3-none-any.whl
+pip install --no-deps vllm_kvmgr-0.4.11-py3-none-any.whl
 ```
 
 The DSpark recipe does not pip install. It mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.4.10.dist-info` into site-packages instead. vLLM finds the
+`deploy/vllm_kvmgr-0.4.11.dist-info` into site-packages instead. vLLM finds the
 plugin through the entry point in that dist-info folder. The folder is made by
 a script:
 
@@ -155,8 +155,13 @@ the engine:
   Only restores are affected: saves keep upstream's call. The stream, events,
   completion and `wait_compute` don't change. Each load's ledger line says
   which path it took (`copy_api`, `copy_calls`), and `/kv/workers` shows
-  `copy_api`, `copy_chunk` and the `copy_calls_*` counters. It stays `batch`
-  until the vllm-proxy session has run `kvrace` on each mode.
+  `copy_api`, `copy_chunk` and the `copy_calls_*` counters.
+
+  **`loop` fixed it (2026-10-16):** 1,503 restores of the faulting shape in
+  the reproducer, then 15 hours of production, with no Xid and no measurable
+  restore cost. The cluster boots with `loop` from DSpark's
+  `flags.reference.json`; the code default is still `batch`. Don't use
+  `chunk`: production faulted once on a 992-descriptor batch.
 - **`load_poll_ms` is ignored (removed in v0.4.8).** v0.4.4 added a thread
   that started restore copies between scheduler steps. On the cluster it
   brought the Xid 32 fault back within 27 restores, so it is gone: restore
@@ -288,6 +293,15 @@ the start, the same as vLLM does on the GPU.
 - The index of saved blocks is kept in a journal (an append-only log) plus a
   snapshot. A crash, even in the middle of writing the snapshot, loses
   nothing.
+- **One index per format root, not per model.** `presence.json` is keyed by
+  block hash at `dspark-kv-v1/`, so a fingerprint rename keeps it. The other
+  side of that: after a change of model, TP size, dtype or KV layout, the old
+  `<name>_r<rank>` directory stays on disk, and nothing in the engine can
+  reach it. The byte budget doesn't count it, and the free-space floor would
+  evict the current model's keys first.
+  - At boot kvmgr names such directories in one WARNING, and `/kv` lists
+    them as `other_fingerprint_dirs`. It never deletes them: keep them to
+    switch back, or remove them deliberately (DSpark `local-ops` kvsweep).
 - **At startup**, every saved block is checked on every node (does the file
   exist, is it the right size) before vLLM starts taking requests. This is
   the slowest part of startup, and it grows with the cache. It cannot be

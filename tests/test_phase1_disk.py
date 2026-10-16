@@ -120,7 +120,14 @@ check("...and is instantiable, i.e. implements every abstract method",
       not type(sp).__abstractmethods__, repr(type(sp).__abstractmethods__))
 eq("block_size_factor stays 1 (we never set a uniform block size)",
    sp.block_size_factor, 1)
+from kvmgr import serve as _serve  # noqa: E402
+_starts = []
+_real_ms = _serve.maybe_start
+_serve.maybe_start = lambda: _starts.append(1)
 mgr = sp.get_manager()
+_serve.maybe_start = _real_ms
+eq("*** the disk manager starts the stats port (idempotent), so /kv exists "
+   "with no GPU manager ***", len(_starts), 1)
 check("get_manager returns an OffloadingManager",
       isinstance(mgr, base.OffloadingManager))
 check("...and the same one twice (the scheduler holds one)",
@@ -1506,6 +1513,53 @@ check("*** an EXISTING new-format directory is never adopted into, even when "
       "***", os.path.isdir(_old_fake) and os.path.isdir(_newbase),
       (os.path.isdir(_old_fake), os.path.isdir(_newbase)))
 _shP.rmtree(_old_fake, ignore_errors=True)
+
+print("== (P4b) other fingerprint dirs are NAMED, never deleted ==")
+# The index is keyed by block hash at the format root (by design), so files
+# under another fingerprint's directory are invisible to the index, the byte
+# budget and the free-space floor. kvmgr names them; the operator decides.
+_fr = tempfile.mkdtemp(prefix="kvfp-")
+_own = os.path.join(_fr, "modelA@abc_111")
+for _d in ("modelA@abc_111_r0", "modelA@abc_111_r1", "modelB@def_222_r0",
+           "modelA@old_000_r0", "modelB@def_222_r1"):
+    os.makedirs(os.path.join(_fr, _d))
+open(os.path.join(_fr, "presence.json"), "w").write("{}")
+open(os.path.join(_fr, "stray_r0"), "w").write("a FILE, not a dir")
+_got = diskspec.other_fingerprint_dirs(_own, 0)
+eq("*** this rank's OTHER dirs, sorted; not our own, not rank 1's, not files ***",
+   [d["name"] for d in _got], ["modelA@old_000_r0", "modelB@def_222_r0"])
+check("...each with an mtime", all(isinstance(d["mtime"], int) for d in _got))
+eq("rank 1 sees its own others", [d["name"] for d in
+                                  diskspec.other_fingerprint_dirs(_own, 1)],
+   ["modelB@def_222_r1"])
+eq("an unreadable root is [], not an error",
+   diskspec.other_fingerprint_dirs("/nonexistent/x/y", 0), [])
+_capold = diskspec._OTHER_FP_CAP
+diskspec._OTHER_FP_CAP = 1
+eq("bounded", len(diskspec.other_fingerprint_dirs(_own, 0)), 1)
+diskspec._OTHER_FP_CAP = _capold
+harness.clear_log()
+diskspec._note_other_fingerprint_dirs(_own, 0)
+check("*** said once at mapper build, naming them and kvsweep ***",
+      "2 OTHER fingerprint directories" in harness.log_text()
+      and "kvsweep" in harness.log_text(), harness.log_text()[-300:])
+check("*** ...and NOTHING was deleted ***",
+      sorted(os.listdir(_fr)) == sorted(["modelA@abc_111_r0", "modelA@abc_111_r1",
+                                         "modelB@def_222_r0", "modelA@old_000_r0",
+                                         "modelB@def_222_r1", "presence.json",
+                                         "stray_r0"]))
+_snapm = diskspec.DiskPresenceManager(sp.file_mapper(), num_workers=WORLD)
+eq("/kv shows them", [d["name"] for d in
+                      _snapm.snapshot()["other_fingerprint_dirs"]],
+   ["modelA@old_000_r0", "modelB@def_222_r0"])
+_src = open(diskspec.__file__).read()
+_fmb = _src[_src.index("    def file_mapper(self)"):]
+_fmb = _fmb[:_fmb.index("        return self._mapper")]
+check("file_mapper() reports them when it builds the mapper",
+      "_note_other_fingerprint_dirs(self._mapper.base_path, self.rank)" in _fmb)
+diskspec._OTHER_FP_DIRS[:] = []
+import shutil as _shF
+_shF.rmtree(_fr)
 
 print("== (P4) the fingerprint is PUBLISHED, so it can be checked ==")
 # *** A FINGERPRINT NOBODY CAN READ IS A CLAIM NOBODY CAN CHECK. *** The

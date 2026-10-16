@@ -11,7 +11,7 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   restarts, deploys and measurements in its `CLAUDE.md`), and the recipe is the
   DSpark repo. This file is meant to stand alone, but **DSpark's `CLAUDE.md`
   governs the engine** and wins any disagreement about restarting it.
-- Releases are tags (`v0.1.0` … `v0.4.10`), each
+- Releases are tags (`v0.1.0` … `v0.4.11`), each
   naming the vLLM build it is proven on (`pyproject.toml` states the window).
 - **It is the only copy.** The DSpark recipe repo
   (`~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark`) no
@@ -156,8 +156,15 @@ the current stream before each load copy.
   through a proxy for `ops` in the copy handler's module. The proxy acts only
   inside `DiskLoadHandler`'s own call (a thread-local), so stores and every
   other caller are untouched. `kvmgr.copyapi` must stay in `_PRESERVE`, or a
-  reload silently puts every load back on `batch`. The default changes only
-  after kvrace has run each mode.
+  reload silently puts every load back on `batch`.
+- **`loop` is the fix, validated 2026-10-16** (vllm-proxy, DSpark `c119e21`):
+  1,503 kvrace restores of the faulting shape with 0 Xid, then 15 h of
+  production with 0 Xid, at no measurable restore cost. It is the boot
+  setting through DSpark's `local-ops/flags.reference.json`. Without that
+  key, any restart (a supervisor recovery included) comes back on `batch`.
+  `chunk` is not safe: production faulted once on a 992-descriptor batch.
+  The code default stays `batch`, as ask9 asked; never ship a flags file
+  without the key.
 - **Every change to the load path is gated on the reproducer:** `kvrace.py
   run --arm on --loads 1000` must stay clean, and a 700K restore must stay
   about 10 s idle. It is an actuator; the vllm-proxy session runs it, with the

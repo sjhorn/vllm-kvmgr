@@ -65,6 +65,8 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     # test harness does) would otherwise snap back to /etc silently.
     ("kvmgr.flags", "FLAGS_PATH", "the flags file this process reads"),
     ("kvmgr.diskspec", "_LIVE_MANAGER", "the disk index, for GET /kv"),
+    ("kvmgr.diskspec", "_OTHER_FP_DIRS",
+     "other fingerprint dirs found at mapper build (shown on /kv)"),
     ("kvmgr.stats", "_groups", "all per-group counters -- the observability"),
     ("kvmgr.diag.tiering", "_real_odirect", "the saved platform O_DIRECT value"),
     ("kvmgr.serve", "_server", "the stats HTTP server handle"),
