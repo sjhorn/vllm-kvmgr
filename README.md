@@ -288,6 +288,15 @@ the start, the same as vLLM does on the GPU.
 - The index of saved blocks is kept in a journal (an append-only log) plus a
   snapshot. A crash, even in the middle of writing the snapshot, loses
   nothing.
+- **One index per format root, not per model.** `presence.json` is keyed by
+  block hash at `dspark-kv-v1/`, so a fingerprint rename keeps it. The other
+  side of that: after a change of model, TP size, dtype or KV layout, the old
+  `<name>_r<rank>` directory stays on disk, and nothing in the engine can
+  reach it. The byte budget doesn't count it, and the free-space floor would
+  evict the current model's keys first.
+  - At boot kvmgr names such directories in one WARNING, and `/kv` lists
+    them as `other_fingerprint_dirs`. It never deletes them: keep them to
+    switch back, or remove them deliberately (DSpark `local-ops` kvsweep).
 - **At startup**, every saved block is checked on every node (does the file
   exist, is it the right size) before vLLM starts taking requests. This is
   the slowest part of startup, and it grows with the cache. It cannot be

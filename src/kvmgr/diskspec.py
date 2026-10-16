@@ -237,6 +237,69 @@ SPEC_NAMES = (DSPARK_SPEC_NAME, GENERIC_SPEC_NAME)
 # that serves /kv, which is why this works without IPC.
 _LIVE_MANAGER: "DiskPresenceManager | None" = None
 
+# Other fingerprint directories under the format root, found when the mapper
+# is built (other_fingerprint_dirs). Shown on /kv; see that function.
+_OTHER_FP_DIRS: list = []
+_OTHER_FP_CAP = 32
+
+
+def other_fingerprint_dirs(base_path: str, rank: int) -> list:
+    """The OTHER fingerprint directories of this rank under the format root.
+
+    *** WHY THIS EXISTS. *** The index (`presence.json`) lives at the format
+    root, keyed by block hash, by design (so `_migrate_legacy_base`'s rename
+    keeps it). So a fingerprint change -- another model, TP size, dtype, KV
+    layout -- leaves the old `<name>_r<rank>` directory on disk with NOTHING
+    able to reach it: the boot walk drops its keys, the byte budget counts
+    only indexed keys, and the free-space floor evicts indexed keys -- the
+    CURRENT model's -- to protect files no lookup can use. Deleting them here
+    would be wrong (switch-model.sh switches back, and the directory is a valid
+    cache for that model), so they are named instead: the operator decides
+    (DSpark local-ops kvsweep).
+
+    Names and mtimes only, at most _OTHER_FP_CAP: no size walk, which at 400 GB
+    is the boot-time cost this must not add. PURE apart from one scandir."""
+    import os as _os
+    root, own = _os.path.split(base_path.rstrip("/"))
+    own = "%s_r%d" % (own, int(rank))
+    suffix = "_r%d" % int(rank)
+    out = []
+    try:
+        with _os.scandir(root) as it:
+            for e in it:
+                if (e.name != own and e.name.endswith(suffix)
+                        and e.is_dir(follow_symlinks=False)):
+                    try:
+                        mt = int(e.stat(follow_symlinks=False).st_mtime)
+                    except OSError:
+                        mt = None
+                    out.append({"name": e.name, "mtime": mt})
+    except OSError:
+        return []
+    out.sort(key=lambda d: d["name"])
+    return out[:_OTHER_FP_CAP]
+
+
+def _note_other_fingerprint_dirs(base_path: str, rank: int) -> None:
+    """Record and say once what other_fingerprint_dirs found. Never raises."""
+    try:
+        found = other_fingerprint_dirs(base_path, rank)
+    except Exception:
+        return
+    _OTHER_FP_DIRS[:] = found
+    if found:
+        logger.warning(
+            "kvmgr: %d OTHER fingerprint director%s beside this one under %s "
+            "(%s). Their files are invisible to this engine's index, its byte "
+            "budget and its free-space floor -- the floor would evict THIS "
+            "model's keys before touching them. Keep them to switch back, or "
+            "remove them deliberately (DSpark local-ops kvsweep); kvmgr never "
+            "deletes them. Listed on /kv as other_fingerprint_dirs.",
+            len(found), "y" if len(found) == 1 else "ies",
+            base_path.rsplit("/", 1)[0],
+            ", ".join(d["name"] for d in found[:4])
+            + (" ..." if len(found) > 4 else ""))
+
 # *** THE SCHEDULER-SIDE JOB SET, WHICH NOTHING COULD SEE. ***
 # The worker's own counters said `jobs_open: 0` while the scheduler was still
 # holding ~127 jobs -- and the scheduler's `self._jobs` is EXACTLY what
@@ -3114,6 +3177,9 @@ class DiskPresenceManager(OffloadingManager):
         _sized = bool(getattr(self, "_group_bytes", None))
         _accounting_ok = (not self._present) or (self._bytes > 0 and _sized)
         return dict(self._stats, present=len(self._present),
+                    # other fingerprint dirs under the root: on disk, and
+                    # invisible to this index, its budget and its floor
+                    other_fingerprint_dirs=list(_OTHER_FP_DIRS),
                     bytes_held=self._bytes,
                     budget_bytes=_budget,
                     budget_gb=round(_budget / 1e9, 2) if _budget else 0,
@@ -3498,6 +3564,9 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
                 )
             except Exception:
                 logger.exception("kvmgr: could not log the mapper fingerprint")
+            # getattr: the path accessor works on a partial spec (see above)
+            if getattr(self, "rank", None) is not None:
+                _note_other_fingerprint_dirs(self._mapper.base_path, self.rank)
         return self._mapper
 
     def get_manager(self) -> OffloadingManager:
