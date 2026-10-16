@@ -58,7 +58,35 @@ The original step:
     GB10 check of `chunk` and `loop` restores is optional, and needs a GPU
     window.
 
-## Step 2. The disk tier mergeable (1–2 days, local)
+## Step 2. The disk tier mergeable: DONE (0.5.0, `3683547`, 2026-10-16)
+
+- **The seven red suites:** phase4, 6 and 11 now run on 0.31. phase1, 2, 3 and
+  10 skip with a reason. phase1's knob table moved to phase18 (273 checks,
+  every vLLM). DSpark mode is skipped on this branch, loudly.
+- **The newly running suites found three bugs, now fixed:**
+  - loadfail's 0.31 state was missing from reload's `_PRESERVE`;
+  - the reload's class snapshot imported `kvmgr.manager`, which can't import
+    on 0.31;
+  - `register()` let a manager-module `ImportError` escape.
+- **The three diagnostics:**
+  - copyprobe: correct on 0.31 (direct layout), now pinned;
+  - tiering: stands down whole on 0.31, where it would have half-patched;
+  - ledger: model runner V2 gets `in_step=None` with the real reason, and
+    `req_in_step` is read from `req_states`.
+- **The presence index:** it is per root by design. Other fingerprint
+  directories are now named at boot and on `/kv`, never deleted. Done on
+  `main-next` (`0053fb4`) and cherry-picked here.
+- **The stats port** starts from the disk manager: on `main-next`
+  (`79dc617`) and here.
+- **`main`:** phase17 was missing from `run-all.sh` (`d8ca28b`).
+- **Docs and version:** 0.5.0; README "On vLLM 0.31"; CLAUDE.md for the line.
+- **Exit check:** pristine is green on 0.31 with every skip explained, and
+  `main-next` is green in both modes. The three local CPU cycles re-ran on
+  0.5.0, each with restore, corruption, recompute, heal and reboot, and every
+  reply was identical: Qwen at TP=1 (rank-0 corruption), Gemma with six
+  groups, and Qwen at TP=2 (rank-1 corruption).
+
+The original step:
 
 **Decided 2026-10-16 (user): (a), its own release line.** Branch
 `vllm-0.31`, versions `0.5.x`, rebased on `main` for each `main` release,
