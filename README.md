@@ -69,11 +69,11 @@ from disk.
 Into a vLLM image:
 
 ```sh
-pip install --no-deps vllm_kvmgr-0.4.10-py3-none-any.whl
+pip install --no-deps vllm_kvmgr-0.4.11-py3-none-any.whl
 ```
 
 The DSpark recipe does not pip install. It mounts `src/kvmgr` and
-`deploy/vllm_kvmgr-0.4.10.dist-info` into site-packages instead. vLLM finds the
+`deploy/vllm_kvmgr-0.4.11.dist-info` into site-packages instead. vLLM finds the
 plugin through the entry point in that dist-info folder. The folder is made by
 a script:
 
