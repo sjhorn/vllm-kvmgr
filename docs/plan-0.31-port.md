@@ -26,7 +26,15 @@ the user.
 - **DSpark's `CLAUDE.md` governs the engine and the recipe.** DSpark work
   happens on a branch in that repo, never on its `main` until step 4 is green.
 
-## Step 1. ask9 onto the branch (about half a day, local)
+## Step 1. ask9 onto the branch: DONE (`6567d4f`, 2026-10-16)
+
+Rebased onto v0.4.10, and `load_copy_api` ported to 0.31's
+resolved-at-init copy. Offline tests pass, plus three break-verifies. The
+local six-group cycle (restore, Gate B, heal, reboot) re-ran with identical
+replies. The GB10 check of `chunk` and `loop` waits for a free window: both
+nodes are busy, so all testing is local until then.
+
+The original step:
 
 - Rebase `spike/vllm-0.31-local` onto `main` v0.4.10, and resolve the conflicts
   (likely in `diskio.py`, `flags.py`, `diag/ledger.py`, `diag/reload.py`).
@@ -52,7 +60,9 @@ the user.
 
 ## Step 2. The disk tier mergeable (1–2 days, local)
 
-**Decision first: how 0.31 support lives** (the user's call):
+**Decided 2026-10-16 (user): (a), its own release line.** Branch
+`vllm-0.31`, versions `0.5.x`, rebased on `main` for each `main` release,
+merged when the cluster moves. The options were:
 - **(a) A release line on its own branch** (`vllm-0.31`, versions `0.5.x`),
   rebased on `main` per release and merged when the cluster moves.
   Recommended: `main` stays exactly what the cluster runs, and nothing on
@@ -157,8 +167,7 @@ With DSpark-0.31 booting and kvmgr's 0.31 line:
 
 ## Decisions needed from the user
 
-1. Step 2: how 0.31 support lives, (a) its own branch (recommended) or (b) one
-   codebase.
+1. ~~Step 2: how 0.31 support lives~~: decided, its own branch.
 2. Step 3.2: the base image source.
 3. Steps 3.4 and 3.5: when GPU windows are available. Each one takes the
    cluster down.
