@@ -85,9 +85,11 @@ def describe_copy(kind: str, gpu_tensors, host_tensors, refs, bids, slots) -> di
     """Every descriptor of one copy, with checks. Pure; never raises on data.
 
     kind "load" writes the GPU (dst = gpu), "store" writes staging (dst = host).
-    Mirrors 0.21's `transfer_async` for one group at block_size_factor 1:
+    Mirrors upstream's descriptor build for one group at one block per row:
     for each ref, for each block i, src/dst = base + row * stride(0), size =
-    ref.page_size_bytes."""
+    ref.page_size_bytes. That is 0.21's `transfer_async`, and vLLM 0.31's
+    `_fill_direct_ops` (the layout a handler built without `canonical_layout`
+    uses -- ours are; phase14 (14z) pins both and fails if either moves)."""
     gpu_side_is_dst = kind == "load"
     tensors = {}
     for ref in refs:

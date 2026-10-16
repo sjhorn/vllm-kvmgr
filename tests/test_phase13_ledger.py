@@ -569,6 +569,45 @@ finally:
     _dio._LIVE_CONN_WORKER[:] = _saved_cw
     L._RUNNER.clear()
 
+print("\n== (13v2) model runner V2 (vLLM 0.31's default): in_step is None, req_in_step read ==")
+_saved_cw = list(_dio._LIVE_CONN_WORKER)
+cw2 = CW()
+cw2._load_jobs = {910: "req-v2", 911: "req-gone"}
+_dio._LIVE_CONN_WORKER[:] = [cw2]
+
+
+class RunnerV2:
+    """The 0.31 shape: no input_batch; req_states (host) and block_tables."""
+    def __init__(self):
+        self.req_states = types.SimpleNamespace(req_id_to_index={"req-v2": 0})
+        self.block_tables = types.SimpleNamespace(block_tables=[object()])
+
+    def execute_model(self, fn):
+        return fn()
+
+
+try:
+    tmp = fresh()
+    L._RUNNER.clear()
+    hr2 = rhandler([[0] * 62])
+    rv2 = RunnerV2()
+    rv2.execute_model(lambda: L.submit(hr2, "load", 60, 910, 0, [1988], [0]))
+    rv2.execute_model(lambda: L.submit(hr2, "load", 61, 911, 0, [1988], [1]))
+    recs = [json.loads(x) for x in lines(os.path.join(tmp, "ledger-r0.jsonl"))]
+    r0 = [r for r in recs if r.get("req") == "req-v2"][0]
+    r1 = [r for r in recs if r.get("req") == "req-gone"][0]
+    check("*** the V2 runner is found on the stack and cached ***",
+          L._RUNNER == [rv2])
+    eq("*** in_step is None, never 0 (the rows are GPU-only) ***",
+       r0.get("in_step", "MISSING"), None)
+    check("...with V2's reason, not 'runner not found'",
+          "model runner V2" in (r0.get("in_step_why") or ""), r0.get("in_step_why"))
+    eq("*** req_in_step is still read, from req_states (host) ***",
+       (r0.get("req_in_step"), r1.get("req_in_step")), (True, False))
+finally:
+    _dio._LIVE_CONN_WORKER[:] = _saved_cw
+    L._RUNNER.clear()
+
 print(f"\n{PASS} passed, {len(FAIL)} failed")
 for f in FAIL:
     print("FAILED:", f)

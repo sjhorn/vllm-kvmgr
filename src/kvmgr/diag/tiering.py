@@ -253,13 +253,38 @@ def install_verify() -> bool:
     return True
 
 
+def shape_021() -> "str | None":
+    """None if this vLLM's tiering is the 0.21 shape these shims patch, else
+    why not. vLLM 0.31 has none of it: the fs tier's `store_block` and
+    `load_block` became `_store_block` / `batch_*_block`, it probes O_DIRECT
+    itself (`probe_o_direct`), and `TieringOffloadingSpec` no longer asserts
+    one GPU block size (`gpu_block_size` is gone). Patching a different shape
+    half-way is worse than not patching, so the whole diagnostic stands down."""
+    try:
+        from vllm.v1.kv_offload.tiering.fs import io as fsio
+    except Exception:
+        return None          # nothing importable: each install says False itself
+    missing = [n for n in ("store_block", "load_block") if not hasattr(fsio, n)]
+    if missing:
+        return ("this vLLM's tiering fs io has no %s (vLLM 0.31 renamed them and "
+                "probes O_DIRECT itself)" % "/".join(missing))
+    return None
+
+
 def install() -> bool:
     """Wrap `TieringOffloadingSpec.get_manager`. Idempotent and total.
 
     Returns True if the wrapper is in place (now or already), False if the
     offload machinery is not importable here -- which is the normal case in any
-    process that does not build an offloading spec.
+    process that does not build an offloading spec -- or is not the 0.21 shape
+    these shims were written for (`shape_021`).
     """
+    why = shape_021()
+    if why:
+        logger.warning("kvmgr: diag_tiering_shims NOT installed: %s. They patch "
+                       "vLLM 0.21's tiering spec; kvmgr's own disk tier never "
+                       "used them.", why)
+        return False
     try:
         from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
     except Exception:

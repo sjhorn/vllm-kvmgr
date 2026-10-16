@@ -449,6 +449,52 @@ eq("and it is OFF by default -- it doubles store I/O",
 
 check("offload_odirect is in DEFAULTS so the hot-config suite covers it",
       "offload_odirect" in flags.DEFAULTS)
+print()
+print("== (4d) on vLLM 0.31's tiering shape the shims stand down, whole ==")
+# The 0.31 names, read from the v0.31.0 tag (vllm/v1/kv_offload/tiering/fs/io.py
+# and tiering/spec.py): no store_block/load_block, upstream probes O_DIRECT,
+# and TieringOffloadingSpec no longer reads gpu_block_size at all.
+for _n in ("vllm.v1.kv_offload", "vllm.v1.kv_offload.tiering",
+           "vllm.v1.kv_offload.tiering.fs", "vllm.v1.kv_offload.tiering.fs.io",
+           "vllm.v1.kv_offload.tiering.spec"):
+    sys.modules.pop(_n, None)
+for _n in ("vllm.v1.kv_offload", "vllm.v1.kv_offload.tiering",
+           "vllm.v1.kv_offload.tiering.fs", "vllm.v1.kv_offload.tiering.fs.io",
+           "vllm.v1.kv_offload.tiering.spec"):
+    _m = types.ModuleType(_n)
+    sys.modules[_n] = _m
+    _par, _, _leaf = _n.rpartition(".")
+    if _par in sys.modules:
+        setattr(sys.modules[_par], _leaf, _m)
+_io31 = sys.modules["vllm.v1.kv_offload.tiering.fs.io"]
+for _fn in ("_store_block", "_load_block", "batch_store_block",
+            "batch_load_block", "probe_o_direct"):
+    setattr(_io31, _fn, lambda *a, **k: None)
+_io31.O_DIRECT = 0x4000
+
+
+class Spec031:
+    def get_manager(self):
+        return "upstream's manager"
+
+
+_orig_gm = Spec031.get_manager
+sys.modules["vllm.v1.kv_offload.tiering.spec"].TieringOffloadingSpec = Spec031
+harness.clear_log()
+check("shape_021() names what is missing", "store_block/load_block" in
+      (offload.shape_021() or ""), offload.shape_021())
+eq("*** install() refuses on the 0.31 shape ***", offload.install(), False)
+check("...and says so, naming the knob", "diag_tiering_shims NOT installed"
+      in harness.log_text(), harness.log_text()[-200:])
+check("*** ...having patched NOTHING: get_manager untouched ***",
+      Spec031.get_manager is _orig_gm)
+check("...O_DIRECT untouched", _io31.O_DIRECT == 0x4000)
+check("...no store wrapper added",
+      not hasattr(_io31, "store_block") and
+      not getattr(_io31, "_kvmgr_verify_wrapped", False))
+for _n in ("vllm.v1.kv_offload.tiering.spec", "vllm.v1.kv_offload.tiering.fs.io",
+           "vllm.v1.kv_offload.tiering.fs", "vllm.v1.kv_offload.tiering"):
+    sys.modules.pop(_n, None)
 
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")

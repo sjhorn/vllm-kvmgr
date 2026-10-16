@@ -409,6 +409,40 @@ check("selftest is OFF by default; the probe is ON",
 
 if not _had:
     del _torch.cuda
+print("\n== (14z) the probe's arithmetic is still upstream's, on THIS vLLM ==")
+_R = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_gw = open(os.path.join(_R, "tests", "upstream", "vllm", "v1", "kv_offload",
+                        "cpu", "gpu_worker.py")).read()
+_dio = open(os.path.join(_R, "src", "kvmgr", "diskio.py")).read()
+if "def _fill_direct_ops(" in _gw:
+    # vLLM 0.31: two layouts. describe_copy (and load_ops_for) model the
+    # DIRECT one -- one whole page per (block, ref) -- which is what a handler
+    # built without canonical_layout uses. The canonical layout scatters each
+    # ref into fragments, and would make every descriptor here wrong.
+    _fd = _gw[_gw.index("    def _fill_direct_ops("):]
+    _fd = _fd[:_fd.index("\n    def ", 10)]
+    check("UPSTREAM (0.31): the direct fill is one page_size_bytes copy per "
+          "(block, ref)",
+          "all_sizes[op_idx:end_idx] = data_ref.page_size_bytes" in _fd
+          and "for data_ref in self.layer_refs_per_group[g_idx]:" in _fd)
+    check("...and at blocks_per_chunk == 1 a pointer is base + block * "
+          "stride(0)",
+          "output[:] = base_ptr + block_ids.astype(np.uint64)[:num_sub_blocks]"
+          " * row_stride" in _gw)
+    check("...the canonical layout is opt-in (default False)",
+          "canonical_layout: bool = False," in _gw)
+    _starts = [j for j in range(len(_dio))
+               if _dio.startswith("SingleDirectionOffloadingHandler(", j)]
+    _ctors = [_dio[i:_dio.index("\n            )", i)] for i in _starts]
+    check("*** neither of OUR handlers asks for the canonical layout ***",
+          len(_ctors) == 2 and not any("canonical_layout" in c for c in _ctors),
+          "%d constructions" % len(_ctors))
+    check("...and the staging is one block per row (asserted at init)",
+          "assert spec.blocks_per_chunk == 1" in _dio)
+else:
+    check("UPSTREAM (0.21): one page_size_bytes copy per (block, ref)",
+          "all_sizes[op_idx:end_idx] = data_ref.page_size_bytes" in _gw)
+
 print()
 print(f"{PASS} passed, {len(FAIL)} failed")
 if harness.SKIPPED:
