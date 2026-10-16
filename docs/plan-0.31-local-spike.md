@@ -253,6 +253,53 @@ Only 4 matters for the cluster port.
 The recommendation below is unchanged: phase 4's wall is one more piece of
 safety the built-in tiers would not have given us.
 
+## On a GB10 (spark-45ea, 2026-10-15)
+
+This was a one-off run on the head node while both engines were down under
+`~/.engine-hold`, with the user's go-ahead. Nothing of the cluster's was
+touched: a container named `kvmgr031`, everything under `~/kvmgr031-test`
+(deleted afterwards), ports 18000/18899 on 127.0.0.1, and 25% of the GPU.
+The scripts are `scripts/cuda031.sh` and `scripts/cycle031.sh`.
+
+(This section was written on 2026-10-16. Its first version was never
+committed: a failed command earlier in the same shell line stopped it.)
+
+**Two walls, neither kvmgr's** (a bare vLLM stalled the same way):
+1. **The 64K-page kernel hangs vLLM's default lazy safetensors loader** at
+   the first weight copy, as DSpark's compose documents. The fix is
+   `--safetensors-load-strategy eager`.
+   - *Corrected 2026-10-16:* this, not missing sm_121 kernels, is also what
+     stalled the stock `vllm/vllm-openai:v0.31.0`. That image was abandoned
+     before eager loading was found, and was never re-tested.
+   - sm_120 code runs on sm_121, and v0.31.0 pins an SM120-capable DeepGEMM.
+2. **The run used the node's `eugr/spark-vllm:latest`,** built for 12.1a with
+   CUDA 13.0.2.
+   - Its vLLM is a `main` commit (`0872ddf4b`), not v0.31.0: compared with the
+     tag, it has 345 commits v0.31.0 lacks, and v0.31.0 has 27 it lacks.
+   - They differ in DSV4's `attention.py` and `compressor.py`, and in
+     `block_pool.py` and `scheduler.py`.
+   - Its sources had every 0.31 shape this branch relies on.
+
+The container also needed `--ulimit memlock=-1`.
+
+**Results** (Qwen3-0.6B, 16-token blocks, 1.8 MB a page, a 4,850-token canary
+of 303 blocks):
+
+| step | result |
+|---|---|
+| prime | 0.39 s; stores flush in the background |
+| reboot + restore | boot walk 256/256; 256 blocks restored, 256/256 CRC ok, identical |
+| Gate B, block 18 | checksum caught it; request-level failure; **engine up**, recompute, identical; no Xid or illegal access |
+| next request | index whole again, 303/303 |
+| reboot + restore | 303/303 restored, CRC ok, identical |
+| compute wait | `compute_waits 5`, `compute_wait_unarmed 0`: armed on every copy round |
+
+This proves the CUDA copy path (0.31's `SingleDirectionOffloadingHandler`
+under our handlers), the checksums and the request-level recompute on a real
+GPU. It doesn't prove speed: the model is too small for a restore to beat a
+0.39 s prefill. It also doesn't cover DeepSeek V4, two nodes, or the Xid
+reproducer.
+
 ## Recommendation: keep our own spec, don't move to the built-in tiers
 
 Unchanged from the first spike, with two new reasons from today's checks.

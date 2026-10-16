@@ -9,9 +9,13 @@
 #   * host network, but the API and the stats port bind 127.0.0.1 on
 #     18000/18899, not the engine's ports. A small GPU share (GPU_UTIL).
 #
-# On a GB10 (DGX Spark, sm_121) the stock image has no 12.1 kernels and stalls
-# in JIT at the first CUDA copy; use an image built for 12.1a, e.g.
-#   IMAGE=eugr/spark-vllm:latest SERVE="vllm serve"   (its entrypoint is NVIDIA's)
+# On a GB10 (DGX Spark, sm_121, the 64K-page kernel) pass
+#   EXTRA="--safetensors-load-strategy eager"
+# or the default lazy loader hangs at the first weight copy. That hang (not
+# missing sm_121 kernels, as first thought) stalled the stock image too; the
+# stock image is unproven on GB10 with eager loading. The 12.1a build used in
+# the spike:  IMAGE=eugr/spark-vllm:latest SERVE="vllm serve"  (NVIDIA entrypoint;
+# a vLLM main commit, not v0.31.0).
 #
 #   cuda031.sh up | logs | down        (down leaves $T; `rm -rf $T` is the cleanup)
 set -euo pipefail

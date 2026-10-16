@@ -155,7 +155,16 @@ DSpark repo, branch `vllm-0.31`. What has to move:
    look for that delta in 0.31.
    - The deliverable is a table in DSpark's repo, and the real effort
      estimate replaces "1–3 weeks".
-2. **Base image (decision).** We need 0.31 built for sm_121 (12.1a). Options:
+2. **Base image (decision).** Checked 2026-10-16, without running anything
+   on the nodes (spark-45ea had about 1 GB free):
+   - **The stock `vllm/vllm-openai:v0.31.0`:** never re-tested with eager
+     loading. It may well run (sm_120 code runs on sm_121), and v0.31.0 pins
+     FlashInfer `0.7.0.post1`, which contains flashinfer#4380, plus a
+     DeepGEMM fork with an SM120 port.
+   - **`eugr/spark-vllm`:** proven on GB10, but a `main` commit that
+     diverges from v0.31.0, including in DSV4 attention.
+
+   The options were:
    - the node's `eugr/spark-vllm` (a 0.30.1rc1 dev build, a day before
      0.31.0; worked for the spike);
    - a newer build from the same source;

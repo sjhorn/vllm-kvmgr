@@ -84,10 +84,12 @@ from disk.
   - The ledger's `in_step` is `null` on model runner V2, which keeps its block
     tables on the GPU. `req_in_step` is still read.
 - **On a GB10 (DGX Spark):**
-  - Use an image built for sm_121 (`12.1a`); the stock `vllm/vllm-openai`
-    stalls at the first CUDA copy.
-  - Start vLLM with `--safetensors-load-strategy eager` (the 64K-page kernel
-    hangs the default loader).
+  - Start vLLM with `--safetensors-load-strategy eager`. The 64K-page kernel
+    hangs the default lazy loader at the first weight copy, with the GPU idle.
+    That hang, not missing sm_121 kernels, is what stalled both the stock
+    `vllm/vllm-openai:v0.31.0` and a `12.1a` build (corrected 2026-10-16).
+    sm_120 code runs on sm_121, and v0.31.0 pins an SM120-capable DeepGEMM.
+    The stock image is still unproven on GB10 with eager loading.
   - Run the container with `--ulimit memlock=-1`.
 
   `scripts/cuda031.sh` does all three.
