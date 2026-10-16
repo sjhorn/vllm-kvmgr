@@ -30,9 +30,13 @@ caller -- the store handler, anything upstream -- sees the real call with
 nothing in between. The stream, the events, the completion, `wait_compute`
 and the ledger are unchanged: the dispatch happens where the one call was.
 
-vLLM 0.31 resolves `self._swap_blocks_batch` once at handler init, so there
-the proxy would have to wrap that instance attribute instead; not done (0.21
-is what runs).
+*** vLLM 0.31 *** resolves the copy once, at handler init
+(`self._swap_blocks_batch = _select_swap_blocks_fn(...)`), so a module global
+is never looked up again. There `install_on` wraps THAT instance attribute, on
+our load handler's inner handler only, with the same thread-local dispatch.
+For loads with pinned pages all under 28 KiB, 0.31 picks its Triton kernel
+instead, and there is no batch call to split: `install_on` says so and the
+mode stays batch.
 """
 
 from __future__ import annotations
@@ -124,8 +128,37 @@ def _as_list(t) -> list:
 
 # -- the dispatch -------------------------------------------------------------
 
+def _dispatch(real, src, dst, sizes, *a, **kw):
+    """One copy's descriptors, by this thread's mode. `real` is the batch call."""
+    act = getattr(_TLS, "active", None)
+    if act is None:
+        return real(src, dst, sizes, *a, **kw)
+    mode, chunk = act["mode"], act["chunk"]
+    n = len(sizes)
+    STATS["copies"] += 1
+    STATS["descriptors"] += n
+    if mode == "chunk":
+        calls = 0
+        for i in range(0, n, chunk):
+            real(src[i:i + chunk], dst[i:i + chunk], sizes[i:i + chunk],
+                 *a, **kw)
+            calls += 1
+    elif mode == "loop":
+        stream = _stream_handle()
+        s, d, z = _as_list(src), _as_list(dst), _as_list(sizes)
+        for i in range(n):
+            memcpy_async(int(d[i]), int(s[i]), int(z[i]), stream)
+        calls = n
+    else:
+        real(src, dst, sizes, *a, **kw)
+        calls = 1
+    act["calls"] += calls
+    STATS["calls_" + mode] += calls
+    return None
+
+
 class OpsProxy:
-    """Stands in for `vllm._custom_ops` in the copy handler's module."""
+    """Stands in for `vllm._custom_ops` in the copy handler's module (0.21)."""
 
     def __init__(self, real):
         self._kvmgr_real = real
@@ -134,42 +167,48 @@ class OpsProxy:
         return getattr(self._kvmgr_real, name)
 
     def swap_blocks_batch(self, src, dst, sizes, *a, **kw):
-        real = self._kvmgr_real.swap_blocks_batch
-        act = getattr(_TLS, "active", None)
-        if act is None:
-            return real(src, dst, sizes, *a, **kw)
-        mode, chunk = act["mode"], act["chunk"]
-        n = len(sizes)
-        STATS["copies"] += 1
-        STATS["descriptors"] += n
-        if mode == "chunk":
-            calls = 0
-            for i in range(0, n, chunk):
-                real(src[i:i + chunk], dst[i:i + chunk], sizes[i:i + chunk],
-                     *a, **kw)
-                calls += 1
-        elif mode == "loop":
-            stream = _stream_handle()
-            s, d, z = _as_list(src), _as_list(dst), _as_list(sizes)
-            for i in range(n):
-                memcpy_async(int(d[i]), int(s[i]), int(z[i]), stream)
-            calls = n
-        else:
-            real(src, dst, sizes, *a, **kw)
-            calls = 1
-        act["calls"] += calls
-        STATS["calls_" + mode] += calls
-        return None
+        return _dispatch(self._kvmgr_real.swap_blocks_batch, src, dst, sizes,
+                         *a, **kw)
+
+
+def _wrap_bound(real):
+    """0.31: the handler's own `_swap_blocks_batch`, dispatched."""
+    def swap_blocks_batch(src, dst, sizes, *a, **kw):
+        return _dispatch(real, src, dst, sizes, *a, **kw)
+    swap_blocks_batch._kvmgr_real = real
+    return swap_blocks_batch
 
 
 def install_on(inner) -> "str | None":
-    """Put the proxy where `inner.transfer_async` looks up `ops`. Idempotent.
-    None = installed (or already); otherwise why not."""
+    """Route `inner`'s batch copy through the dispatch. Idempotent.
+    None = installed (or already); otherwise why it cannot be."""
+    why = getattr(inner, "kvmgr_no_driver_copy", None)
+    if why:
+        return str(why)
     try:
         g = type(inner).transfer_async.__globals__
     except Exception as exc:
         return "no transfer_async globals: %r" % (exc,)
     cur = g.get("ops")
+    real_ops = getattr(cur, "_kvmgr_real", cur)
+    if hasattr(inner, "_swap_blocks_batch"):
+        # 0.31: resolved at init; wrap the instance attribute, this handler only
+        fn = inner._swap_blocks_batch
+        if getattr(fn, "_kvmgr_real", None) is not None:
+            return None
+        # == not `is`: a bound method is a new object on every access
+        if real_ops is None or fn != getattr(real_ops, "swap_blocks_batch",
+                                             None):
+            return ("the handler resolved %r, not ops.swap_blocks_batch "
+                    "(0.31 picks its Triton kernel for loads when every page "
+                    "is under 28 KiB): no batch call to split"
+                    % (getattr(fn, "func", fn),))[:240]
+        inner._swap_blocks_batch = _wrap_bound(fn)
+        STATS["installed"] += 1
+        logger.info("kvmgr: load copies go through load_copy_api (batch|chunk|"
+                    "loop, hot; loads only) on this handler's "
+                    "_swap_blocks_batch (vLLM 0.31 shape)")
+        return None
     # by attribute, not isinstance: a hot reload redefines the class
     if getattr(cur, "_kvmgr_real", None) is not None:
         return None

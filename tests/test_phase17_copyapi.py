@@ -193,6 +193,63 @@ eq("calls_for", [CA.calls_for(m, n, 64) for m, n in
 F.write()
 KF.reset_for_tests()
 
+print("\n== (17g2) vLLM 0.31: the copy resolved at init, wrapped per handler ==")
+_m31 = types.ModuleType("fake_gpu_worker_031")
+_m31.ops = RealOps()
+_m31.LOG = LOG
+exec(compile('''
+import functools
+def triton_swap(src, dst, sizes, is_src_access_order_any=False, bytes_per_chunk=0):
+    LOG.append(("triton", list(src)))
+
+class Handler31:
+    def __init__(self, gpu_to_cpu, small_pages=False):
+        self.gpu_to_cpu = gpu_to_cpu
+        self._swap_blocks_batch = (
+            functools.partial(triton_swap, bytes_per_chunk=8192)
+            if small_pages and not gpu_to_cpu else ops.swap_blocks_batch)
+
+    def transfer_async(self, job_id, src, dst, sizes):
+        LOG.append(("start", job_id))
+        self._swap_blocks_batch(src, dst, sizes,
+                                is_src_access_order_any=not self.gpu_to_cpu)
+        LOG.append(("end", job_id))
+        return True
+''', "fake_gpu_worker_031", "exec"), _m31.__dict__)
+L31, S31 = _m31.Handler31(False), _m31.Handler31(True)
+eq("installs on the instance", CA.install_on(L31), None)
+eq("...idempotent", CA.install_on(L31), None)
+check("*** the module global is left alone (0.31 never reads it again) ***",
+      getattr(_m31.ops, "_kvmgr_real", None) is None)
+check("*** another handler of the same class keeps the real call ***",
+      S31._swap_blocks_batch == _m31.ops.swap_blocks_batch)
+for mode, c in (("batch", 64), ("chunk", 7), ("loop", 64)):
+    LOG.clear()
+    with CA.active(mode, c) as rec:
+        L31.transfer_async(1, SRC, DST, SZ)
+    eq("0.31 %s: every triple, in order" % mode, triples(LOG), TRIPLES)
+    eq("0.31 %s: the calls calls_for predicts" % mode, rec["calls"],
+       CA.calls_for(mode, N, c))
+    kinds = [e[0] for e in LOG]
+    check("0.31 %s: between the events" % mode,
+          kinds[0] == "start" and kinds[-1] == "end"
+          and "start" not in kinds[1:] and "end" not in kinds[:-1])
+LOG.clear()
+with CA.active("loop", 64):
+    S31.transfer_async(2, SRC[:3], DST[:3], SZ[:3])
+check("*** a store handler (not installed) ignores even an active mode ***",
+      [e[0] for e in LOG] == ["start", "batch", "end"], [e[0] for e in LOG])
+T31 = _m31.Handler31(False, small_pages=True)
+_why = CA.install_on(T31) or ""
+check("*** Triton chosen (small pages): refused, with the reason ***",
+      "no batch call to split" in _why and "triton_swap" in _why, _why)
+check("...and its copy is left as it was",
+      getattr(T31._swap_blocks_batch, "_kvmgr_real", None) is None)
+_hc = type("HostCopyHandler", (), {"kvmgr_no_driver_copy": "host copy (no CUDA)",
+                                   "transfer_async": lambda self: None})()
+eq("a host-copy handler says why, before anything else", CA.install_on(_hc),
+   "host copy (no CUDA)")
+
 print("\n== (17h) wiring: the load handler, the ledger, /kv/workers, upstream ==")
 _d = open(os.path.join(REPO, "src", "kvmgr", "diskio.py")).read()
 _load = _d[_d.index("class DiskLoadHandler"):]
@@ -216,14 +273,26 @@ check("UPSTREAM'S SHAPE: the copy is `ops` from `vllm._custom_ops`",
       "from vllm import _custom_ops as ops" in _up)
 _ta = _up[_up.index("    def transfer_async("):]
 _ta = _ta[:_ta.index("\n    def ", 10)]
-check("UPSTREAM'S SHAPE: ONE ops.swap_blocks_batch, between the start and end "
-      "events, inside the copy stream",
-      _ta.count("ops.swap_blocks_batch(") == 1
-      and _ta.index("start_event.record(stream)")
-      < _ta.index("ops.swap_blocks_batch(")
+V031 = "self._swap_blocks_batch(" in _ta
+_call = "self._swap_blocks_batch(" if V031 else "ops.swap_blocks_batch("
+_ctx = "with current_platform.stream(stream):" if V031 else \
+    "with torch.cuda.stream(stream):"
+print("vendored copy handler shape:", "0.31 (resolved at init)" if V031 else "0.21")
+check("UPSTREAM'S SHAPE: ONE %s, between the start and end events, inside the "
+      "copy stream" % _call,
+      _ta.count(_call) == 1
+      and _ta.index("start_event.record(stream)") < _ta.index(_call)
       < _ta.index("end_event.record(stream)")
-      and _ta.index("with torch.cuda.stream(stream):")
-      < _ta.index("start_event.record(stream)"))
+      and _ta.index(_ctx) < _ta.index("start_event.record(stream)"))
+if V031:
+    _sel = _up[_up.index("def _select_swap_blocks_fn("):]
+    _sel = _sel[:_sel.index("\n\n\n")]
+    check("UPSTREAM'S SHAPE (0.31): the copy is resolved once, at init",
+          "self._swap_blocks_batch = _select_swap_blocks_fn(" in _up)
+    check("...as ops.swap_blocks_batch, or a Triton partial for small pinned "
+          "load pages",
+          "return ops.swap_blocks_batch" in _sel
+          and "functools.partial(swap_blocks_batch" in _sel)
 _r = open(os.path.join(REPO, "src", "kvmgr", "diag", "reload.py")).read()
 check("a reload keeps the thread-local the installed proxy reads",
       '("kvmgr.copyapi", "_TLS"' in _r)

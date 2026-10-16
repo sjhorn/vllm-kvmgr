@@ -1487,6 +1487,9 @@ class HostCopyHandler:
     on the next get_finished, the same shape as an async copy observed one
     step later."""
 
+    # ask9's load_copy_api has nothing to route here: no driver call at all
+    kvmgr_no_driver_copy = "host copy handler (no CUDA): torch indexing, no driver call"
+
     class _Done:
         def query(self) -> bool:
             return True

@@ -44,7 +44,7 @@ the user.
     instance attribute, and drives a fake handler built the 0.31 way.
   - Break-verify.
 - **Verification:**
-  - The offline suites, green in pristine mode (the six GPU-manager suites
+  - The offline suites, green in pristine mode (the seven GPU-manager suites
     stay red; see step 2).
   - The Mac container cannot exercise this: its copy is `HostCopyHandler`. A
     GB10 check of `chunk` and `loop` restores is optional, and needs a GPU
@@ -64,7 +64,7 @@ the user.
 **Then, either way:**
 - **The GPU-manager half.** Main plan item 3 decides whether prompt-block
   protection still pays. Until then it is skipped on 0.31 with the reason
-  logged (as now). The six red suites become "skipped on 0.31, with a reason",
+  logged (as now). The seven red suites (phase1, 2, 3, 4, 6, 10, 11) become "skipped on 0.31, with a reason",
   never silent passes.
 - **The diagnostics still written against 0.21:**
   - `diag/copyprobe.describe_copy`, the copy arithmetic;
