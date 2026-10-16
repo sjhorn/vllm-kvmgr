@@ -38,7 +38,7 @@ for mode in $MODES; do
            test_phase9_verify.py test_phase10_standalone.py test_phase11_diag.py \
            test_phase12_packaging.py test_phase13_ledger.py \
            test_phase14_copyprobe.py test_phase15_loadfail.py \
-           test_phase16_reqkeys.py; do
+           test_phase16_reqkeys.py test_phase17_copyapi.py; do
     out=$("$PY" "$f" 2>&1); rc=$?
     skips=$(printf '%s\n' "$out" | grep -c '^SKIP ')
     if [ "$rc" = "0" ]; then
