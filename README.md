@@ -51,11 +51,12 @@ from disk.
 
 ## What you need
 
-- **vLLM `0.21.1rc1.dev339+g1967a5627bc3`.** This is the version it is tested
-  on. `pyproject.toml` allows `>=0.21.1rc1.dev0,<0.22`, but the plugin uses
-  some private parts of vLLM, so other versions in that range may break. To
-  move to a new vLLM, copy that version's files into `tests/upstream/` and run
-  the tests. A change in vLLM shows up as a test failure with a name.
+- **This is the vLLM 0.31 line** (branch `vllm-0.31`, versions 0.5.x).
+  `main` (0.4.x) is the 0.21 line that the cluster runs.
+  - Tested on vLLM 0.31.0 (CPU, in an Apple `container` on a Mac: one KV
+    group, six groups, and TP=2), and on a GB10 with a 0.31-era build.
+  - Not yet run on the cluster: `docs/plan-0.31-port.md`.
+  - What differs on 0.31 is in [On vLLM 0.31](#on-vllm-031).
 - **No changes to vLLM itself.** The DSpark recipe adds some patches, but you
   do not need them. See [Without the DSpark patches](#without-the-dspark-patches).
 - **`PYTHONHASHSEED` set to a fixed number, and never changed.** vLLM names
@@ -64,6 +65,35 @@ from disk.
   just get misses. Changing the number later has the same effect.
 - `--enable-prefix-caching`, and a folder you can write to on every node.
 
+
+## On vLLM 0.31
+
+- **Only the disk tier.** 0.31 has no `spec_manager_map` or
+  `MLAAttentionManager`, so kvmgr's GPU KV manager is not registered, and
+  the log says so. Main plan item 3 decides whether it is rebuilt.
+- **A failed restore is reported by request.** 0.31's scheduler refuses
+  block-level load failures on any model with more than one KV group, and
+  raises. So `loadfail` puts the request in `failed_recving`, and upstream
+  restarts it from token 0, which on 0.21 was our multi-group behaviour.
+- **`load_copy_api`** wraps the restore handler's own `_swap_blocks_batch`,
+  since 0.31 resolves its copy routine once, at init. When 0.31 has picked its
+  Triton kernel (pinned pages all under 28 KiB) there is no batch call to
+  split, and `/kv/workers` says so (`copy_api_why`).
+- **Diagnostics:**
+  - `diag_tiering_shims` stands down (0.31 has none of what it patched).
+  - The ledger's `in_step` is `null` on model runner V2, which keeps its block
+    tables on the GPU. `req_in_step` is still read.
+- **On a GB10 (DGX Spark):**
+  - Use an image built for sm_121 (`12.1a`); the stock `vllm/vllm-openai`
+    stalls at the first CUDA copy.
+  - Start vLLM with `--safetensors-load-strategy eager` (the 64K-page kernel
+    hangs the default loader).
+  - Run the container with `--ulimit memlock=-1`.
+
+  `scripts/cuda031.sh` does all three.
+- **Local testing without a GPU:** `scripts/local031.sh` runs vLLM 0.31's CPU
+  image in an Apple `container`, using a plain-torch copy in place of the CUDA
+  one. `down` also stops the container service.
 ## Install
 
 Into a vLLM image:

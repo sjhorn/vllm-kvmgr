@@ -11,7 +11,7 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   restarts, deploys and measurements in its `CLAUDE.md`), and the recipe is the
   DSpark repo. This file is meant to stand alone, but **DSpark's `CLAUDE.md`
   governs the engine** and wins any disagreement about restarting it.
-- Releases are tags (`v0.1.0` … `v0.4.11`), each
+- Releases are tags (`v0.1.0` … `v0.4.11` on `main`; `v0.5.x` on `vllm-0.31`), each
   naming the vLLM build it is proven on (`pyproject.toml` states the window).
 - **It is the only copy.** The DSpark recipe repo
   (`~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark`) no
@@ -49,6 +49,21 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   through `hooks.py`; **core must never import from `diag`** (a test enforces
   this). `compat/dspark.py` bridges the DSpark fork's patch6 and does nothing
   without it.
+- **This is the vLLM 0.31 line** (branch `vllm-0.31`, 0.5.x). It is rebased
+  onto `main` (0.4.x, the 0.21 line the cluster runs) for each `main`
+  release, and merged when the cluster moves (`docs/plan-0.31-port.md`).
+  Never deploy it to `head`/`worker` before step 4 of that plan.
+- **0.31-only patches:**
+  - `loadfail.py` wraps OffloadingConnector `get_transfer_results` and
+    Scheduler `_handle_failed_recving` (the request-level path).
+  - `copyapi.py` wraps the load handler's `_swap_blocks_batch` instance
+    attribute.
+
+  phase15 (15d2) and phase17 pin them.
+- **Tests on this branch:**
+  - DSpark mode is skipped (DSpark's patches are 0.21 files).
+  - phase1, 2, 3 and 10 skip with a reason: no GPU manager.
+  - Every skip says so; none passes silently.
 - **Patches on vLLM classes, which a port must re-check:** `loadfail.py`
   (Scheduler `_update_requests_with_invalid_blocks`, OffloadingConnector
   `get_block_ids_with_load_errors`), `diskio._arm_compute_wait` (upstream's
