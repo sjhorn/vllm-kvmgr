@@ -120,7 +120,14 @@ check("...and is instantiable, i.e. implements every abstract method",
       not type(sp).__abstractmethods__, repr(type(sp).__abstractmethods__))
 eq("block_size_factor stays 1 (we never set a uniform block size)",
    sp.block_size_factor, 1)
+from kvmgr import serve as _serve  # noqa: E402
+_starts = []
+_real_ms = _serve.maybe_start
+_serve.maybe_start = lambda: _starts.append(1)
 mgr = sp.get_manager()
+_serve.maybe_start = _real_ms
+eq("*** the disk manager starts the stats port (idempotent), so /kv exists "
+   "with no GPU manager ***", len(_starts), 1)
 check("get_manager returns an OffloadingManager",
       isinstance(mgr, base.OffloadingManager))
 check("...and the same one twice (the scheduler holds one)",

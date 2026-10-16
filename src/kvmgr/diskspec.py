@@ -3593,6 +3593,16 @@ class DSparkDiskOffloadingSpec(OffloadingSpec):
                 manifest_path=os.path.join(self.root_dir, "presence.json"),
             )
             _LIVE_MANAGER = self._manager
+            # The stats port (GET /kv, /kv/keys) is started by the GPU
+            # manager's constructor, in this same engine-core process. If that
+            # manager is not registered (vLLM 0.31 has no hook for it, or the
+            # registration failed), nothing else would start it, so the disk
+            # tier does too. Idempotent: the second call returns at once.
+            try:
+                from . import serve
+                serve.maybe_start()
+            except Exception:
+                logger.exception("kvmgr: could not start the stats port")
         return self._manager
 
     def get_handlers(
