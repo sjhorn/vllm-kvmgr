@@ -5,6 +5,27 @@
 
 # vllm-kvmgr
 
+> **This is the `release/0.4.x` branch: the vLLM 0.21 line, now in
+> maintenance.** It supports `vllm>=0.21.1rc1.dev0,<0.22` (see
+> `pyproject.toml`).
+>
+> - **The last release is [v0.4.11](https://github.com/sjhorn/vllm-kvmgr/releases/tag/v0.4.11).**
+>   The DSpark recipe's final 0.21 tag, `vllm-0.21-final`, mounts it.
+>   Production last ran [v0.4.10](https://github.com/sjhorn/vllm-kvmgr/releases/tag/v0.4.10)
+>   on 0.21, until 2026-10-16. v0.4.11 adds two things on top: the disk
+>   tier starts the stats port itself, and it names stranded fingerprint
+>   directories. It has passed the test suites but has not booted on the
+>   cluster.
+> - **The vLLM 0.31 line is 0.5.x**, on branch
+>   [`vllm-0.31`](https://github.com/sjhorn/vllm-kvmgr/tree/vllm-0.31) until
+>   it merges to `main`. On 0.31 kvmgr is the disk tier only, since 0.31 has
+>   no hook for the GPU KV manager.
+> - **The two lines' disk tiers are not interchangeable.** 0.31 changed the
+>   on-disk layout, so a 0.5.x engine never reads a 0.4.x tier, and the
+>   reverse. Give each its own `/kvoffload` directory.
+>
+> Fixes here only; new work goes to the 0.31 line.
+
 A vLLM plugin that does two jobs:
 
 1. **It decides which prompt blocks stay in GPU memory.** You can change how
