@@ -208,6 +208,14 @@ def load_kv_offload() -> types.ModuleType:
             parent, _, leaf = name.rpartition(".")
             setattr(sys.modules[parent], leaf, mod)
 
+    # vLLM 0.32: base.py (and the connector and tiering manager) import
+    # CacheHitSource. The real file: it is a pure enum with no vLLM imports.
+    if "vllm.v1.metrics" not in sys.modules:
+        sys.modules["vllm.v1.metrics"] = types.ModuleType("vllm.v1.metrics")
+        setattr(sys.modules["vllm.v1"], "metrics", sys.modules["vllm.v1.metrics"])
+    if "vllm.v1.metrics.cache_hit_source" not in sys.modules:
+        _load_file(os.path.join(PRISTINE, "vllm", "v1", "metrics", "cache_hit_source.py"),
+                   "vllm.v1.metrics.cache_hit_source")
     _load_file(os.path.join(kvo, "config.py"), "vllm.v1.kv_offload.config")
     _load_file(os.path.join(kvo, "base.py"), "vllm.v1.kv_offload.base")
     _load_file(os.path.join(kvo, "factory.py"), "vllm.v1.kv_offload.factory")

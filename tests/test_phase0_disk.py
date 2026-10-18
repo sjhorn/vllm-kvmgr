@@ -188,9 +188,15 @@ check("0.31 tiering: ONE /dev/shm region per host, rows of the WHOLE page",
       and "self._row_stride = kv_bytes_per_chunk" in _sor)
 check("...each worker writes at rank * cpu_page_size in it",
       "self._worker_offset = rank * cpu_page_size" in _sor)
-check("...and the worker's rank is device_index % world_size, so one GPU per "
-      "node makes BOTH nodes rank 0",
-      "current_device_index() % world_size" in tier_src)
+# *** CHANGED IN v0.32.0. *** 0.31 took the rank from
+# `current_device_index() % world_size`, so with one GPU per node BOTH nodes
+# were rank 0 -- the reason kvmgr's disk tier exists. v0.32.0 takes it from
+# `config.parallel.rank`. Whether upstream tiering now carries rank 1's half
+# on this cluster is NOT tested (the region is still one per host).
+check("...and since v0.32.0 the worker's rank is config.parallel.rank, not "
+      "device_index % world_size (0.31's both-nodes-rank-0 bug is fixed)",
+      "self.config.parallel.rank" in tier_src
+      and "current_device_index() % world_size" not in tier_src)
 
 print()
 print("== (0i) rank is in the PATH, deliberately not in the fingerprint ==")

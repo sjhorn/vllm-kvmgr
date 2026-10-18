@@ -51,12 +51,14 @@ from disk.
 
 ## What you need
 
-- **This is the vLLM 0.31 line** (branch `vllm-0.31`, versions 0.5.x).
-  `main` (0.4.x) is the 0.21 line that the cluster runs.
-  - Tested on vLLM 0.31.0 (CPU, in an Apple `container` on a Mac: one KV
-    group, six groups, and TP=2), and on a GB10 with a 0.31-era build.
-  - Not yet run on the cluster: `docs/plan-0.31-port.md`.
-  - What differs on 0.31 is in [On vLLM 0.31](#on-vllm-031).
+- **This is the vLLM 0.32 line** (branch `vllm-0.32`, versions 0.6.x).
+  The 0.31 line (`vllm-0.31`, 0.5.x) is what the cluster runs today, and
+  `main`/`release/0.4.x` (0.4.x) is the 0.21 line.
+  - kvmgr's own code is the 0.31 line's. What changed is the vendored vLLM
+    (`tests/upstream/`, from the v0.32.0 tag); every offline suite passes
+    against it.
+  - Not yet run on a GPU or the cluster.
+  - What differs on 0.31 and 0.32 is in [On vLLM 0.31](#on-vllm-031).
 - **No changes to vLLM itself.** The DSpark recipe adds some patches, but you
   do not need them. See [Without the DSpark patches](#without-the-dspark-patches).
 - **`PYTHONHASHSEED` set to a fixed number, and never changed.** vLLM names
@@ -96,6 +98,19 @@ from disk.
 - **Local testing without a GPU:** `scripts/local031.sh` runs vLLM 0.31's CPU
   image in an Apple `container`, using a plain-torch copy in place of the CUDA
   one. `down` also stops the container service.
+
+### On vLLM 0.32
+
+Everything above holds; kvmgr's code is unchanged. What moved upstream
+(v0.32.0, `tests/upstream/MANIFEST.txt`):
+- **Upstream tiering now takes its rank from `config.parallel.rank`.** On 0.31
+  it was `current_device_index() % world_size`, which made both nodes rank 0
+  on a one-GPU-per-node cluster, the reason this disk tier exists. Its region
+  is still one per host; whether it now carries rank 1's half is untested.
+- `kv_offload/base.py`, the connector and the tiering manager import
+  `vllm.v1.metrics.cache_hit_source.CacheHitSource` (vendored for the tests).
+- The functions kvmgr patches or relies on are unchanged from 0.31.
+
 ## Install
 
 Into a vLLM image:
