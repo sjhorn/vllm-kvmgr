@@ -13,6 +13,22 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   governs the engine** and wins any disagreement about restarting it.
 - Releases are tags (`v0.1.0` … `v0.4.11`), each
   naming the vLLM build it is proven on (`pyproject.toml` states the window).
+- **One release line per vLLM version** (since 2026-10-18). Each has its own
+  branch, its own checkout on the nodes, its own dist-info name and its own
+  disk tier, so a version switch never touches another line's files:
+
+  | line | branch | versions | node checkout | tier | status |
+  |---|---|---|---|---|---|
+  | vLLM 0.32 | `vllm-0.32` | 0.6.x | `~/vllm-kvmgr-032` (worktree) | `~/kvoffload-032` | **production** since 2026-10-18 12:05Z |
+  | vLLM 0.31 | `vllm-0.31` | 0.5.x | `~/vllm-kvmgr-031` (worktree) | `~/kvoffload-031` | rollback |
+  | vLLM 0.21 | `main`, `release/0.4.x` | 0.4.x | `~/vllm-kvmgr` (branch `main`, v0.4.10) | `~/kvoffload` | old rollback |
+
+  `main` is still the 0.4.x line. **A push of `main` to `head`/`worker` lands
+  in `~/vllm-kvmgr`, the 0.21 rollback checkout**, not in what serves. Deploy
+  a line by pushing ITS branch (`git push head vllm-0.32 && git push worker
+  vllm-0.32`); `updateInstead` updates that worktree. Moving `main` to a newer
+  line first needs those checkouts re-pointed, or a push of `main` rewrites the
+  0.21 rollback.
 - **It is the only copy.** The DSpark recipe repo
   (`~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark`) no
   longer holds one: its compose mounts `../vllm-kvmgr` on each node.
