@@ -1,40 +1,49 @@
 # tests/upstream/ -- vLLM sources the offline tests load, vendored
 #
-# Copied 2026-10-13 from the DSpark repo's patches/pristine/, which captured them
-# from the runtime image by `docker run --rm --entrypoint cat <image> <path>`
-# (never through a bind mount, which returns the patched file). Apache-2.0, same
-# as vLLM. Only the KV-relevant files are vendored.
+# Branch vllm-0.32. Re-vendored 2026-10-18 from the
+# upstream tag v0.32.0 (github.com/vllm-project/vllm, raw files at the tag), not from a
+# runtime image. Apache-2.0, same as vLLM. Only the KV-relevant files.
+# Connector files keep the flattened names the suites already use:
+#   distributed_kv_connector_offloading_connector.py
+#     <- vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+#   kv_connector_offloading/*.py
+#     <- vllm/distributed/kv_transfer/kv_connector/v1/offloading/*.py
 #
-# "Pristine" means unpatched by the DSpark fork's MNT-* overlays. It is the vLLM
-# build kvmgr is proven on, not necessarily upstream main.
+# The file set is v0.31.0's (15 of the 25 files changed in v0.32.0), plus
+# v1/metrics/cache_hit_source.py, which v0.32.0's base.py imports.
+# Changes from the 0.21.1rc1.dev339 set: v1/kv_offload/worker/worker.py is gone
+# upstream (OffloadingHandler/TransferSpec removed); added v1/kv_offload/config.py,
+# kv_connector_offloading/config.py, v1/kv_cache_spec_registry.py and
+# v1/kv_offload/cpu/shared_offload_region.py.
 #
-image=vllm-dspark-runtime:dspark-nvfp4-stage-c
-vllm_version=0.21.1rc1.dev339+g1967a5627bc3
-captured=2026-09-20 (core), 2026-10-07 (kv_offload, connector, executor)
-#
-# These files are the CONTRACT the tests pin. To port kvmgr to another vLLM,
-# re-vendor from that build and let the named failures say what moved.
+vllm_version=0.32.0
+tag_commit=5df63a7203cdb9328d824a27b682e77c7b9928be
+captured=2026-10-18
 #
 # sha256  lines  path
-b7e83ac78d50ea8652227eb1f245206c37dbd692597cf08348fef1e6df032025    207  vllm/distributed_kv_connector_offloading_connector.py
-eeac5a2da73684293959ee2eaef03c38b455eece02d6d7db8c4abd0ed960254c     60  vllm/kv_connector_offloading/common.py
-5ab3c65af3c0f78b0696bcc60c68ecfe51332c6d5f6684bb2cfa0e0ea9677d73    165  vllm/kv_connector_offloading/metrics.py
-3efd44a633890b3a81f29eb8ee170cb7dc31c3eea5b60093119ad2d43a3228a6    996  vllm/kv_connector_offloading/scheduler.py
-2537f6bee1327c01d3763207d11e26dfd1d0466c7a04b2ddc19c1c72b50df930    316  vllm/kv_connector_offloading/worker.py
-36a1683a7341a27862b0301e991e76734d968701632775932fbeb0420e894283    520  vllm/v1/core/block_pool.py
-d152b52dd908e37eb413c2dc19d63cd54a718f0b398923f520e3425039d6f860    689  vllm/v1/core/kv_cache_coordinator.py
-85563fd2bd5ada624fdd3f25e53c5ac9285620d2ae8f9b4033ec3d0e1d4514c3    601  vllm/v1/core/kv_cache_manager.py
-b02f18a8bf5b3fe016a5756d4868dfe0ba98c8d89bb128ecc6b55d28621cf66f   2149  vllm/v1/core/kv_cache_utils.py
-825073826b5be7fbe78e97c6e8fefa14636ca1cb2208f010f9da5acbdcb0a5a2   2369  vllm/v1/core/sched/scheduler.py
-fc68b4ca9914f7c81bda8cc4d0f7495d0665b1165f29d3b08fbc106064ecfb47   1421  vllm/v1/core/single_type_kv_cache_manager.py
-2cca69138a2fdfe0c08cc3b3767964f63ae24e3f5bfbb2ac6826fa70c295458f   1037  vllm/v1/executor/multiproc_executor.py
-af70c723898631e5461cc2873629a3bbd4b75492996e60be573686355d618f2a    411  vllm/v1/kv_offload/base.py
-d220dbad866029d598e06d44eb979164ccecabd72208091bbafad13fc19cd585     13  vllm/v1/kv_offload/cpu/common.py
-d0f3b1847a61466e7b23ea3d0c226a84b5926340c50b0e769170fae97f90e0e9    452  vllm/v1/kv_offload/cpu/gpu_worker.py
-c2e2a457dbe7a69281a8d06fef8bbd5ef849ea96e4c69042548e53f6250e45d1    103  vllm/v1/kv_offload/cpu/spec.py
-2e389bfd245dc41ccc3ddbc03897e09c9b95fab0676850fd73294c1b7a2353f5     63  vllm/v1/kv_offload/factory.py
-2d968749832c17dd4206dab9702c31402c312fe5eaf463faff3edee417f51d9d    126  vllm/v1/kv_offload/file_mapper.py
-4900265b4a1a812e20b9022c399f2175da08e25d1a10582cc31aef93a562a8c1    150  vllm/v1/kv_offload/tiering/fs/manager.py
-293bb15ae2e13a1d80d6bf7e2c1e4e072b3687720ab3edea86b52eb90b675f55    505  vllm/v1/kv_offload/tiering/manager.py
-a4910931830aa0f114e19ee3d498a6ed628f7674316518721576e67affc031a8    186  vllm/v1/kv_offload/tiering/spec.py
-1fbf4a7b3c2ee9c995f1163c7fc157e37289a676a8c21368a4efaa5afe9bacfa    176  vllm/v1/kv_offload/worker/worker.py
+fa748f6f40a76e83f7ece683e90d6cdede9a069c45438cfcdcdb70ff2dd901fe    271  vllm/distributed_kv_connector_offloading_connector.py
+9b3f042c6fa1581d10e8f688d2d9bc927bb41b780a9ea01f514d57228e20c978    104  vllm/kv_connector_offloading/common.py
+59119ba44f4fbc79506d37194c2d4a5007885fa8d469b86e7d661a0f1080bcfc    284  vllm/kv_connector_offloading/config.py
+be612281636ba034de1b04f26e01c33603b59fff35d608c669467cdb3172a528    502  vllm/kv_connector_offloading/metrics.py
+f9e2f9ad8a637b54c88589ebc58353b236fafe6688def4b22b68f275decbbc6b   2101  vllm/kv_connector_offloading/scheduler.py
+ca61db86f61b4b2638102ebb04d8a6cf20947203926a31a9f0cccf284ce2bcf8    323  vllm/kv_connector_offloading/worker.py
+6d1e0d89b43e3b2ae396906b9c2f0551dbe192b60d05f8c1ca2d93a91bbbeea3    901  vllm/v1/core/block_pool.py
+efd7193391197c555ebc0c8f2b593a6c4cb5b7da2978cd57414c0b71170f5971   1038  vllm/v1/core/kv_cache_coordinator.py
+d08315437c6b07040d1b7e12d7bd7d6e966c976a286f05a9788098cfdd9754c7    922  vllm/v1/core/kv_cache_manager.py
+af4164bca819f1cdc416077522a7019936fd38a523a482283eb91b08dae0e57a   2796  vllm/v1/core/kv_cache_utils.py
+d9a39870286c424cef2fc0730e24092ee3df67e848608e2278944846bab804ae   3436  vllm/v1/core/sched/scheduler.py
+fe38816a388bb5b615231f621adc208e3893d20349865d041cc4f646d4d89b0a   2707  vllm/v1/core/single_type_kv_cache_manager.py
+948c15e09617b02e2d0746d9ee20b43168b083da71313d05f06b29a753f8570b   1134  vllm/v1/executor/multiproc_executor.py
+b4a1d9e686574a9f8927720e2bee687f3a0b61b91487f71e6f21032ef4cf229a    219  vllm/v1/kv_cache_spec_registry.py
+8dea4e6cf774b15aa0fe0f9399f5ae53d32d976489f3251cf8d5620fe9e059dd    647  vllm/v1/kv_offload/base.py
+a6d7c35a1473778f9afd6067255217a3b45eb89d5d5c692a14d7c37c16be0a38     90  vllm/v1/kv_offload/config.py
+192fdaabd839011af4846db1ada440672cef8d643cc7e610175d23bee8275439     26  vllm/v1/kv_offload/cpu/common.py
+d074628708ad0378e9b73502c1f3945a647c531d54102a1db9f90ba1c7f98dff    898  vllm/v1/kv_offload/cpu/gpu_worker.py
+7ac04febeb8ff920fb350f7f6cfef366bd12c216a226980a4150c60cc6016cf9    379  vllm/v1/kv_offload/cpu/shared_offload_region.py
+12af986b9482049ea657218e31db262b372f0bfe4e73e383136bbd85533b508d    207  vllm/v1/kv_offload/cpu/spec.py
+77ad189b54ab4166fe06485c5a316107184342c793c6b7707fae51263b858c73     69  vllm/v1/kv_offload/factory.py
+c1edb0a15924c2d84c2a784094c2da7e14a26c3a12389b6dfcfaf1de20e7b474    144  vllm/v1/kv_offload/file_mapper.py
+7bbcecd31991ed85a39bc232d9b1a8b78dc43b6c4f345d63bc0d423bcead1e0d    353  vllm/v1/kv_offload/tiering/fs/manager.py
+8c38e771d321d98ab18fd7582c152d02abc00eb53eab91ececf935dc5f2fe20f   1034  vllm/v1/kv_offload/tiering/manager.py
+e9492da6f8e0a0037e28c9c96fc6d116d8e535e4128890472e40b79c2354dedc    496  vllm/v1/kv_offload/tiering/spec.py
+f2d383500ac0d11c91f463d549a3cf4b2c6720dccc7e776ac3d881cef6573cfe     32  vllm/v1/metrics/cache_hit_source.py

@@ -55,7 +55,6 @@ def eq(name, got, want):
 
 
 base = harness.load_kv_offload()
-wrk = sys.modules["vllm.v1.kv_offload.worker.worker"]
 fmap = sys.modules["vllm.v1.kv_offload.file_mapper"]
 fact = sys.modules["vllm.v1.kv_offload.factory"]
 
@@ -63,126 +62,49 @@ LIVE_BLOCK_SIZES = harness.LIVE_BLOCK_SIZES          # (256, 64, 64, 4, 8)
 WORLD_SIZE = 2                                        # one rank per node
 WHOLE_PAGE = 2_103_552                                # measured on disk
 
-print("== (0a) the abstract surface Phase 1 must implement ==")
+print("== (0a) the abstract surface (vLLM 0.31) ==")
 
 # If an upstream bump adds an abstract method, our spec stops being
-# instantiable -- and it would fail at BOOT, in the engine core, where the only
-# symptom this project reliably gets is "the plugin did not load".
-eq("OffloadingManager has exactly three abstract methods",
+# instantiable -- and it would fail at BOOT, in the engine core.
+eq("OffloadingManager has exactly four abstract methods (on_new_request is new)",
    sorted(base.OffloadingManager.__abstractmethods__),
-   ["lookup", "prepare_load", "prepare_store"])
-eq("OffloadingSpec has exactly two",
+   ["lookup", "on_new_request", "prepare_load", "prepare_store"])
+eq("OffloadingSpec has exactly two (get_worker replaced get_handlers)",
    sorted(base.OffloadingSpec.__abstractmethods__),
-   ["get_handlers", "get_manager"])
-eq("OffloadingHandler has exactly three",
-   sorted(wrk.OffloadingHandler.__abstractmethods__),
-   ["get_finished", "transfer_async", "wait"])
+   ["get_manager", "get_worker"])
+eq("OffloadingWorker has exactly four",
+   sorted(base.OffloadingWorker.__abstractmethods__),
+   ["get_finished", "submit_load", "submit_store", "wait"])
 check("touch/complete_*/take_events/reset_cache are CONCRETE, so we inherit them",
       all(m not in base.OffloadingManager.__abstractmethods__
           for m in ("touch", "complete_load", "complete_store",
                     "take_events", "reset_cache", "shutdown")))
+eq("lookup answers a LookupResult, not a bool",
+   sorted(m.name for m in base.LookupResult), ["HIT", "HIT_PENDING", "MISS", "RETRY"])
 
 print()
-print("== (0b) MEDIUM is the routing key, and ours must be novel ==")
-
-# worker.py: "transfers are forwarded to workers by (src_medium, dst_medium)",
-# and register_handler ASSERTS on a duplicate pair. So picking a medium string
-# already in use is not a subtle collision -- it is a boot-time assert.
-check("LoadStoreSpec.medium is abstract", "medium" in base.LoadStoreSpec.__abstractmethods__)
-check("...and is a staticmethod",
-      isinstance(inspect.getattr_static(base.LoadStoreSpec, "medium"), staticmethod))
-eq("GPU's medium string", base.GPULoadStoreSpec.medium(), "GPU")
-
-OUR_MEDIUM = "DSPARK_DISK"
-
-# CHECK THE COLLISION DIRECTLY, rather than leaving it to blow up downstream.
-# With a used string the duplicate-pair assert below does fire -- but as a bare
-# traceback with no name, which is this repo's "fails for the wrong reason" trap.
-# Scanned out of the pristine tree so a medium added upstream is picked up.
-_PRISTINE_KVO = os.path.join(REPO, "tests", "upstream", "vllm", "v1", "kv_offload")
-UPSTREAM_MEDIA = set()
-for _dir, _, _files in os.walk(_PRISTINE_KVO):
-    for _f in _files:
-        if not _f.endswith(".py"):
-            continue
-        _src = open(os.path.join(_dir, _f)).read()
-        for _m in re.finditer(r'def medium\(\)[^\n]*\n\s*return\s+"([^"]+)"', _src):
-            UPSTREAM_MEDIA.add(_m.group(1))
-check("found the upstream medium strings to avoid", bool(UPSTREAM_MEDIA),
-      repr(sorted(UPSTREAM_MEDIA)))
-eq("...and it is the WHOLE set -- the scan is only as complete as the tree, so "
-   "this fails if a pristine file is missing or upstream adds a medium",
-   sorted(UPSTREAM_MEDIA), ["CPU", "GPU"])
-check("*** our medium collides with none of them ***",
-      OUR_MEDIUM not in UPSTREAM_MEDIA, f"{OUR_MEDIUM} vs {sorted(UPSTREAM_MEDIA)}")
+print("== (0b) no medium routing: one worker per spec, direction explicit ==")
+check("LoadStoreSpec has no medium()", not hasattr(base.LoadStoreSpec, "medium"))
+eq("OffloadingEvent.medium is an enum", sorted(m.name for m in base.Medium),
+   ["CPU", "STORAGE"])
+OUR_MEDIUM = base.Medium.STORAGE
 
 
 class DiskSpecProbe(base.LoadStoreSpec):
-    """Minimal stand-in for Phase 1's DiskLoadStoreSpec: just the medium."""
+    pass
 
-    @staticmethod
-    def medium() -> str:
-        return OUR_MEDIUM
-
-
-w = wrk.OffloadingWorker()
-
-
-class H(wrk.OffloadingHandler):
-    def __init__(self):
-        self.calls = []
-
-    def transfer_async(self, job_id, spec):
-        self.calls.append((job_id, spec[0].medium(), spec[1].medium()))
-        return True
-
-    def get_finished(self):
-        return []
-
-    def wait(self, job_ids):
-        return None
-
-
-h_store, h_load = H(), H()
-w.register_handler(base.GPULoadStoreSpec, DiskSpecProbe, h_store)
-w.register_handler(DiskSpecProbe, base.GPULoadStoreSpec, h_load)
-eq("both directions register under their medium PAIR",
-   sorted(w.transfer_type_to_handler),
-   [("DSPARK_DISK", "GPU"), ("GPU", "DSPARK_DISK")])
-
-dup = False
-try:
-    w.register_handler(base.GPULoadStoreSpec, DiskSpecProbe, H())
-except AssertionError:
-    dup = True
-check("*** a duplicate medium pair ASSERTS -- so our medium must be novel ***", dup)
 
 print()
-print("== (0c) routing actually reaches the right handler ==")
-
-gpu = base.GPULoadStoreSpec(block_ids=[7, 8, 9], group_sizes=[3], block_indices=[0])
-ok = w.transfer_async(1, (gpu, DiskSpecProbe()))
-check("a GPU->DISK transfer is submitted", ok)
-eq("and it reached the STORE handler", h_store.calls, [(1, "GPU", "DSPARK_DISK")])
-eq("and not the load handler", h_load.calls, [])
-w.transfer_async(2, (DiskSpecProbe(), gpu))
-eq("the reverse reaches the LOAD handler", h_load.calls, [(2, "DSPARK_DISK", "GPU")])
-
-print()
-print("== (0d) TransferResult is where the Prometheus labels come from ==")
-
-# THIS IS NOT COSMETIC, and today proved it. The absence of a
-# `transfer_type="CPU_to_GPU"` series is what told us prepare_load had never
-# been called once -- a stronger statement than "the lookup missed". A handler
-# that omits these fields makes the restore path UNOBSERVABLE.
-res = wrk.TransferResult(job_id=1, success=True, transfer_size=123,
-                         transfer_time=0.5, transfer_type=("DSPARK_DISK", "GPU"))
+print("== (0d) TransferResult: no transfer_type on 0.31 ==")
+res = base.TransferResult(job_id=1, success=True, transfer_size=123,
+                          transfer_time=0.5)
 eq("TransferResult carries size", res.transfer_size, 123)
-eq("...time", res.transfer_time, 0.5)
-eq("...and the medium pair that becomes the metric label", res.transfer_type,
-   ("DSPARK_DISK", "GPU"))
-check("size/time/type all default to None, so forgetting them is silent",
-      wrk.TransferResult(job_id=2, success=True).transfer_size is None)
+check("...and no transfer_type (load/store is decided by _load_jobs)",
+      not hasattr(res, "transfer_type"))
+check("size and time default to None",
+      base.TransferResult(job_id=2, success=True).transfer_size is None)
+check("block ids are int32 now", base.GPULoadStoreSpec(
+    [1], group_sizes=[1], block_indices=[0]).block_ids.dtype == "int32")
 
 print()
 print("== (0e) GPULoadStoreSpec's group contract -- the 5-group layout ==")
@@ -228,12 +150,16 @@ print("== (0g) OUR SPEC NEEDS NO HYBRID SHIM, which is the find of this phase ==
 tier_src = open(os.path.join(REPO, "tests", "upstream", "vllm", "v1",
                              "kv_offload", "tiering", "spec.py")).read()
 base_src = inspect.getsource(base.OffloadingSpec.__init__)
-check("TieringOffloadingSpec is the one asserting a single block size",
-      "assert len(self.gpu_block_size) == 1" in tier_src)
+# vLLM 0.31: neither spec asserts a single block size any more, and the
+# divisibility check moved out of the spec into build_offloading_config.
+check("0.31: TieringOffloadingSpec no longer asserts a single block size",
+      "len(self.gpu_block_size) == 1" not in tier_src)
 check("*** and the BASE does NOT ***",
       "len(self.gpu_block_size) == 1" not in base_src)
-check("the base asserts only divisibility by hash_block_size",
-      "% self.hash_block_size == 0" in base_src)
+_occ = open(os.path.join(REPO, "tests", "upstream", "vllm",
+                         "kv_connector_offloading", "config.py")).read()
+check("divisibility by tokens_per_hash is asserted in build_offloading_config",
+      "group.tokens_per_block % tokens_per_hash == 0" in _occ)
 HASH_BLOCK_SIZE = 4   # the GCD of our five, resolved by patch8
 check("...which all five of our block sizes satisfy",
       all(b % HASH_BLOCK_SIZE == 0 for b in LIVE_BLOCK_SIZES),
@@ -242,9 +168,9 @@ check("...which all five of our block sizes satisfy",
 # And block_size_factor must stay 1: setting it needs ONE block size, which we
 # do not have. Factor 1 is also the only case the hybrid relaxation was ever
 # safe for, so this is the same constraint seen from the other side.
-check("block_size_factor defaults to 1", "self.block_size_factor: int = 1" in base_src)
-check("...and setting it REQUIRES a single block size, so we must not",
-      "len(gpu_block_sizes) == 1" in base_src)
+check("blocks_per_chunk defaults to 1", "blocks_per_chunk = 1" in _occ)
+check("...and setting it via block_size REQUIRES a single block size, so we must not",
+      "len(unique_tokens_per_block) == 1" in _occ)
 
 print()
 print("== (0h) the page arithmetic -- the number Phase 1's gate checks ==")
@@ -255,8 +181,22 @@ print("== (0h) the page arithmetic -- the number Phase 1's gate checks ==")
 eq("today's file size, measured on disk", WHOLE_PAGE, 2_103_552)
 eq("*** per-worker slice, which is what OUR files must be ***",
    WHOLE_PAGE // WORLD_SIZE, 1_051_776)
-check("tiering sizes its region by world_size (the half-empty cause)",
-      "* world_size" in tier_src)
+_sor = open(os.path.join(REPO, "tests", "upstream", "vllm", "v1", "kv_offload",
+                         "cpu", "shared_offload_region.py")).read()
+check("0.31 tiering: ONE /dev/shm region per host, rows of the WHOLE page",
+      '/dev/shm/vllm_offload_{engine_id}.mmap' in _sor
+      and "self._row_stride = kv_bytes_per_chunk" in _sor)
+check("...each worker writes at rank * cpu_page_size in it",
+      "self._worker_offset = rank * cpu_page_size" in _sor)
+# *** CHANGED IN v0.32.0. *** 0.31 took the rank from
+# `current_device_index() % world_size`, so with one GPU per node BOTH nodes
+# were rank 0 -- the reason kvmgr's disk tier exists. v0.32.0 takes it from
+# `config.parallel.rank`. Whether upstream tiering now carries rank 1's half
+# on this cluster is NOT tested (the region is still one per host).
+check("...and since v0.32.0 the worker's rank is config.parallel.rank, not "
+      "device_index % world_size (0.31's both-nodes-rank-0 bug is fixed)",
+      "self.config.parallel.rank" in tier_src
+      and "current_device_index() % world_size" not in tier_src)
 
 print()
 print("== (0i) rank is in the PATH, deliberately not in the fingerprint ==")
@@ -267,7 +207,7 @@ fm_src = inspect.getsource(fmap.FileMapper)
 check("get_file_name appends _r<rank>", "_r" in fm_src and "rank" in fm_src)
 check("...and the config file is shared BECAUSE rank is outside the hash",
       "rank lives outside the hash" in fm_src)
-for field in ("model_name", "hash_block_size", "tp_size", "dtype", "kv_cache_groups"):
+for field in ("model_name", "tokens_per_hash", "tp_size", "dtype", "kv_cache_groups"):
     check(f"fingerprint covers {field}", f'"{field}"' in fm_src)
 check("fingerprint does NOT cover rank",
       '"rank":' not in fm_src)

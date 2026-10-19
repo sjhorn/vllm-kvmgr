@@ -285,7 +285,7 @@ for k in (K1, K2, K3):
 m3.complete_store([K1, K2, K3], ctx)
 check("still no snapshot", not os.path.exists(os.path.join(tmp3, "presence.json")))
 m4 = mkmgr(tmp3)
-m4.lookup(K1, ctx)              # _ensure_index() loads on first use
+m4._lookup_bool(K1, ctx)              # _ensure_index() loads on first use
 eq("*** ALL THREE KEYS SURVIVED WITH NO SNAPSHOT AT ALL ***",
    len(m4._present), 3)
 eq("...reported as replayed adds", m4._stats.get("journal_adds"), 3)
@@ -297,7 +297,7 @@ print("== (8j) the filesystem prune still applies to replayed keys ==")
 # failed load, so a stale claim is an engine death, not a miss.
 os.unlink(os.path.join(tmp3, bytes(K2).hex() + ".bin"))
 m5 = mkmgr(tmp3)
-m5.lookup(K1, ctx)
+m5._lookup_bool(K1, ctx)
 eq("*** A REPLAYED KEY WITH NO FILE IS PRUNED ***", len(m5._present), 2)
 check("...and it is the right one", bytes(K2) not in m5._present)
 eq("...counted as pruned", m5._stats.get("manifest_pruned"), 1)
@@ -311,7 +311,7 @@ for k in (K1, K2):
 m6.complete_store([K1, K2], ctx)
 m6._journal_append(D.JOURNAL_REMOVE, [K1])     # the edge _enforce_budget uses
 m7 = mkmgr(tmp4)
-m7.lookup(K1, ctx)
+m7._lookup_bool(K1, ctx)
 eq("a journalled remove is honoured on reload", len(m7._present), 1)
 check("...and it removed the right key", bytes(K1) not in m7._present)
 
@@ -331,7 +331,7 @@ check("*** compacting IS DISCARDED once the snapshot is durable ***",
       not os.path.exists(os.path.join(tmp5, "presence.json.compacting")))
 eq("the live journal's counters are reset", m8._jstate()["records"], 0)
 m9 = mkmgr(tmp5)
-m9.lookup(K1, ctx)
+m9._lookup_bool(K1, ctx)
 eq("the index reloads from the snapshot alone", len(m9._present), 2)
 eq("...with no journal records to replay", m9._stats.get("journal_records"), 0)
 
@@ -354,7 +354,7 @@ with open(os.path.join(tmp6, "presence.json.compacting"), "w") as f:
 with open(os.path.join(tmp6, "presence.json.journal"), "w") as f:
     f.write(D.journal_encode(D.JOURNAL_ADD, [(K3, 0)]))
 m11 = mkmgr(tmp6)
-m11.lookup(K1, ctx)
+m11._lookup_bool(K1, ctx)
 eq("*** A CRASH MID-COMPACTION STILL YIELDS EVERY KEY, ONCE ***",
    len(m11._present), 3)
 check("...no key is duplicated", len(set(m11._present)) == len(m11._present))
@@ -412,7 +412,7 @@ try:
 except Exception:
     pass
 m14 = mkmgr(tmp8)
-m14.lookup(K1, ctx)
+m14._lookup_bool(K1, ctx)
 eq("...so the key still reloads", len(m14._present), 1)
 
 print()
@@ -436,7 +436,7 @@ check("records were written while it was on",
 FJ.write(journal_enabled=0)             # somebody turns the feature off
 KF.reset_for_tests()
 m16 = mkmgr(tmp9)
-m16.lookup(K1, ctx)
+m16._lookup_bool(K1, ctx)
 eq("*** THE RECORDS ARE STILL REPLAYED WITH THE KNOB OFF ***",
    len(m16._present), 2)
 eq("...and counted", m16._stats.get("journal_adds"), 2)
@@ -468,7 +468,7 @@ check("...and the live journal still holds the newer record",
       os.path.exists(os.path.join(tmpA, "presence.json.journal")))
 # Nothing may be lost: both keys must come back.
 mB = mkmgr(tmpA)
-mB.lookup(K1, ctx)
+mB._lookup_bool(K1, ctx)
 eq("...so BOTH keys survive the deferred rotate", len(mB._present), 2)
 
 FJ.write(journal_enabled=0)

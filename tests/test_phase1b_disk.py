@@ -283,7 +283,7 @@ print("== (b6) chunking: a job larger than the pool must still be accepted ==")
 
 from kvmgr.diskio import DiskStoreHandler  # noqa: E402
 
-wrk = sys.modules["vllm.v1.kv_offload.worker.worker"]
+wrk = sys.modules["vllm.v1.kv_offload.base"]  # 0.31: TransferResult lives here
 
 
 class FakeInner:
@@ -294,8 +294,7 @@ class FakeInner:
         self._done = []
         self.fail_next = False
 
-    def transfer_async(self, job_id, spec):
-        gpu, cpu = spec
+    def transfer_async(self, job_id, gpu, cpu):  # 0.31 inner signature
         self.subs.append((job_id, list(gpu.block_ids), list(gpu.group_sizes),
                           list(cpu.block_ids)))
         self._done.append(wrk.TransferResult(job_id=job_id,
@@ -506,8 +505,10 @@ eq("...covering every block exactly once",
 eq("...and every key got a file", h.stats["files"], 100)
 eq("all staging slots are returned", h._pool.available, 8)
 eq("no job state is left behind", len(h._jobs), 0)
-check("the transfer_type label names our medium",
-      done[0].transfer_type == ("GPU", "DSPARK_DISK"))
+# 0.31: TransferResult has no transfer_type; the connector labels a result
+# load or store by whether its job id is in _load_jobs.
+check("no transfer_type on 0.31's TransferResult",
+      not hasattr(done[0], "transfer_type"))
 
 print()
 print("== (b7) batching is PER GROUP, because the inner walks group_sizes ==")
@@ -753,7 +754,7 @@ eq("*** a restarted engine RECOVERS presence from disk -- the whole prize ***",
 # hazard: a file lost on the OTHER node answered True and became upstream's
 # bare assert.
 eq("*** a manifest-recovered key DEFERS rather than claiming ***",
-   m2.lookup(k_a, ctx2), None)
+   m2._lookup_bool(k_a, ctx2), None)
 eq("...and the defer put it on the verification queue",
    list(m2._wanted_map()), [bytes(k_a)])
 # one verification round, as the pump would apply it: both ranks vouch
@@ -763,7 +764,7 @@ _v = m2.verify_apply([bytes(k_a)],
                      2)
 eq("...the verdict carries no fault", _v["fault"], None)
 eq("*** and THEN lookup hits -- the prize still survives the restart ***",
-   m2.lookup(k_a, ctx2), True)
+   m2._lookup_bool(k_a, ctx2), True)
 eq("...the queue is drained", list(m2._wanted_map()), [])
 
 # ...and an entry whose own file has gone is PRUNED, not trusted.
@@ -773,20 +774,20 @@ os.unlink(FakeMapper.get_file_name(k_b))
 m3 = diskspec.DiskPresenceManager(FakeMapper, num_workers=2, manifest_path=mpath)
 eq("*** an entry whose file is gone is PRUNED ***", m3._stats["manifest_pruned"], 1)
 eq("...the survivor is kept", m3._stats["manifest_loaded"], 1)
-eq("...and lookup refuses the pruned key", m3.lookup(k_b, ctx2), False)
+eq("...and lookup refuses the pruned key", m3._lookup_bool(k_b, ctx2), False)
 eq("...while still DEFERRING the live one until the cluster vouches for it",
-   m3.lookup(k_a, ctx2), None)
+   m3._lookup_bool(k_a, ctx2), None)
 m3.verify_apply([bytes(k_a)],
                 [{"rank": 0, "missing": [], "wrong_size": [], "checked": 1},
                  {"rank": 1, "missing": [], "wrong_size": [], "checked": 1}], 2)
-eq("...and then hitting it", m3.lookup(k_a, ctx2), True)
+eq("...and then hitting it", m3._lookup_bool(k_a, ctx2), True)
 
 # a corrupt manifest must cost recompute, never correctness
 open(mpath, "w").write("{not json")
 m4 = diskspec.DiskPresenceManager(FakeMapper, num_workers=2, manifest_path=mpath)
 eq("*** an unreadable manifest yields an EMPTY index, not a wrong one ***",
    len(m4._present), 0)
-eq("...so lookup simply misses", m4.lookup(k_a, ctx2), False)
+eq("...so lookup simply misses", m4._lookup_bool(k_a, ctx2), False)
 F.write(disk_restore=0)
 flags.reset_for_tests()
 
@@ -851,7 +852,7 @@ check("...and the snapshot says it is paused",
 eq("*** a paused store claims NOTHING present ***",
    mgrP.snapshot()["present"], 0)
 F.write(kvmgr_enabled=1, disk_store_paused=0, disk_restore=1)
-eq("...so a lookup after a pause correctly MISSES", mgrP.lookup(kp[0], ctxP), False)
+eq("...so a lookup after a pause correctly MISSES", mgrP._lookup_bool(kp[0], ctxP), False)
 
 # and it is HOT in both directions, which is the whole point
 F.write(kvmgr_enabled=1, disk_store_paused=1)
@@ -972,8 +973,8 @@ check("*** transfer_time is SET, or the connector drops the metric ***",
 check("...and TRUTHY, because the gate is `if transfer_result.transfer_time`",
       bool(r0.transfer_time), repr(r0.transfer_time))
 check("...with transfer_size beside it", r0.transfer_size is not None)
-check("...and transfer_type naming OUR medium, so the series is findable",
-      r0.transfer_type == ("GPU", diskspec.DISK_MEDIUM), repr(r0.transfer_type))
+check("...and no transfer_type (0.31 labels by _load_jobs membership)",
+      not hasattr(r0, "transfer_type"))
 
 # A transfer too fast to measure must still be observable: 0.0 is dropped by
 # the same truthiness gate that drops None, so the floor is what keeps a fast
@@ -1099,7 +1100,7 @@ try:
     live.complete_store(kk, base.ReqContext(req_id="rq"))
     eq("...`present` follows a store",
        diskspec.live_manager_snapshot()["present"], 3)
-    live.lookup(kk[0], base.ReqContext(req_id="rq"))
+    live._lookup_bool(kk[0], base.ReqContext(req_id="rq"))
     s2 = diskspec.live_manager_snapshot()
     check("...and `lookup` counts, so a miss is distinguishable from no call",
           s2["lookup"] >= 1)
@@ -2845,9 +2846,8 @@ class _CapLogKw(_CapLog):
 class FakeLoadInner(FakeInner):
     """FakeInner for the LOAD direction, whose spec is (CPU, GPU)."""
 
-    def transfer_async(self, job_id, spec):
-        cpu, gpu = spec
-        return FakeInner.transfer_async(self, job_id, (gpu, cpu))
+    def transfer_async(self, job_id, cpu, gpu):
+        return FakeInner.transfer_async(self, job_id, gpu, cpu)
 
 
 def mkloadhandler(pool_size, nrefs=REFS):
@@ -3119,11 +3119,11 @@ class _Inner7(FakeLoadInner):
         self._stream_pool = []
         self.used = []
 
-    def transfer_async(self, job_id, spec):
+    def transfer_async(self, job_id, src, dst):    # vLLM 0.31's signature
         st = self._stream_pool.pop() if self._stream_pool else _Stream7()
         self.used.append(list(st.waited))
         self._stream_pool.append(st)          # returned on completion
-        return FakeLoadInner.transfer_async(self, job_id, spec)
+        return FakeLoadInner.transfer_async(self, job_id, src, dst)
 
 
 _had_cuda = hasattr(_torch7, "cuda")
@@ -3227,10 +3227,12 @@ finally:
 _gw7 = open(os.path.join(REPO, "tests", "upstream", "vllm", "v1", "kv_offload",
                          "cpu", "gpu_worker.py")).read()
 check("upstream's handler takes its stream with _stream_pool.pop()",
-      "stream = self._stream_pool.pop() if self._stream_pool else" in _gw7)
-check("...and on this vLLM waits on compute for STORES only",
-      "if self.gpu_to_cpu:\n            # wait for model computation to finish "
-      "before offloading\n            stream.wait_stream(" in _gw7)
+      "self._stream_pool.pop() if self._stream_pool else" in _gw7)
+# vLLM 0.31 waits on compute for LOADS too (the fix 0.21 lacked), so our arm
+# is a second, harmless wait there. Pinned so a port notices if it changes.
+check("...and on 0.31 waits on compute for loads AND stores, unconditionally",
+      "        stream.wait_stream(current_platform.current_stream())\n" in _gw7
+      and "if self.gpu_to_cpu:\n            # wait for model computation" not in _gw7)
 _lg7 = open(os.path.join(REPO, "src", "kvmgr", "diag", "ledger.py")).read()
 check("the ledger's load submit line carries wait_compute",
       '"wait_compute": getattr(h, "_wait_compute_last", None)' in _lg7)
@@ -3534,6 +3536,11 @@ eq("67 blocks: rounds_planned 3, the last a 1-block tail",
    [(1, 3, 34, False), (2, 3, 1, False), (3, 3, 0, True)])
 eq("ext_tokens = blocks x the group's block size; start from block_indices",
    (_plan["ext_tokens"], _plan["ext_start_token"]), ({"0": 67 * 256}, {"0": 0}))
+h10t = mkloadhandler(80)
+h10t._spec.tokens_per_block = (64, 64, 64, 4, 8)      # 0.31's name
+_run_job(h10t, 106, 5, 4000, _busy_step)
+eq("0.31's tokens_per_block gives ext_tokens too",
+   [r for r in _led_lines(106) if r["ev"] == "plan"][0]["ext_tokens"], {"0": 5 * 64})
 eq("a step with a forward pass reports its tokens",
    {r["step_tokens"] for r in _subs}, {4096})
 

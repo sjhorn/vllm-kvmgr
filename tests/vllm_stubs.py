@@ -238,6 +238,18 @@ def install() -> None:
 
     req.Request = Request
 
+    # ---- vLLM 0.31: what kv_offload/base.py and file_mapper.py import ----
+    hints = _mod("vllm.v1.kv_hints")
+
+    class KvHintsEnvelope:  # only ever an annotation in base.py
+        pass
+
+    hints.KvHintsEnvelope = KvHintsEnvelope
+    cmap = _mod(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping")
+    # Only reached when config.canonical_layout is set, which ours never is.
+    cmap.canonical_format_id = lambda layout: f"canonical:{layout}"
+
     # ---- vllm.v1.kv_cache_interface ----------------------------------
     _install_kv_cache_interface()
 

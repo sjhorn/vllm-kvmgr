@@ -51,11 +51,14 @@ from disk.
 
 ## What you need
 
-- **vLLM `0.21.1rc1.dev339+g1967a5627bc3`.** This is the version it is tested
-  on. `pyproject.toml` allows `>=0.21.1rc1.dev0,<0.22`, but the plugin uses
-  some private parts of vLLM, so other versions in that range may break. To
-  move to a new vLLM, copy that version's files into `tests/upstream/` and run
-  the tests. A change in vLLM shows up as a test failure with a name.
+- **This is the vLLM 0.32 line** (branch `vllm-0.32`, versions 0.6.x).
+  The 0.31 line (`vllm-0.31`, 0.5.x) is what the cluster runs today, and
+  `main`/`release/0.4.x` (0.4.x) is the 0.21 line.
+  - kvmgr's own code is the 0.31 line's. What changed is the vendored vLLM
+    (`tests/upstream/`, from the v0.32.0 tag); every offline suite passes
+    against it.
+  - Not yet run on a GPU or the cluster.
+  - What differs on 0.31 and 0.32 is in [On vLLM 0.31](#on-vllm-031).
 - **No changes to vLLM itself.** The DSpark recipe adds some patches, but you
   do not need them. See [Without the DSpark patches](#without-the-dspark-patches).
 - **`PYTHONHASHSEED` set to a fixed number, and never changed.** vLLM names
@@ -63,6 +66,50 @@ from disk.
   names, and the files on disk are never found again. There is no error; you
   just get misses. Changing the number later has the same effect.
 - `--enable-prefix-caching`, and a folder you can write to on every node.
+
+
+## On vLLM 0.31
+
+- **Only the disk tier.** 0.31 has no `spec_manager_map` or
+  `MLAAttentionManager`, so kvmgr's GPU KV manager is not registered, and
+  the log says so. Main plan item 3 decides whether it is rebuilt.
+- **A failed restore is reported by request.** 0.31's scheduler refuses
+  block-level load failures on any model with more than one KV group, and
+  raises. So `loadfail` puts the request in `failed_recving`, and upstream
+  restarts it from token 0, which on 0.21 was our multi-group behaviour.
+- **`load_copy_api`** wraps the restore handler's own `_swap_blocks_batch`,
+  since 0.31 resolves its copy routine once, at init. When 0.31 has picked its
+  Triton kernel (pinned pages all under 28 KiB) there is no batch call to
+  split, and `/kv/workers` says so (`copy_api_why`).
+- **Diagnostics:**
+  - `diag_tiering_shims` stands down (0.31 has none of what it patched).
+  - The ledger's `in_step` is `null` on model runner V2, which keeps its block
+    tables on the GPU. `req_in_step` is still read.
+- **On a GB10 (DGX Spark):**
+  - Start vLLM with `--safetensors-load-strategy eager`. The 64K-page kernel
+    hangs the default lazy loader at the first weight copy, with the GPU idle.
+    That hang, not missing sm_121 kernels, is what stalled both the stock
+    `vllm/vllm-openai:v0.31.0` and a `12.1a` build (corrected 2026-10-16).
+    sm_120 code runs on sm_121, and v0.31.0 pins an SM120-capable DeepGEMM.
+    The stock image is still unproven on GB10 with eager loading.
+  - Run the container with `--ulimit memlock=-1`.
+
+  `scripts/cuda031.sh` does all three.
+- **Local testing without a GPU:** `scripts/local031.sh` runs vLLM 0.31's CPU
+  image in an Apple `container`, using a plain-torch copy in place of the CUDA
+  one. `down` also stops the container service.
+
+### On vLLM 0.32
+
+Everything above holds; kvmgr's code is unchanged. What moved upstream
+(v0.32.0, `tests/upstream/MANIFEST.txt`):
+- **Upstream tiering now takes its rank from `config.parallel.rank`.** On 0.31
+  it was `current_device_index() % world_size`, which made both nodes rank 0
+  on a one-GPU-per-node cluster, the reason this disk tier exists. Its region
+  is still one per host; whether it now carries rank 1's half is untested.
+- `kv_offload/base.py`, the connector and the tiering manager import
+  `vllm.v1.metrics.cache_hit_source.CacheHitSource` (vendored for the tests).
+- The functions kvmgr patches or relies on are unchanged from 0.31.
 
 ## Install
 

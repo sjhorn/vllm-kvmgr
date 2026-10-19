@@ -59,124 +59,84 @@ FileMapper = sys.modules["vllm.v1.kv_offload.file_mapper"].FileMapper
 GROUPS = [(256, "g0"), (64, "g1"), (64, "g2"), (4, "g3"), (8, "g4")]
 
 
+_oc = sys.modules["vllm.v1.kv_offload.config"]
+from dataclasses import replace as _rep  # noqa: E402
+
+
 class _Cfg:
     def __init__(self, **kw):
         self.__dict__.update(kw)
 
 
-def fake_self(cache_block_size: int, *, hash_block_size: int = 4, rank: int = 0):
-    """A stand-in for a constructed spec, differing ONLY in the forked field.
+def ocfg(*, tokens_per_hash=4, rank=0, model="deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+         dtype="nvfp4_ds_mla", tp=2, groups=GROUPS):
+    return _oc.OffloadingConfig(
+        groups=tuple(_oc.OffloadingGroupConfig(tokens_per_block=bs,
+                                               layer_names=(n,), group_id=i)
+                     for i, (bs, n) in enumerate(groups)),
+        worker_kv_bytes_per_block=1, enable_kv_cache_events=False,
+        extra_config={}, engine_id="e",
+        model=_oc.OffloadingModelConfig(name=model, dtype=dtype),
+        cache=_oc.OffloadingCacheConfig(tokens_per_hash=tokens_per_hash,
+                                        blocks_per_chunk=1),
+        parallel=_oc.OffloadingParallelConfig(
+            rank=rank, world_size=2, tp_size=tp, pp_size=1, pcp_size=1,
+            dcp_size=1, data_parallel_index=0, data_parallel_size=1,
+            data_parallel_rank_local=None, is_parallelism_agnostic=False))
 
-    `cache_block_size` is what `cache_config.block_size` reads in this process:
-    256 in a worker, 4 in the engine core. A correct mapper ignores it.
-    """
-    vllm_config = _Cfg(
-        model_config=_Cfg(model="deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"),
-        cache_config=_Cfg(block_size=cache_block_size, cache_dtype="nvfp4_ds_mla"),
-        parallel_config=_Cfg(
-            tensor_parallel_size=2, pipeline_parallel_size=1,
-            prefill_context_parallel_size=1, decode_context_parallel_size=1,
-            rank=rank, world_size=2,
-        ),
-    )
-    kv_cache_config = _Cfg(
-        kv_cache_groups=[
-            _Cfg(kv_cache_spec=_Cfg(block_size=bs), layer_names=[name])
-            for bs, name in GROUPS
-        ],
-    )
-    return _Cfg(
-        vllm_config=vllm_config,
-        kv_cache_config=kv_cache_config,
-        hash_block_size=hash_block_size,
-        block_size_factor=1,
-        root_dir="/kvoffload/" + diskspec.DISK_FORMAT_ROOT,
-        _mapper=None,
-    )
+
+def fake_self(**kw):
+    """A stand-in for a constructed spec (0.31: everything from one config)."""
+    c = ocfg(**kw)
+    return _Cfg(config=c, tokens_per_hash=c.cache.tokens_per_hash,
+                blocks_per_chunk=1,
+                root_dir="/kvoffload/" + diskspec.DISK_FORMAT_ROOT, _mapper=None)
 
 
 def mapper_for(**kw):
-    """Call the real `file_mapper` property function against a fake self."""
-    fn = diskspec.DSparkDiskOffloadingSpec.file_mapper
-    return fn(fake_self(**kw))
+    """Call the real `file_mapper` function against a fake self."""
+    return diskspec.DSparkDiskOffloadingSpec.file_mapper(fake_self(**kw))
 
 
-print("\n--- the fork itself: two processes, one path ---")
+print("\n--- vLLM 0.31: the 0.21 fork cannot happen ---")
+# On 0.21 the worker and the engine core built the path from different
+# cache_config.block_size values. On 0.31 both build it from ONE normalized
+# OffloadingConfig, and tokens_per_hash comes from resolve_kv_cache_block_sizes
+# in both. So upstream's own helper no longer forks, which is what the 0.21
+# note said would let the override go. We keep constructing directly only
+# because the format version and model content id must be in the hash.
+_fms = open(os.path.join(REPO, "tests", "upstream", "vllm", "v1", "kv_offload",
+                         "file_mapper.py")).read()
+check("upstream's helper reads config.cache.tokens_per_hash, not cache_config",
+      "tokens_per_hash=config.cache.tokens_per_hash" in _fms
+      and "cache_config" not in _fms)
 
-worker = mapper_for(cache_block_size=256)     # what the worker sees
-engine = mapper_for(cache_block_size=4)       # what the engine core sees
-
-eq("THE FIX: worker and engine-core agree on the base path",
-   worker.base_path, engine.base_path)
-eq("...and on every field", worker.fields, engine.fields)
-check("the live fork is reproduced by the HELPER we stopped using",
-      True, "see the next block")
-
-# Prove the bug is real rather than asserted -- build both sides the way
-# `from_offloading_spec` does and show they diverge. If this ever stops
-# diverging, upstream fixed it and the override can go.
-def helper_fields(cache_block_size):
-    s = fake_self(cache_block_size=cache_block_size)
-    return FileMapper(
-        root_dir=s.root_dir,
-        model_name=s.vllm_config.model_config.model,
-        hash_block_size=s.vllm_config.cache_config.block_size,   # <- the bug
-        gpu_blocks_per_file=1,
-        tp_size=2, pp_size=1, pcp_size=1, dcp_size=1, rank=0,
-        dtype="nvfp4_ds_mla",
-        kv_cache_groups=[{"block_size": bs, "layer_names": [n]} for bs, n in GROUPS],
-    )
-
-
-h_worker, h_engine = helper_fields(256), helper_fields(4)
-check("upstream's own derivation DOES fork on this layout",
-      h_worker.base_path != h_engine.base_path,
-      f"{os.path.basename(h_worker.base_path)} != {os.path.basename(h_engine.base_path)}")
-eq("...and it forks in exactly one field, as measured",
-   [k for k in h_worker.fields if h_worker.fields[k] != h_engine.fields[k]],
-   ["hash_block_size"])
+worker = mapper_for()
+eq("rank 0 and rank 1 share one base", mapper_for(rank=1).base_path,
+   worker.base_path)
 
 print("\n--- the fingerprint still fingerprints ---")
-
-eq("hash_block_size is the RESOLVED value, not the CLI's",
-   worker.fields["hash_block_size"], 4)
+eq("tokens_per_hash is in the hash", worker.fields["tokens_per_hash"], 4)
 check("the five real block sizes are in the hash",
-      [g["block_size"] for g in worker.fields["kv_cache_groups"]]
+      [g["tokens_per_block"] for g in worker.fields["kv_cache_groups"]]
       == [bs for bs, _ in GROUPS])
+check("a changed tokens_per_hash still changes the path",
+      mapper_for(tokens_per_hash=8).base_path != worker.base_path)
+for label, kw in (("model", {"model": "other/model"}), ("dtype", {"dtype": "fp8"}),
+                  ("tp_size", {"tp": 4}),
+                  ("group block size", {"groups": [(128, "g0")] + GROUPS[1:]})):
+    check(f"a changed {label} refuses the old bytes",
+          mapper_for(**kw).base_path != worker.base_path)
 
-for field, alt in (("hash_block_size", 8),):
-    other = mapper_for(cache_block_size=256, hash_block_size=alt)
-    check(f"a changed {field} still changes the path",
-          other.base_path != worker.base_path,
-          f"{alt} vs 4")
-
-# A different model, quantisation or TP size must NOT inherit the same bytes.
-for label, mut in (
-    ("model", lambda s: setattr(s.vllm_config.model_config, "model", "other/model")),
-    ("dtype", lambda s: setattr(s.vllm_config.cache_config, "cache_dtype", "fp8")),
-    ("tp_size", lambda s: setattr(s.vllm_config.parallel_config,
-                                  "tensor_parallel_size", 4)),
-    ("group block size", lambda s: setattr(
-        s.kv_cache_config.kv_cache_groups[0].kv_cache_spec, "block_size", 128)),
-):
-    s = fake_self(cache_block_size=256)
-    mut(s)
-    got = diskspec.DSparkDiskOffloadingSpec.file_mapper(s)
-    check(f"a changed {label} refuses the old bytes", got.base_path != worker.base_path)
-
-print("\n--- rank lives OUTSIDE the hash, which is what shares the index ---")
-
-r1 = mapper_for(cache_block_size=4, rank=1)
-eq("both ranks share one base", r1.base_path, worker.base_path)
-check("...and separate only in the file name",
-      r1.rank == 1 and worker.rank == 0)
+print("\n--- the dtype fork (0.31 rewrites fp8 -> fp8_ds_mla in the WORKERS only) ---")
+eq("*** worker fp8_ds_mla and engine core fp8 share ONE base ***",
+   mapper_for(dtype="fp8_ds_mla").base_path, mapper_for(dtype="fp8").base_path)
+check("...and nvfp4_ds_mla is still a different tier from fp8",
+      mapper_for(dtype="nvfp4_ds_mla").base_path != mapper_for(dtype="fp8").base_path)
 
 print("\n--- upstream drift: a new field must fail LOUDLY, not be dropped ---")
-
-# We construct FileMapper directly, so a field upstream adds would silently
-# default. The contract to re-check on an engine bump is this key set.
 probe = FileMapper(
-    root_dir="/x", model_name="m", hash_block_size=4, gpu_blocks_per_file=1,
+    root_dir="/x", model_name="m", tokens_per_hash=4, blocks_per_file=1,
     tp_size=1, pp_size=1, pcp_size=1, dcp_size=1, rank=0, dtype="d",
     kv_cache_groups=[],
 )

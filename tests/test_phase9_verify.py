@@ -188,18 +188,18 @@ for k in (K1, K2):
 m = restored(tmp, [K1, K2])
 eq("the manifest loaded both keys", m._stats["manifest_loaded"], 2)
 eq("*** a present but UNVERIFIED key DEFERS -- None, not True ***",
-   m.lookup(K1, Ctx()), None)
+   m._lookup_bool(K1, Ctx()), None)
 eq("...and `hit` is NOT counted for a defer", m._stats["hit"], 0)
 eq("...the defer is counted as what it is", m._stats.get("verify_deferred"), 1)
 eq("...and the key is queued for the pump", list(m._wanted_map()), [bytes(K1)])
 eq("a key that is simply ABSENT still answers False at once",
-   m.lookup(K3, Ctx()), False)
+   m._lookup_bool(K3, Ctx()), False)
 eq("...and absent keys are never queued", list(m._wanted_map()), [bytes(K1)])
 
 print()
 print("== (9d) the pump's verdict, applied: the SAME key then answers ==")
 m.verify_apply([bytes(K1)], [vouch(0, checked=1), vouch(1, checked=1)], 2)
-eq("*** and THEN the key hits ***", m.lookup(K1, Ctx()), True)
+eq("*** and THEN the key hits ***", m._lookup_bool(K1, Ctx()), True)
 eq("...now `hit` is counted", m._stats["hit"], 1)
 eq("...and the queue is drained", list(m._wanted_map()), [])
 eq("the verified count is visible", m._verify_snapshot()["verified"], 1)
@@ -214,14 +214,14 @@ KF.reset_for_tests()
 for k in (K1, K2):
     touch(tmp, k)
 m = restored(tmp, [K1, K2])
-m.lookup(K1, Ctx())
+m._lookup_bool(K1, Ctx())
 m.verify_apply([bytes(K1), bytes(K2)],
                [vouch(0, checked=2), vouch(1, missing=[bytes(K1).hex()], checked=2)], 2)
 check("*** the condemned key is OUT of the index ***", bytes(K1) not in m._present)
 check("...and the clean one is still in it", bytes(K2) in m._present)
 eq("...the drop is counted", m._stats.get("verify_forgot"), 1)
 eq("...and lookup now simply misses rather than claiming",
-   m.lookup(K1, Ctx()), False)
+   m._lookup_bool(K1, Ctx()), False)
 # *** JOURNALLED, or a boot resurrects a key the cluster has just said it
 # cannot serve. Same ordering argument as eviction: a remove recorded for a
 # file that survives costs one re-store; a delete with no record is an orphan.
@@ -240,7 +240,7 @@ eq("the forgotten key is offered again", [bytes(k) for k in out.keys_to_store],
 m.complete_store([K1], Ctx())
 check("...it is back in the index", bytes(K1) in m._present)
 eq("*** and born VERIFIED, because complete_store IS the all-ranks edge ***",
-   m.lookup(K1, Ctx()), True)
+   m._lookup_bool(K1, Ctx()), True)
 
 print()
 print("== (9g) a defer EXPIRES to False, so nothing waits for ever ==")
@@ -249,11 +249,11 @@ F.write(disk_restore=1, disk_verify_enabled=1, disk_verify_defer_s=0.0001)
 KF.reset_for_tests()
 touch(tmp, K1)
 m = restored(tmp, [K1])
-eq("the first ask defers", m.lookup(K1, Ctx()), None)
+eq("the first ask defers", m._lookup_bool(K1, Ctx()), None)
 import time as _t
 _t.sleep(0.01)
 eq("*** and once the budget is spent it answers MISS, not a claim ***",
-   m.lookup(K1, Ctx()), False)
+   m._lookup_bool(K1, Ctx()), False)
 eq("...counted", m._stats.get("verify_defer_expired"), 1)
 
 print()
@@ -267,7 +267,7 @@ m = restored(tmp, [K1])
 m.verify_fault("rank 1 did not answer (test)")
 check("*** a fault is recorded ***", D._VERIFY_FAULT is not None)
 eq("...presence REFUSES while it stands -- never 'probably fine'",
-   m.lookup(K1, Ctx()), False)
+   m._lookup_bool(K1, Ctx()), False)
 eq("...and the refusal is counted", m._stats.get("verify_refused_fault"), 1)
 _snap = m._verify_snapshot()
 check("*** the fault is in the snapshot, so a script can FAIL on it ***",
@@ -285,7 +285,7 @@ print("== (9i) verification OFF is exactly today's behaviour ==")
 F.write(disk_restore=1, disk_verify_enabled=0)
 KF.reset_for_tests()
 eq("*** with the knob off a present key hits at once, no defer ***",
-   m.lookup(K1, Ctx()), True)
+   m._lookup_bool(K1, Ctx()), True)
 F.write(disk_restore=1, disk_verify_enabled=1)
 KF.reset_for_tests()
 
@@ -510,7 +510,7 @@ for k in MANY:
     touch(tmp, k)
 m8 = restored(tmp, MANY)
 for k in MANY:
-    m8.lookup(k, Ctx())
+    m8._lookup_bool(k, Ctx())
 eq("every unverified ask is queued", len(m8._wanted_map()), len(MANY))
 eq("*** the chunk bounds the RPC message ***", len(m8._verify_chunk()), 3)
 eq("...oldest first, so the request closest to giving up is served first",
@@ -538,7 +538,7 @@ check("*** the background sweep picks up already-verified keys ***",
       len(_chunk) >= 1, f"{len(_chunk)} key(s)")
 eq("*** and it does NOT enqueue them, so they stay claimable ***",
    len(m9._wanted_map()), 0)
-eq("...a lookup during re-verification still hits", m9.lookup(K1, Ctx()), True)
+eq("...a lookup during re-verification still hits", m9._lookup_bool(K1, Ctx()), True)
 check("...and the background work is counted",
       (m9._stats.get("verify_bg_checked") or 0) >= 1)
 F.write(disk_restore=1, disk_verify_enabled=1, disk_verify_bg_per_s=0)
@@ -696,7 +696,7 @@ eq("...pruning none", m._stats["manifest_pruned"], 0)
 check("*** every survivor is BORN VERIFIED, so no lookup can defer ***",
       all(bytes(k) in m._verified_set() for k in BK))
 eq("...and a lookup answers at once, with no deferral",
-   m.lookup(BK[0], Ctx()), True)
+   m._lookup_bool(BK[0], Ctx()), True)
 eq("...nothing was queued", len(m._wanted_map()), 0)
 check("the boot names HOW it checked, and it says all-ranks",
       (getattr(m, "_boot_how", "") or "").startswith("all-ranks"),
@@ -717,7 +717,7 @@ check("...even though it exists on this one, which the old walk could not see",
       os.path.exists(os.path.join(tmp, bytes(BK[2]).hex() + ".bin")))
 check("...so it cannot be claimed", bytes(BK[2]) not in m._present)
 eq("...and lookup misses it rather than loading into an assert",
-   m.lookup(BK[2], Ctx()), False)
+   m._lookup_bool(BK[2], Ctx()), False)
 eq("...the drop is counted", m._stats.get("boot_verify_dropped"), 1)
 
 print()
@@ -944,14 +944,14 @@ check("*** `_verified` is NOT cleared -- a re-check must not be a cache "
 eq("...and the key inside the chunk is vouched for too",
    bytes(RK[0]) in m._verified_set(), True)
 eq("...so an already-vouched-for key still answers at once",
-   m.lookup(RK[0], Ctx()), True)
+   m._lookup_bool(RK[0], Ctx()), True)
 # RK[1] is inside the chunk the pump just verified, so the discriminator has
 # to be a key the chunk did not reach -- otherwise this passes for the wrong
 # reason and would keep passing with the re-queue removed.
 # RK[8]: past the chunk AND not one of the two vouched for above, so it is
 # the only key here whose answer is decided by the verification alone.
 check("...while a key the chunk has not reached yet does NOT claim presence",
-      m.lookup(RK[8], Ctx()) in (None, False))
+      m._lookup_bool(RK[8], Ctx()) in (None, False))
 check("...and the pump then actually checked a chunk", core.calls >= 1)
 
 # *** THE FILES MUST EXIST, or `_load_manifest` prunes every key and this

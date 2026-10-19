@@ -47,8 +47,8 @@ FileMapper = sys.modules["vllm.v1.kv_offload.file_mapper"].FileMapper
 F = harness.Flags(os.path.join(tempfile.mkdtemp(prefix="kv16-"), "flags.json"))
 
 root = tempfile.mkdtemp(prefix="kv16-root-")
-mapper0 = FileMapper(root_dir=root, model_name="m", hash_block_size=4,
-                     gpu_blocks_per_file=1, tp_size=2, pp_size=1, pcp_size=1,
+mapper0 = FileMapper(root_dir=root, model_name="m", tokens_per_hash=4,
+                     blocks_per_file=1, tp_size=2, pp_size=1, pcp_size=1,
                      dcp_size=1, rank=0, dtype="nvfp4_ds_mla")
 
 
@@ -101,8 +101,8 @@ eq("*** in_index and verified are the index's own answer ***",
 _p = g0["keys"][2]["path"]
 eq("*** the path on rank 0 is upstream FileMapper's own ***",
    _p["0"], mapper0.get_file_name(G0[2]))
-_m1 = FileMapper(root_dir=root, model_name="m", hash_block_size=4,
-                 gpu_blocks_per_file=1, tp_size=2, pp_size=1, pcp_size=1,
+_m1 = FileMapper(root_dir=root, model_name="m", tokens_per_hash=4,
+                 blocks_per_file=1, tp_size=2, pp_size=1, pcp_size=1,
                  dcp_size=1, rank=1, dtype="nvfp4_ds_mla")
 eq("*** ...and rank 1's is what rank 1's own FileMapper says ***",
    _p["1"], _m1.get_file_name(G0[2]))
@@ -182,6 +182,16 @@ class OffloadingConnectorScheduler:
         return False, None
 
 
+class Sched031(OffloadingConnectorScheduler):
+    """0.31's shape: the final key is appended and the state is kept."""
+
+    def request_finished(self, request):
+        st = self._req_status[request.request_id]
+        st.group_states[0].offload_keys.append(FINAL)
+        return False, None
+
+
+FINAL = K(b"\x7f" * 30 + b"\x00\x00", 0)
 _osm.OffloadingConnectorScheduler = OffloadingConnectorScheduler
 _pkg = "vllm.distributed.kv_transfer.kv_connector.v1.offloading"
 for _n in ("vllm.distributed", "vllm.distributed.kv_transfer",
@@ -198,16 +208,44 @@ eq("upstream's return value is passed through",
    s.request_finished(types.SimpleNamespace(request_id="fin")), (False, None))
 check("*** the finished request's keys are in the ring ***", "fin" in RK._RING)
 eq("...and upstream still dropped its state", s._req_status, {})
+_cls031 = Sched031          # its own, unwrapped request_finished
+_osm.OffloadingConnectorScheduler = _cls031
+RK._install_capture()
+s31 = _cls031()
+s31._req_status["fin31"] = state("fin31", 99, [(list(G0), 0), (G1, 0)])
+s31.request_finished(types.SimpleNamespace(request_id="fin31"))
+check("*** 0.31 shape: the ring holds the FINAL key appended inside "
+      "request_finished ***",
+      RK._RING["fin31"]["groups"][0]["keys"][-1] == FINAL,
+      RK._RING["fin31"]["groups"][0]["keys"][-1:])
 
 _up = open(os.path.join(REPO, "tests", "upstream", "vllm",
                         "kv_connector_offloading", "scheduler.py")).read()
 _rf = _up[_up.index("    def request_finished("):]
 _rf = _rf[:_rf.index("\n    def ", 10)]
-check("UPSTREAM'S SHAPE: request_finished drops _req_status itself, which is "
-      "why the capture must run first",
-      "del self._req_status[request.request_id]" in _rf)
+check("UPSTREAM'S SHAPE (0.31): request_finished keeps _req_status alive and "
+      "appends the final key first, which is why the capture also runs AFTER it",
+      "req_status.update_offload_keys()" in _rf
+      and "del self._req_status[request.request_id]" not in _rf)
 check("...and the per-group key list is RequestGroupState.offload_keys",
       "offload_keys: list[OffloadKey]" in _up)
+
+_e31 = RK.entry_of(
+    types.SimpleNamespace(config=Cfg(kv_group_configs=[
+        Cfg(group_idx=0, tokens_per_chunk=256)])),
+    types.SimpleNamespace(req=types.SimpleNamespace(request_id="c", num_tokens=5),
+                          group_states=(types.SimpleNamespace(
+                              offload_keys=list(G0), num_hit_chunks=2),)))
+eq("*** 0.31 field names: tokens_per_chunk and num_hit_chunks are read ***",
+   (_e31["groups"][0]["block_tokens"], _e31["groups"][0]["num_hit_blocks"]),
+   (256, 2))
+_eNo = RK.entry_of(types.SimpleNamespace(config=Cfg(kv_group_configs=[Cfg()])),
+                   types.SimpleNamespace(req=types.SimpleNamespace(
+                       request_id="d", num_tokens=5), group_states=(
+                       types.SimpleNamespace(offload_keys=[]),)))
+eq("...and neither present is None, not 0",
+   (_eNo["groups"][0]["block_tokens"], _eNo["groups"][0]["num_hit_blocks"]),
+   (None, None))
 
 print("\n== (16g) the route, and the ledger's keys ==")
 hooks.register("http_get", RK.http_get)

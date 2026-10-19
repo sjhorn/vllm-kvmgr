@@ -11,37 +11,33 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   restarts, deploys and measurements in its `CLAUDE.md`), and the recipe is the
   DSpark repo. This file is meant to stand alone, but **DSpark's `CLAUDE.md`
   governs the engine** and wins any disagreement about restarting it.
-- Releases are tags (`v0.1.0` … `v0.4.11`), each
-  naming the vLLM build it is proven on (`pyproject.toml` states the window).
-- **One release line per vLLM version** (since 2026-10-18). Each has its own
-  branch, its own checkout on the nodes, its own dist-info name and its own
-  disk tier, so a version switch never touches another line's files:
-
-  | line | branch | versions | node checkout | tier | status |
-  |---|---|---|---|---|---|
-  | vLLM 0.32 | `vllm-0.32` | 0.6.x | `~/vllm-kvmgr-032` (worktree) | `~/kvoffload-032` | **production** since 2026-10-18 12:05Z |
-  | vLLM 0.31 | `vllm-0.31` | 0.5.x | `~/vllm-kvmgr-031` (worktree) | `~/kvoffload-031` | rollback |
-  | vLLM 0.21 | `main`, `release/0.4.x` | 0.4.x | `~/vllm-kvmgr` (branch `main`, v0.4.10) | `~/kvoffload` | old rollback |
-
-  `main` is still the 0.4.x line. **A push of `main` to `head`/`worker` lands
-  in `~/vllm-kvmgr`, the 0.21 rollback checkout**, not in what serves. Deploy
-  a line by pushing ITS branch (`git push head vllm-0.32 && git push worker
-  vllm-0.32`); `updateInstead` updates that worktree. Moving `main` to a newer
-  line first needs those checkouts re-pointed, or a push of `main` rewrites the
-  0.21 rollback.
+- Releases are tags (`v0.1.0` … `v0.4.11` for vLLM 0.21, `v0.5.0` for 0.31,
+  `v0.6.0` for 0.32), each naming the vLLM build it is proven on
+  (`pyproject.toml` states the window).
+- **`main` is the vLLM 0.32 line (0.6.x), the one the cluster runs** (since
+  2026-10-19; production since 2026-10-18 12:05Z). The older lines are
+  retired: their checkouts, images and disk tiers were deleted from the nodes
+  on 2026-10-19. Their branches stay for history only: `vllm-0.31` (0.5.x,
+  tag `v0.5.0`) and `release/0.4.x` (0.4.x, vLLM 0.21). Never deploy them.
+- **On the nodes** (`head`/`worker` = `/home/shorn/vllm-kvmgr` on spark-45ea and
+  spark-da08, `receive.denyCurrentBranch=updateInstead`):
+  - `~/vllm-kvmgr-032` is what serves: a worktree on branch `vllm-0.32`. The
+    DSpark compose mounts its `src/kvmgr` and its dist-info.
+  - `~/vllm-kvmgr` checks out `main` and is mounted by nothing. It is the
+    git home of that worktree, so **never delete it**.
+  - Keep `vllm-0.32` equal to `main`. **Deploy:** tests green → tag →
+    `git push head main main:vllm-0.32 && git push worker main main:vllm-0.32`
+    (`updateInstead` updates both checkouts). Push only as part of a deploy the
+    user asked for. DSpark's start script refuses to start unless both nodes
+    are at the same commit.
+  - **A push does not reach a running engine**: it takes effect at the next
+    restart, and the next restart may be a crash recovery nobody planned.
+    **So never push code to the nodes you would not want booted.**
 - **It is the only copy.** The DSpark recipe repo
   (`~/dev/spark/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark`) no
-  longer holds one: its compose mounts `../vllm-kvmgr` on each node.
-- Deploy: tests green → tag → `git push head main && git push worker main`
-  (remotes `head`/`worker` = `/home/shorn/vllm-kvmgr` on spark-45ea and
-  spark-da08, `receive.denyCurrentBranch=updateInstead`). Push only as part of
-  a deploy the user asked for. DSpark's start script refuses to start unless
-  both nodes are at the same commit. **A push does not reach a running engine**:
-  it takes effect at the next restart, and the next restart may be a crash
-  recovery nobody planned. **So never push code to the nodes you would not
-  want booted.**
+  longer holds one: its compose mounts `~/vllm-kvmgr-032` on each node.
 - **A version bump renames the dist-info** (`deploy/vllm_kvmgr-<ver>.dist-info`),
-  and DSpark's `docker-compose.dspark.yml` names it in one mount line. Bump,
+  and DSpark's `docker-compose.dspark-032.yml` names it in one mount line. Bump,
   regenerate, then change that line in DSpark and push BOTH repos together. A
   compose naming a dist-info that is not there has no entry point, so kvmgr
   silently does not load. `test_phase12_packaging.py` in dspark mode fails
@@ -65,6 +61,17 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
   through `hooks.py`; **core must never import from `diag`** (a test enforces
   this). `compat/dspark.py` bridges the DSpark fork's patch6 and does nothing
   without it.
+- **Patches since vLLM 0.31** (on top of the list below):
+  - `loadfail.py` wraps OffloadingConnector `get_transfer_results` and
+    Scheduler `_handle_failed_recving` (the request-level path).
+  - `copyapi.py` wraps the load handler's `_swap_blocks_batch` instance
+    attribute.
+
+  phase15 (15d2) and phase17 pin them.
+- **Tests on this branch:**
+  - DSpark mode is skipped (DSpark's patches are 0.21 files).
+  - phase1, 2, 3 and 10 skip with a reason: no GPU manager.
+  - Every skip says so; none passes silently.
 - **Patches on vLLM classes, which a port must re-check:** `loadfail.py`
   (Scheduler `_update_requests_with_invalid_blocks`, OffloadingConnector
   `get_block_ids_with_load_errors`), `diskio._arm_compute_wait` (upstream's

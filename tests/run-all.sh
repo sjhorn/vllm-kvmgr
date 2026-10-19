@@ -27,6 +27,19 @@ set -u
 cd "$(dirname "$0")"
 PY=${PY:-python3.12}
 MODES=${MODES:-"pristine dspark"}
+
+# *** vllm-0.31 branch: DSpark mode is SKIPPED, LOUDLY. *** DSpark's patches
+# (patch6/7/8, mnt10) are whole vLLM 0.21 files; loaded against this branch's
+# vendored 0.31 core they test a combination that cannot exist. Until DSpark
+# has a 0.31 recipe (plan-0.31-port.md step 3), only pristine mode is real.
+_VV=$(sed -n 's/^vllm_version=//p' upstream/MANIFEST.txt 2>/dev/null)
+case "$_VV" in
+  0.21*|"") ;;
+  *) case " $MODES " in *" dspark "*)
+       echo "SKIP [dspark mode] the vendored vLLM is $_VV and DSpark's patches are 0.21 files: dspark mode is not run on this branch (plan-0.31-port.md step 3)"
+       MODES=$(printf '%s' "$MODES" | sed 's/dspark//; s/  */ /g; s/^ //; s/ $//');;
+     esac;;
+esac
 T=0
 for mode in $MODES; do
   echo "== mode: $mode =="
@@ -38,7 +51,8 @@ for mode in $MODES; do
            test_phase9_verify.py test_phase10_standalone.py test_phase11_diag.py \
            test_phase12_packaging.py test_phase13_ledger.py \
            test_phase14_copyprobe.py test_phase15_loadfail.py \
-           test_phase16_reqkeys.py test_phase17_copyapi.py; do
+           test_phase16_reqkeys.py test_phase17_copyapi.py \
+           test_phase18_knobs.py; do
     out=$("$PY" "$f" 2>&1); rc=$?
     skips=$(printf '%s\n' "$out" | grep -c '^SKIP ')
     if [ "$rc" = "0" ]; then

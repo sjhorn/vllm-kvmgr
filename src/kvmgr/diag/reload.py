@@ -91,6 +91,13 @@ _PRESERVE: tuple[tuple[str, str, str], ...] = (
     ("kvmgr.loadfail", "_ERRORS", "failed loads' blocks awaiting the connector"),
     ("kvmgr.loadfail", "_LOCK", "the lock around _ERRORS"),
     ("kvmgr.loadfail", "STATS", "load-failure counters"),
+    # vLLM 0.31's request-level path: failed load jobs not yet mapped to a
+    # request, and whether the connector wrap is the request-level one. The
+    # get_transfer_results wrap installed at boot reads the OLD module's
+    # dict, so a failure noted by the reloaded diskio must land in the same
+    # object -- or the request is never failed and its blocks are trusted.
+    ("kvmgr.loadfail", "_FAILED_JOBS", "0.31 failed load jobs awaiting their request"),
+    ("kvmgr.loadfail", "_REQUEST_LEVEL", "0.31: failures reported by request"),
     # The ring of finished requests' keys, its lock and counters: the gate
     # reads a request that finished BEFORE a reload.
     # ask9: the proxy installed in the copy handler's module keeps the OLD
@@ -187,11 +194,17 @@ _PRESERVE_CLASS: tuple[tuple[str, str, str, str], ...] = (
 
 def _snapshot_class_state() -> tuple[dict, list[str]]:
     """Grab the class attributes in `_PRESERVE_CLASS` before the reload."""
-    import importlib as _il
+    import sys as _sys
     saved, errs = {}, []
     for mod, cls, attr, _why in _PRESERVE_CLASS:
+        # Only a module already loaded has state to keep, and the reload below
+        # skips one that is not; importing it here could fail (kvmgr.manager on
+        # vLLM 0.31, which has no MLAAttentionManager) or create the very state
+        # it is meant to preserve.
+        if mod not in _sys.modules:
+            continue
         try:
-            k = getattr(_il.import_module(mod), cls, None)
+            k = getattr(_sys.modules[mod], cls, None)
             if k is not None and hasattr(k, attr):
                 saved[(mod, cls, attr)] = getattr(k, attr)
         except Exception as exc:

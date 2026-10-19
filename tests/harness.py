@@ -135,6 +135,40 @@ _loaded: Loaded | None = None
 STOCK_MLA_MANAGER = None
 
 
+def _has_gpu_manager_core() -> bool:
+    """Does the vendored vLLM have the GPU-manager hook kvmgr's manager uses?
+
+    0.21's `single_type_kv_cache_manager` has `spec_manager_map` (and
+    `MLAAttentionManager`); vLLM 0.31 has neither (managers come from
+    `KVCacheSpecRegistry`), so kvmgr's GPU KV manager is not registered there
+    and its suites have nothing to test."""
+    src = os.path.join(UPSTREAM, "vllm", "v1", "core",
+                       "single_type_kv_cache_manager.py")
+    try:
+        return "spec_manager_map" in open(src).read()
+    except OSError:
+        return False
+
+
+# vLLM 0.31 branch (vllm-0.31): False. DSpark mode loads patch6, which is a
+# 0.21 file, so it keeps the core even here.
+GPU_MANAGER = DSPARK or _has_gpu_manager_core()
+NO_GPU_MANAGER_WHY = (
+    "the vendored vLLM has no spec_manager_map/MLAAttentionManager (0.31 "
+    "builds managers from KVCacheSpecRegistry), so kvmgr's GPU KV manager is "
+    "not registered there; plan-0.31-port.md step 2 / main plan item 3")
+
+
+def require_gpu_manager(what: str) -> None:
+    """Skip the WHOLE suite, loudly, when there is no GPU-manager core.
+    Prints a SKIP line (run-all.sh counts it) and a SKIPPED summary, exits 0."""
+    if GPU_MANAGER:
+        return
+    print(f"SKIP [no GPU manager] {what}: {NO_GPU_MANAGER_WHY}")
+    print("0 passed, 0 failed (SKIPPED: no GPU-manager core on this vLLM)")
+    sys.exit(0)
+
+
 def load_kv_offload() -> types.ModuleType:
     """Load the REAL `vllm.v1.kv_offload.*` from patches/pristine/ and return it.
 
@@ -154,7 +188,10 @@ def load_kv_offload() -> types.ModuleType:
     `vllm.v1.core.kv_cache_utils`, which is PATCH 8 -- so the block-size
     resolution these tests see is our patched one, which is the point.
     """
-    load()  # patch8 must be in sys.modules under its canonical name first
+    # vLLM 0.31: base.py no longer imports kv_cache_utils, so the disk tier
+    # loads WITHOUT the GPU-manager core (which has no hook on 0.31 and does
+    # not load here). Stubs only.
+    vllm_stubs.install()
     # *** IDEMPOTENT. *** A second load re-executes base.py and mints NEW class
     # objects, so a spec built against the first copy is no longer an instance
     # of the second's LoadStoreSpec -- every isinstance check then fails for a
@@ -164,17 +201,23 @@ def load_kv_offload() -> types.ModuleType:
         return sys.modules["vllm.v1.kv_offload.base"]
 
     kvo = os.path.join(PRISTINE, "vllm", "v1", "kv_offload")
-    for name in ("vllm.v1.kv_offload", "vllm.v1.kv_offload.worker",
-                 "vllm.v1.kv_offload.tiering"):
+    for name in ("vllm.v1.kv_offload", "vllm.v1.kv_offload.tiering"):
         if name not in sys.modules:
             mod = types.ModuleType(name)
             sys.modules[name] = mod
             parent, _, leaf = name.rpartition(".")
             setattr(sys.modules[parent], leaf, mod)
 
+    # vLLM 0.32: base.py (and the connector and tiering manager) import
+    # CacheHitSource. The real file: it is a pure enum with no vLLM imports.
+    if "vllm.v1.metrics" not in sys.modules:
+        sys.modules["vllm.v1.metrics"] = types.ModuleType("vllm.v1.metrics")
+        setattr(sys.modules["vllm.v1"], "metrics", sys.modules["vllm.v1.metrics"])
+    if "vllm.v1.metrics.cache_hit_source" not in sys.modules:
+        _load_file(os.path.join(PRISTINE, "vllm", "v1", "metrics", "cache_hit_source.py"),
+                   "vllm.v1.metrics.cache_hit_source")
+    _load_file(os.path.join(kvo, "config.py"), "vllm.v1.kv_offload.config")
     _load_file(os.path.join(kvo, "base.py"), "vllm.v1.kv_offload.base")
-    _load_file(os.path.join(kvo, "worker", "worker.py"),
-               "vllm.v1.kv_offload.worker.worker")
     _load_file(os.path.join(kvo, "factory.py"), "vllm.v1.kv_offload.factory")
     # cpu/common.py holds CPULoadStoreSpec, which the disk handler uses as the
     # inner (staging) destination -- so the chunking tests need it.
@@ -197,6 +240,15 @@ def load(force: bool = False) -> Loaded:
         return _loaded
 
     vllm_stubs.install()
+
+    if not GPU_MANAGER:
+        # No GPU-manager core to load (vLLM 0.31): the stubs and the
+        # offloading stack only. A suite that needs the managers calls
+        # require_gpu_manager() first; one that touches them anyway fails on
+        # the None, never on a silently different module.
+        load_kv_offload()
+        _loaded = Loaded(None, None, None, None)
+        return _loaded
 
     core = os.path.join(UPSTREAM, "vllm", "v1", "core")
     if DSPARK:
@@ -349,12 +401,13 @@ class Flags:
 
     def __init__(self, path: str):
         self.path = path
-        H = load()
-        self.mod = H.mgr_mod
+        # vLLM 0.31: the GPU-manager core may not load; flags do not need it.
+        vllm_stubs.install()
+        self.mod = sys.modules.get("vllm.v1.core.single_type_kv_cache_manager")
         from kvmgr import flags as _kf
 
         _kf.FLAGS_PATH = path
-        if hasattr(self.mod, "_FLAGS_PATH"):
+        if self.mod is not None and hasattr(self.mod, "_FLAGS_PATH"):
             self.mod._FLAGS_PATH = path
 
     def write(self, **kw) -> None:

@@ -63,53 +63,45 @@ PER_RANK = 1_051_776          # measured: the non-zero half of every file
 WHOLE_PAGE = PER_RANK * WORLD  # 2,103,552, also measured
 
 
-class _T:
-    def __init__(self, size):
-        self.size = size
+_oc = sys.modules["vllm.v1.kv_offload.config"]
 
 
-class _KVCfg:
-    num_blocks = NUM_BLOCKS
-    # total GPU bytes such that (total // num_blocks) == PER_RANK exactly
-    kv_cache_tensors = [_T(PER_RANK * NUM_BLOCKS)]
-
-    def __init__(self):
-        g = type("G", (), {})()
-        g.kv_cache_spec = type("S", (), {"block_size": 256})()
-        g.layer_names = ["l0"]
-        self.kv_cache_groups = [g]
-
-
-class _Cfg:
-    def __init__(self, world=WORLD, rank=0):
-        self.parallel_config = type("P", (), {
-            "world_size": world, "rank": rank,
-            "decode_context_parallel_size": 1,
-            "prefill_context_parallel_size": 1,
-            "tensor_parallel_size": world, "pipeline_parallel_size": 1,
-        })()
-        self.cache_config = type("C", (), {"block_size": 256,
-                                           "cache_dtype": "nvfp4_ds_mla"})()
-        self.model_config = type("M", (), {
-            "model": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"})()
-        self.kv_transfer_config = type("K", (), {
-            "kv_connector_extra_config": {"root_dir": "/kvoffload"}})()
+def _Cfg(world=WORLD, rank=0, extra=None):
+    """vLLM 0.31: one normalized OffloadingConfig replaces the
+    (vllm_config, kv_cache_config) pair."""
+    return _oc.OffloadingConfig(
+        groups=(_oc.OffloadingGroupConfig(
+            tokens_per_block=256, layer_names=("l0",), group_id=0),),
+        worker_kv_bytes_per_block=PER_RANK,
+        enable_kv_cache_events=False,
+        extra_config=dict(extra or {"root_dir": "/kvoffload"}),
+        engine_id="e0",
+        model=_oc.OffloadingModelConfig(
+            name="deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+            dtype="nvfp4_ds_mla"),
+        cache=_oc.OffloadingCacheConfig(tokens_per_hash=256, blocks_per_chunk=1),
+        parallel=_oc.OffloadingParallelConfig(
+            rank=rank, world_size=world, tp_size=world, pp_size=1,
+            pcp_size=1, dcp_size=1, data_parallel_index=0,
+            data_parallel_size=1, data_parallel_rank_local=None,
+            is_parallelism_agnostic=False),
+    )
 
 
 def mkspec(world=WORLD, rank=0):
     flags.reset_for_tests()
-    return diskspec.DSparkDiskOffloadingSpec(_Cfg(world, rank), _KVCfg())
+    return diskspec.DSparkDiskOffloadingSpec(_Cfg(world, rank))
 
 
-print("== (1a) the medium, and that it cannot collide ==")
-eq("our medium", diskspec.DISK_MEDIUM, "DSPARK_DISK")
-check("it is not one of upstream's", diskspec.DISK_MEDIUM not in ("CPU", "GPU"))
-eq("DiskLoadStoreSpec reports it", diskspec.DiskLoadStoreSpec([]).medium(),
+print("== (1a) the spec type, and the medium enum (0.31) ==")
+eq("our medium name (still the frozen path component)", diskspec.DISK_MEDIUM,
    "DSPARK_DISK")
+check("0.31 LoadStoreSpec has no medium()",
+      not hasattr(base.LoadStoreSpec, "medium"))
 check("DiskLoadStoreSpec IS a LoadStoreSpec",
       issubclass(diskspec.DiskLoadStoreSpec, base.LoadStoreSpec))
-check("...and is concrete (medium implemented)",
-      not diskspec.DiskLoadStoreSpec.__abstractmethods__)
+check("...and is concrete",
+      not getattr(diskspec.DiskLoadStoreSpec, "__abstractmethods__", ()))
 
 print()
 print("== (1b) the spec satisfies the contract Phase 0 pinned ==")
@@ -118,8 +110,8 @@ check("DSparkDiskOffloadingSpec IS an OffloadingSpec",
       isinstance(sp, base.OffloadingSpec))
 check("...and is instantiable, i.e. implements every abstract method",
       not type(sp).__abstractmethods__, repr(type(sp).__abstractmethods__))
-eq("block_size_factor stays 1 (we never set a uniform block size)",
-   sp.block_size_factor, 1)
+eq("blocks_per_chunk stays 1 (we never set a uniform block size)",
+   sp.blocks_per_chunk, 1)
 from kvmgr import serve as _serve  # noqa: E402
 _starts = []
 _real_ms = _serve.maybe_start
@@ -162,9 +154,9 @@ k2 = base.make_offload_key(b"\x22" * 32, 1)
 
 F.write(disk_restore=0)
 flags.reset_for_tests()
-eq("lookup refuses while disk_restore is off", mgr.lookup(k1, ctx), False)
+eq("lookup refuses while disk_restore is off", mgr._lookup_bool(k1, ctx), False)
 mgr.complete_store([k1], ctx)      # even for a key we DO hold
-eq("...even for a key the manager holds", mgr.lookup(k1, ctx), False)
+eq("...even for a key the manager holds", mgr._lookup_bool(k1, ctx), False)
 refused = False
 try:
     mgr.prepare_load([k1], ctx)
@@ -174,8 +166,8 @@ check("*** prepare_load RAISES rather than best-efforting ***", refused)
 
 F.write(disk_restore=1)
 flags.reset_for_tests()
-eq("with the flag on, a held key is a hit", mgr.lookup(k1, ctx), True)
-eq("...and an unheld one is not", mgr.lookup(k2, ctx), False)
+eq("with the flag on, a held key is a hit", mgr._lookup_bool(k1, ctx), True)
+eq("...and an unheld one is not", mgr._lookup_bool(k2, ctx), False)
 spec = mgr.prepare_load([k1], ctx)
 check("prepare_load now returns our disk spec",
       isinstance(spec, diskspec.DiskLoadStoreSpec))
@@ -223,7 +215,7 @@ check("...and the scheduler sets pending_count from num_workers",
       "pending_count=self.config.num_workers" in sched)
 _flat = "".join(sched.split())
 check("...and num_workers IS world_size, so 'all ranks' means both nodes",
-      "num_workers=spec.vllm_config.parallel_config.world_size" in _flat)
+      "num_workers=vllm_config.parallel_config.world_size" in _flat)  # 0.31 spelling
 eq("our manager records the rank count it was built with",
    m2.snapshot()["num_workers"], WORLD)
 
@@ -233,122 +225,82 @@ m3 = diskspec.DiskPresenceManager(sp.file_mapper(), num_workers=WORLD)
 m3.complete_store([k1, k2], ctx)
 evs = list(m3.take_events())
 eq("one event for the batch", len(evs), 1)
-eq("...on our medium", evs[0].medium, "DSPARK_DISK")
+eq("...on the STORAGE medium (0.31 enum)", evs[0].medium, base.Medium.STORAGE)
 check("...marked stored, not removed", evs[0].removed is False)
 eq("events are TAKEN, not re-reported", list(m3.take_events()), [])
 m3.complete_store([k1], ctx)
 eq("a re-store of a held key emits nothing", list(m3.take_events()), [])
 
 print()
-print("== (1i) get_handlers registers BOTH directions, ALWAYS ==")
-# The handlers need a GPU, but get_handlers imports them INSIDE the function, so
-# patching the module attributes gives a real test of the registration itself --
-# which is the part that decides whether a restore is even routable.
+print("== (1i) get_worker builds BOTH directions, ALWAYS ==")
 from kvmgr import diskio  # noqa: E402
 
-_built = {}
+_built = []
 
 
 class _FakeHandler:
     def __init__(self, **kw):
-        _built.update(kw)
+        _built.append(kw)
+        self.subs, self.waits = [], []
+
+    def transfer_async(self, job_id, spec):
+        self.subs.append((job_id, spec))
+        return True
+
+    def get_finished(self):
+        return [base.TransferResult(job_id=len(self.subs), success=True)]
+
+    def wait(self, ids):
+        self.waits.append(set(ids))
+
+    def shutdown(self):
+        pass
 
 
 _realS, _realL = diskio.DiskStoreHandler, diskio.DiskLoadHandler
 
 
-def _triples():
+def _worker(spec):
     diskio.DiskStoreHandler = diskio.DiskLoadHandler = _FakeHandler
     try:
-        return list(sp.get_handlers(kv_caches=object()))
+        return spec.get_worker(kv_caches=object())
     finally:
         diskio.DiskStoreHandler, diskio.DiskLoadHandler = _realS, _realL
 
 
-# *** THIS ASSERTED "STORE ONLY" AND THAT DESIGN KILLED THE ENGINE. ***
-# Withholding the DISK->GPU handler when disk_restore was off was written up as
-# a second gate -- "done twice so a later optimistic lookup() still cannot
-# restore". It was wrong about the FAILURE MODE. The scheduler reads
-# disk_restore HOT, so flipping it on a running engine makes lookup() claim keys
-# and prepare_load issue load jobs while the worker still has no handler:
-#     worker.py:133  assert handler is not None   -> AssertionError
-#     RuntimeError: Worker failed with error ''
-# A bare assert in a worker, which took the engine core with it. Measured
-# 2026-10-08 at 205K tokens.
-#
-# So the property to assert is the opposite: the HANDLER SET MUST NOT DEPEND ON
-# THE FLAG. lookup() is the only gate, and it is structural -- the scheduler
-# only calls prepare_load for keys lookup claimed.
+# The 0.21 property (the handler set must not depend on disk_restore) carries
+# over: get_worker builds both handlers either way.
 for _flag in (0, 1):
     F.write(kvmgr_enabled=1, disk_restore=_flag)
     flags.reset_for_tests()
-    _t = _triples()
-    eq(f"with disk_restore={_flag}: BOTH directions registered", len(_t), 2)
-    _pairs = sorted((a.medium(), b.medium()) for a, b, _ in _t)
-    eq(f"...the pairs, disk_restore={_flag}", _pairs,
-       [("DSPARK_DISK", "GPU"), ("GPU", "DSPARK_DISK")])
+    del _built[:]
+    w = _worker(sp)
+    check(f"with disk_restore={_flag}: an OffloadingWorker",
+          isinstance(w, base.OffloadingWorker))
+    eq(f"...built from BOTH handlers, disk_restore={_flag}", len(_built), 2)
 
-F.write(kvmgr_enabled=1, disk_restore=0)
-flags.reset_for_tests()
-_off = sorted((a.medium(), b.medium()) for a, b, _ in _triples())
-F.write(kvmgr_enabled=1, disk_restore=1)
-flags.reset_for_tests()
-_on = sorted((a.medium(), b.medium()) for a, b, _ in _triples())
-eq("*** the handler set is IDENTICAL either way -- which is also why the two "
-   "ranks can no longer disagree about it ***", _off, _on)
+g = base.GPULoadStoreSpec([1, 2], group_sizes=[2], block_indices=[0])
+d = diskspec.DiskLoadStoreSpec([k1, k2])
+check("submit_store routes (gpu, disk) to the store handler",
+      w.submit_store(7, g, d) and w._store.subs == [(7, (g, d))])
+check("submit_load routes (disk, gpu) to the load handler",
+      w.submit_load(8, d, g) and w._load.subs == [(8, (d, g))])
+eq("get_finished merges both handlers", len(w.get_finished()), 2)
+w.wait({7, 8})
+check("wait fans out to both", w._store.waits == [{7, 8}] and w._load.waits == [{7, 8}])
 
-# and the gate that remains must still refuse
 F.write(kvmgr_enabled=1, disk_restore=0)
 flags.reset_for_tests()
 _m = sp.get_manager()
-check("*** with restore off, lookup() still refuses -- the ONE gate, and it is "
-      "structural ***", _m.lookup(k1, ctx) is False)
-
-# *** THE LOAD HAS ITS OWN ROW COUNT NOW, and this assertion caught the change
-# *** rather than being quietly updated to match it.
-# It used to read `== 32` and recorded only the LAST handler built, so it could
-# not tell the two apart at all. Sharing one pinned buffer is what faulted the
-# worker with Xid 13 five times (the load reads it under
-# CU_MEMCPY_SRC_ACCESS_ORDER_ANY, whose precondition is that no concurrent GPU
-# stream writes the source, and the store's copy is exactly such a write), so
-# the two sizes being DIFFERENT is now the property worth pinning.
+check("*** with restore off, lookup() still refuses -- the ONE gate ***",
+      _m._lookup_bool(k1, ctx) is False)
+eq("...and the 0.31 lookup maps it to MISS", _m.lookup(k1, ctx), base.LookupResult.MISS)
 eq("the LOAD handler is built with its own staging size, a quarter of the "
-   "store's", _built.get("staging_blocks"), 8)
+   "store's", _built[1].get("staging_blocks"), 8)
 eq("...and the spec derived it from the store's, not a constant",
    sp.staging_load_blocks, max(1, sp.staging_blocks // 4))
-check("*** the two counts DIFFER, which is the whole point of the split ***",
-      sp.staging_load_blocks != sp.staging_blocks)
-check("...and gets the spec, so it can reach file_mapper()", _built.get("spec") is sp)
-
-# ...and with the flag ON, BOTH directions appear. This is the one knob that
-# needs a restart -- handlers are registered once at boot -- so it is read once
-# here rather than per transfer, and the code says so rather than offering a
-# hot flip that could not work.
-F.write(disk_restore=1)
-flags.reset_for_tests()
-
-
-class _FakeLoad:
-    def __init__(self, **kw):
-        pass
-
-
-_rl = diskio.DiskLoadHandler
-diskio.DiskLoadHandler = _FakeLoad
-diskio.DiskStoreHandler = _FakeHandler
-try:
-    both = list(mkspec().get_handlers(kv_caches=object()))
-finally:
-    diskio.DiskLoadHandler = _rl
-    diskio.DiskStoreHandler = _realS
-    F.write(disk_restore=0)
-    flags.reset_for_tests()
-
-eq("with disk_restore ON there are two handlers", len(both), 2)
-eq("...the store direction", (both[0][0].medium(), both[0][1].medium()),
-   ("GPU", "DSPARK_DISK"))
-eq("...and the load direction", (both[1][0].medium(), both[1][1].medium()),
-   ("DSPARK_DISK", "GPU"))
+check("*** the two counts DIFFER ***", sp.staging_load_blocks != sp.staging_blocks)
+check("...and gets the spec, so it can reach file_mapper()", _built[1].get("spec") is sp)
 
 print()
 print("== (1j) the file path: per-rank, per-group, under our root ==")
@@ -395,7 +347,7 @@ for _attr in _OPTIONAL_ATTRS:
     try:
         m_rb.prepare_store([k1, k2], ctx)
         m_rb.complete_store([k1, k2], ctx)
-        m_rb.lookup(k1, ctx)
+        m_rb._lookup_bool(k1, ctx)
         _snap = m_rb.snapshot()
     except Exception as _exc:
         _ok, _why = False, repr(_exc)
@@ -466,7 +418,7 @@ for _attr in _LAZY_ATTRS:
     try:
         m_lz.prepare_store([k1, k2], ctx)
         m_lz.complete_store([k1, k2], ctx)
-        m_lz.lookup(k1, ctx)
+        m_lz._lookup_bool(k1, ctx)
         _snap2 = m_lz.snapshot()
     except Exception as _exc:
         _ok, _why = False, repr(_exc)
@@ -508,12 +460,12 @@ del diskspec._LIVE_OFFLOAD_SCHED[:]
 
 class OffloadingConnectorScheduler:  # name is what is matched, deliberately
     def call_it(self, mgr, key, ctx):
-        return mgr.lookup(key, ctx)
+        return mgr._lookup_bool(key, ctx)
 
 
 class SomethingElse:
     def call_it(self, mgr, key, ctx):
-        return mgr.lookup(key, ctx)
+        return mgr._lookup_bool(key, ctx)
 
 
 _m = diskspec.DiskPresenceManager(sp.file_mapper(), num_workers=WORLD)
@@ -858,15 +810,12 @@ _troot = tempfile.mkdtemp(prefix="kvroot-")
 # root_dir lives on _Cfg's kv_transfer_config, not on _KVCfg -- so the WRITABLE
 # root goes there. The default is /kvoffload, the real mount on the box and
 # read-only here, and testing the manifest means actually creating files.
-class _CfgTmp(_Cfg):
-    def __init__(self, world=WORLD, rank=0):
-        _Cfg.__init__(self, world, rank)
-        self.kv_transfer_config = type("K", (), {
-            "kv_connector_extra_config": {"root_dir": _troot}})()
+def _CfgTmp(world=WORLD, rank=0):
+    return _Cfg(world, rank, extra={"root_dir": _troot})
 
 
 flags.reset_for_tests()
-_tmpspec = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0), _KVCfg())
+_tmpspec = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0))
 _k1 = base.make_offload_key(b"\xa1" * 32, 0)
 _k2 = base.make_offload_key(b"\xa2" * 32, 1)
 
@@ -961,7 +910,7 @@ for _attr in ("_bytes", "_pos_hint", "_evicted_pending", "_gcounts"):
 
 _failures = []
 for _name, _call in (
-    ("lookup", lambda: _legacy.lookup(_lk, ctx)),
+    ("lookup", lambda: _legacy._lookup_bool(_lk, ctx)),
     ("touch", lambda: _legacy.touch([_lk], ctx)),
     ("prepare_store", lambda: _legacy.prepare_store([_lk], ctx)),
     ("complete_store", lambda: _legacy.complete_store([_lk], ctx)),
@@ -989,7 +938,7 @@ check("...and a byte total exists afterwards", hasattr(_legacy, "_bytes"))
 # migration must be idempotent -- it runs at the top of every entry point
 _before = dict(_legacy._present) if _migrated else None
 try:
-    _legacy.lookup(_lk, ctx); _legacy.snapshot(); _legacy.touch([_lk], ctx)
+    _legacy._lookup_bool(_lk, ctx); _legacy.snapshot(); _legacy.touch([_lk], ctx)
     _after = dict(_legacy._present) if _migrated else None
 except Exception as _exc:
     _after = "RAISED: %r" % (_exc,)
@@ -1429,90 +1378,18 @@ eq("*** a candidate root without the repo is skipped, not fatal -- the search "
    "continues to the next one ***",
    diskspec.model_dir("org/mdl", None, _other), None)
 
-print("== (P4) the migration keeps the warm tier, and REFUSES past v1 ==")
-# *** STRENGTHENING A FINGERPRINT ORPHANS EVERYTHING UNDER THE OLD ONE, and on
-# *** this box that is 400 GB and 560,000 keys. *** The bytes are not wrong --
-# the LAYOUT did not change, only the identity string -- so discarding them
-# would be a pure loss paid in 430-795 s cold prefills. A directory rename is
-# O(1) and keeps the manifest too, because presence.json sits at the format
-# root and is keyed by block hash rather than by path.
-_mg = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0), _KVCfg())
-_newbase = "%s_r%d" % (_mg.file_mapper().base_path, _mg.rank)
-
-# Build the pre-Phase-4 path the same way the migration does, and plant a file.
-_legacy_dir = None
-for _cand in os.listdir(_mg.root_dir) if os.path.isdir(_mg.root_dir) else []:
-    pass
-import shutil as _shP
+print("== (P4) the migration is a NO-OP on vLLM 0.31 ==")
+# The 0.21 fingerprint cannot be rebuilt from 0.31's OffloadingConfig, and the
+# GPU KV layout changed (HND -> LBHNC), so no 0.21 file is adoptable. The
+# migration section's assertions are 0.21-only and are not run on this branch.
+print("SKIP  [vllm 0.31] legacy P4 migration -- the 0.21 tier is orphaned either way")
+harness.SKIPPED.append("legacy P4 migration")
+_mg = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0))
+_mg.file_mapper()
 _old_fake = os.path.join(_mg.root_dir, "legacy-fingerprint_r0")
 os.makedirs(_old_fake, exist_ok=True)
-open(os.path.join(_old_fake, "block.bin"), "wb").write(b"kv")
-
-# The real test drives the method, with the legacy mapper monkeypatched to
-# point at our planted directory -- otherwise the assertion only ever exercises
-# a path that does not exist, which is a guard that cannot fail.
-_realFM = diskspec.FileMapper
-
-
-class _FakeFM:
-    def __init__(self, *a, **kw):
-        self.base_path = os.path.join(_mg.root_dir, "legacy-fingerprint")
-
-
-_shP.rmtree(_newbase, ignore_errors=True)
-diskspec.FileMapper = _FakeFM
-try:
-    _mg._migrate_legacy_base(_CfgTmp(WORLD, 0).parallel_config)
-finally:
-    diskspec.FileMapper = _realFM
-
-check("*** the legacy directory is RENAMED onto the new fingerprint, so the "
-      "warm tier survives a fingerprint change ***",
-      os.path.isdir(_newbase) and not os.path.isdir(_old_fake),
-      (os.path.isdir(_newbase), os.path.isdir(_old_fake)))
-check("...and the files came with it",
-      os.path.isfile(os.path.join(_newbase, "block.bin")))
-
-# *** THE VERSION GUARD IS NOT OPTIONAL. *** Past v1 the old directory was
-# written by a DIFFERENT layout, so adopting it is the exact hazard the
-# version exists to prevent. A migration that outlives its own precondition is
-# worse than no migration.
-os.makedirs(_old_fake, exist_ok=True)
-open(os.path.join(_old_fake, "block.bin"), "wb").write(b"kv")
-_shP.rmtree(_newbase, ignore_errors=True)
-_realV = diskspec.DISK_FORMAT_VERSION
-diskspec.DISK_FORMAT_VERSION = 2
-diskspec.FileMapper = _FakeFM
-try:
-    _mg._migrate_legacy_base(_CfgTmp(WORLD, 0).parallel_config)
-finally:
-    diskspec.DISK_FORMAT_VERSION = _realV
-    diskspec.FileMapper = _realFM
-check("*** at format v2 the migration REFUSES -- adopting v1 bytes under a v2 "
-      "layout is plausible-but-wrong KV, the whole thing the version prevents "
-      "***", os.path.isdir(_old_fake) and not os.path.isdir(_newbase),
-      (os.path.isdir(_old_fake), os.path.isdir(_newbase)))
-
-# *** AND THE "never clobber" GUARD HAD TO BE TESTED ON AN EMPTY TARGET. ***
-# The first version planted a file in the new directory and asserted it
-# survived -- which it does EITHER WAY, because POSIX `rename` refuses to
-# replace a NON-EMPTY directory (ENOTEMPTY), so the mutation was caught by the
-# kernel rather than by the guard and the assertion could not fail.
-# Break-verification found that. An EMPTY target is where behaviour genuinely
-# differs: there the rename would succeed, so the explicit check is what makes
-# the outcome a predictable decline with a log instead of a silent adoption.
-os.makedirs(_newbase, exist_ok=True)
-assert not os.listdir(_newbase), "the target must be EMPTY for this to bite"
-diskspec.FileMapper = _FakeFM
-try:
-    _mg._migrate_legacy_base(_CfgTmp(WORLD, 0).parallel_config)
-finally:
-    diskspec.FileMapper = _realFM
-check("*** an EXISTING new-format directory is never adopted into, even when "
-      "empty -- a rename cannot merge two caches, so it declines and says so "
-      "***", os.path.isdir(_old_fake) and os.path.isdir(_newbase),
-      (os.path.isdir(_old_fake), os.path.isdir(_newbase)))
-_shP.rmtree(_old_fake, ignore_errors=True)
+_mg._migrate_legacy_base(_mg.config.parallel)
+check("the planted legacy dir is left alone", os.path.isdir(_old_fake))
 
 print("== (P4b) other fingerprint dirs are NAMED, never deleted ==")
 # The index is keyed by block hash at the format root (by design), so files
@@ -1605,7 +1482,7 @@ print("== (P5) pos MUST be the position in the PREFIX, not in the batch ==")
 # shipped: every other prepare_store test stores a whole run at once, where
 # indexing `todo` and indexing `keys` give the same answer.
 F.write(kvmgr_enabled=1, disk_restore=1, disk_budget_gb=0)
-_pm = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0), _KVCfg()).get_manager()
+_pm = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0)).get_manager()
 
 # One group, five blocks, offered in prefix order.
 _run = [base.make_offload_key(bytes([0xA0 + n]) * 32, 0) for n in range(5)]
@@ -1620,7 +1497,7 @@ eq("a whole-run store records 0..4",
 
 # Now the incremental case: blocks 0..2 are already present, and only 3..4 are
 # new. The full run is still offered -- that is what `skipped_present` counts.
-_pm2 = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0), _KVCfg()).get_manager()
+_pm2 = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0)).get_manager()
 _pm2.prepare_store(_run[:3], ctx)
 _pm2.complete_store(_run[:3], ctx)
 _pm2.prepare_store(_run, ctx)          # all five offered, three already held
@@ -1653,7 +1530,7 @@ check("...so block 0 -- the head -- is never among the first victims",
 # `if not todo` BEFORE the position loop -- so the loop never ran and the test
 # could not see the leak however broken the code was. The leak needs `todo`
 # non-empty AND some keys present, which is the incremental case again.
-_pm3 = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0), _KVCfg()).get_manager()
+_pm3 = diskspec.DSparkDiskOffloadingSpec(_CfgTmp(WORLD, 0)).get_manager()
 _pm3.prepare_store(_run[:3], ctx)
 _pm3.complete_store(_run[:3], ctx)
 eq("after a completed store, no position hints are left over",

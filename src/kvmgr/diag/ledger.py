@@ -410,6 +410,22 @@ def _load_bound():
 _RUNNER_DEPTH = 40
 
 
+V2_WHY = ("model runner V2: its block tables live on the GPU only "
+          "(StagedWriteTensor.gpu), and reading them here would sync the GPU; "
+          "step_tokens says whether the step had a forward pass")
+
+
+def _is_v2_runner(cand) -> bool:
+    """vLLM 0.31's default runner (`v1/worker/gpu/model_runner.py`): no
+    `input_batch`, but `req_states` (host-side request index) and
+    `block_tables` (BlockTables, rows on the GPU)."""
+    return (getattr(cand, "input_batch", None) is None
+            and getattr(getattr(cand, "req_states", None), "req_id_to_index",
+                        None) is not None
+            and getattr(getattr(cand, "block_tables", None), "block_tables",
+                        None) is not None)
+
+
 def _runner():
     """The model runner on this thread's call stack, cached once found.
 
@@ -428,6 +444,9 @@ def _runner():
             cand = f.f_locals.get("self")
             ib = getattr(cand, "input_batch", None) if cand is not None else None
             if ib is not None and getattr(ib, "block_table", None) is not None:
+                _RUNNER[:] = [cand]
+                return cand
+            if cand is not None and _is_v2_runner(cand):
                 _RUNNER[:] = [cand]
                 return cand
             f = f.f_back
@@ -483,7 +502,10 @@ def dest_context(job, group: int, bids) -> dict:
     try:
         runner = _runner()
         ib = getattr(runner, "input_batch", None) if runner is not None else None
-        if ib is None:
+        v2 = runner is not None and _is_v2_runner(runner)
+        if v2:
+            out = {"in_step": None, "in_step_why": V2_WHY}
+        elif ib is None:
             out = {"in_step": None,
                    "in_step_why": "model runner not found on the call stack"}
         else:
@@ -496,9 +518,13 @@ def dest_context(job, group: int, bids) -> dict:
         except Exception:
             req = None
         out["req"] = None if req is None else str(req)
-        if req is not None and ib is not None:
+        # V2 keeps the request index on the host too (req_states), so whether
+        # the load's request is in this step stays readable without a sync
+        idx_map = (runner.req_states.req_id_to_index if v2
+                   else getattr(ib, "req_id_to_index", None))
+        if req is not None and (ib is not None or v2):
             try:
-                out["req_in_step"] = req in (ib.req_id_to_index or {})
+                out["req_in_step"] = req in (idx_map or {})
             except Exception:
                 out["req_in_step"] = None
         else:

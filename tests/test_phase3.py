@@ -48,6 +48,7 @@ def eq(name, got, want):
     check(name, got == want, f"got {got!r} want {want!r}")
 
 
+harness.require_gpu_manager("phase3: the two protection policies")
 H = harness.load()
 MGR = H.mgr_mod
 iface = sys.modules["vllm.v1.kv_cache_interface"]

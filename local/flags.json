@@ -1,0 +1,12 @@
+{
+  "disk_enabled": true,
+  "disk_restore": true,
+  "disk_budget_gb": 4,
+  "journal_enabled": true,
+  "disk_checksum_write": true,
+  "kvmgr_stats_port": 8899,
+  "diag_ledger_keys": true,
+  "kvmgr_control_plane": true,
+  "disk_checksum_verify": true,
+  "disk_load_failure_recompute": true
+}
