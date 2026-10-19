@@ -45,6 +45,13 @@ manager for the MLA group, plus a disk prefix cache that survives restarts.
 - Restarting: **ask before every restart**, stating goal, change, cost (a
   10–22 min boot, every session on the cluster interrupted) and why it cannot
   wait.
+- **Stop and start on 0.32:** on spark-45ea, `touch ~/.engine-hold; cd
+  ~/dspark032 && ./serve-032.sh down` (stop both) or `./serve-032.sh`
+  (restart both); `rm ~/.engine-hold` once it answers. **Never** the
+  `stop-`/`start-deepseek-v4-flash-dspark.sh` scripts in either checkout: they
+  drive the retired 0.21 compose, so `stop` removes nothing and still prints
+  "stopped" (2026-10-19). `sparkstats.service` (a user unit) holds
+  `/dev/nvidia-uvm` open, so stop it too before swapping the UVM module.
 - **`engine-supervisor` restarts BOTH nodes by itself** (a user unit on
   spark-45ea, since 2026-10-14). It acts when either engine container exits
   abnormally (any code except 0/143, OOMKilled, or dead), and after a reboot.
